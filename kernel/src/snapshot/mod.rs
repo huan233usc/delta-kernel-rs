@@ -753,6 +753,22 @@ impl Snapshot {
             .and_then(|crc| crc.file_stats().cloned())
     }
 
+    /// Returns the active file count from the selected checkpoint's `_last_checkpoint` hint.
+    ///
+    /// The count is exact only when this snapshot ends at the checkpoint version. Returns `None`
+    /// when there is no selected checkpoint, the snapshot has a commit tail, or the matching hint
+    /// does not contain a non-negative `numOfAddFiles`. Performs no I/O.
+    pub fn get_checkpoint_num_files_if_present(&self) -> Option<i64> {
+        let log_segment = self.log_segment();
+        if log_segment.checkpoint_version != Some(self.version()) {
+            return None;
+        }
+        log_segment
+            .checkpoint_hint()?
+            .num_of_add_files
+            .filter(|count| *count >= 0)
+    }
+
     /// Get the In-Commit Timestamp (ICT) for this snapshot.
     ///
     /// Returns the `inCommitTimestamp` from the CommitInfo action of the commit that created this
@@ -1501,6 +1517,33 @@ mod tests {
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: SchemaRef = serde_json::from_str(schema_string).unwrap();
         assert_eq!(snapshot.schema(), expected);
+    }
+
+    #[test]
+    fn checkpoint_num_files_requires_matching_checkpoint_hint() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(3)
+            .build(&engine)
+            .unwrap();
+
+        assert_eq!(snapshot.get_checkpoint_num_files_if_present(), Some(4));
+
+        let mut mismatched_segment = snapshot.log_segment().clone();
+        mismatched_segment
+            .last_checkpoint_metadata
+            .as_mut()
+            .unwrap()
+            .parts = Some(2);
+        let mismatched_snapshot =
+            Snapshot::new(mismatched_segment, snapshot.table_configuration().clone()).unwrap();
+
+        assert_eq!(
+            mismatched_snapshot.get_checkpoint_num_files_if_present(),
+            None
+        );
     }
 
     #[test]

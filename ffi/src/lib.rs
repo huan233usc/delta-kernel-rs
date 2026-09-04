@@ -1450,6 +1450,22 @@ pub unsafe extern "C" fn snapshot_file_stats(
         .into()
 }
 
+/// Get the exact active-file count from the selected checkpoint's `_last_checkpoint` hint.
+///
+/// Returns [`OptionalValue::None`] when this snapshot has a post-checkpoint commit tail or the
+/// matching hint has no usable `numOfAddFiles`. Performs no I/O.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_checkpoint_num_files(
+    snapshot: Handle<SharedSnapshot>,
+) -> OptionalValue<i64> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot.get_checkpoint_num_files_if_present().into()
+}
+
 /// Callback invoked by [`visit_file_size_histogram`] when the snapshot's file stats include a
 /// file size histogram.
 ///
@@ -2270,6 +2286,41 @@ mod tests {
         assert!(histogram.sorted_bin_boundaries.is_empty());
 
         unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_num_files_requires_no_commit_tail() -> Result<(), Box<dyn std::error::Error>> {
+        let table_path = std::fs::canonicalize("../kernel/tests/data/parsed-stats/")?;
+        let table_root = Url::from_directory_path(&table_path)
+            .map_err(|()| delta_kernel::Error::generic("invalid table path"))?
+            .to_string();
+        let engine = get_default_engine(&table_root);
+
+        let checkpoint_snapshot = unsafe {
+            let mut builder = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ));
+            snapshot_builder_set_version(&mut builder, 3);
+            ok_or_panic(snapshot_builder_build(builder))
+        };
+        assert_eq!(
+            unsafe { snapshot_checkpoint_num_files(checkpoint_snapshot.shallow_copy()) },
+            OptionalValue::Some(4),
+        );
+
+        let latest_snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        assert_eq!(unsafe { version(latest_snapshot.shallow_copy()) }, 5);
+        assert_eq!(
+            unsafe { snapshot_checkpoint_num_files(latest_snapshot.shallow_copy()) },
+            OptionalValue::None,
+        );
+
+        unsafe { free_snapshot(checkpoint_snapshot) }
+        unsafe { free_snapshot(latest_snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
     }
