@@ -162,6 +162,8 @@ pub enum StructStats {
     /// disables stats reading entirely.
     None,
     /// Emit all indexed columns, plus the `extra_indexed` columns.
+    /// File-level stats (`numRecords` and `tightBounds`) are included even without indexed
+    /// columns.
     ///
     /// Clustering columns outside these sets are not added automatically.
     AllIndexed {

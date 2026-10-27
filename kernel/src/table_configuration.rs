@@ -581,6 +581,7 @@ impl TableConfiguration {
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max,
         )
+        .map(Some)
     }
 
     /// Builds the structured statistics schemas for explicitly selected logical columns.
@@ -613,13 +614,18 @@ impl TableConfiguration {
             })
             .collect::<KernelResult<Vec<_>>>()?;
 
-        self.build_stats_output_schemas_for_resolved_columns(
+        let schemas = self.build_stats_output_schemas_for_resolved_columns(
             logical_columns,
             &physical_columns,
             variant_min_max,
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max,
-        )
+        )?;
+        Ok(schemas
+            .logical
+            .field(NULL_COUNT)
+            .is_some()
+            .then_some(schemas))
     }
 
     fn build_stats_output_schemas_for_resolved_columns(
@@ -628,7 +634,7 @@ impl TableConfiguration {
         physical_columns: &[ColumnName],
         variant_min_max: bool,
         #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
-    ) -> KernelResult<Option<StatsOutputSchemas>> {
+    ) -> KernelResult<StatsOutputSchemas> {
         let logical = build_stats_schema_for_columns(
             &self.logical_schema_without_partition_columns(),
             logical_columns,
@@ -636,11 +642,6 @@ impl TableConfiguration {
             #[cfg(feature = "geo-type-in-dev")]
             geometry_min_max,
         )?;
-        // `expected_stats_schema` emits `nullCount` only when a data column is selected.
-        if logical.field(NULL_COUNT).is_none() {
-            return Ok(None);
-        }
-
         let physical = build_stats_schema_for_columns(
             &self.physical_data_schema_without_partition_columns(),
             physical_columns,
@@ -649,7 +650,7 @@ impl TableConfiguration {
             geometry_min_max,
         )?;
 
-        Ok(Some(StatsOutputSchemas::try_new(logical, physical)?))
+        StatsOutputSchemas::try_new(logical, physical)
     }
 
     /// Returns a [`StatsSchemaBuilder`] for this table's expected file statistics schema, with

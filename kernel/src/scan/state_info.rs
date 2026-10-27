@@ -255,12 +255,9 @@ fn build_data_skipping_schemas(
     let predicate_refs_physical =
         resolve_physical_columns(table_configuration, predicate_column_names_logical);
 
-    // A stats schema with only `numRecords` and `tightBounds` (the bookkeeping fields the stats
-    // schema builder always emits) has nothing to prune by. Return `None` in that case so the
-    // caller skips building a `DataSkippingFilter`. `nullCount` is the per-column stats wrapper,
-    // so its presence is the signal that at least one data column survived. The Delta protocol
-    // allows `minValues` / `maxValues` without `nullCount`, but the builder always emits
-    // `nullCount` whenever it emits min/max; this check relies on that implementation property.
+    // AllIndexed requests retain file-level stats even when no data columns are indexed.
+    // Predicate-only reads need column stats to prune: the builder emits `nullCount` whenever
+    // any data column survives, including when min/max are present.
     let build_stats_schema = |required: Option<&[ColumnName]>,
                               requested: Option<&[ColumnName]>|
      -> KernelResult<Option<SchemaRef>> {
@@ -272,10 +269,8 @@ fn build_data_skipping_schemas(
         #[cfg(feature = "geo-type-in-dev")]
         let builder = builder.with_geometry_min_max(stats.geometry_min_max);
         let stats_schema = builder.build()?;
-        Ok(stats_schema
-            .field(NULL_COUNT)
-            .is_some()
-            .then_some(stats_schema))
+        let needs_file_stats = matches!(stats.struct_stats, StructStats::AllIndexed { .. });
+        Ok((needs_file_stats || stats_schema.field(NULL_COUNT).is_some()).then_some(stats_schema))
     };
 
     let stats_schema = match (&stats.struct_stats, physical_predicate) {
@@ -1390,6 +1385,35 @@ pub(crate) mod tests {
             res,
             "Schema error: Metadata column names must not match physical columns, but logical column 'id' has physical name 'other'"
         );
+    }
+
+    #[rstest]
+    #[case::indexing_disabled(vec![], num_indexed_cols_config(0))]
+    #[case::partition_only(vec!["c0".to_string()], HashMap::new())]
+    fn all_indexed_stats_preserve_file_counts_without_indexed_columns(
+        #[case] partition_columns: Vec<String>,
+        #[case] config: HashMap<String, String>,
+        #[values(StatsOptions::all_struct(), StatsOptions::all())] stats: StatsOptions,
+        #[values(false, true)] with_predicate: bool,
+    ) {
+        let predicate = with_predicate.then(|| Arc::new(col!("c0").gt(lit(0i64))));
+        let state = get_state_info_with_stats(
+            flat_long_schema(1),
+            partition_columns,
+            predicate,
+            &[],
+            config,
+            vec![],
+            stats,
+        )
+        .unwrap();
+        let expected = schema_ref! {
+            nullable "numRecords": LONG,
+            nullable "tightBounds": BOOLEAN,
+        };
+        assert_eq!(state.physical_stats_read_schema(), Some(&expected));
+        assert_eq!(state.physical_stats_output_schema(), Some(&expected));
+        assert!(state.eligible_physical_stats_columns.is_empty());
     }
 
     #[test]
