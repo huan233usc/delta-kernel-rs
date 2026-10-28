@@ -1618,6 +1618,32 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
     snapshot.drop_handle();
 }
 
+/// Releases a snapshot only when its handle is the sole strong owner.
+///
+/// Consumes `snapshot` on every call. Returns `None` after destroying a uniquely owned snapshot,
+/// or `Some` with the still-owned snapshot handle when another strong owner exists. The returned
+/// handle must be retained or released with [`free_snapshot`]. Shared child objects may outlive the
+/// snapshot independently.
+///
+/// # Safety
+///
+/// The input must be a valid owned handle with no concurrent borrowed access through that handle.
+/// The caller must not use or free the consumed handle; use the returned handle when present.
+#[cfg(feature = "internal-api")]
+#[no_mangle]
+pub unsafe extern "C" fn try_free_snapshot(
+    snapshot: Handle<SharedSnapshot>,
+) -> OptionalValue<Handle<SharedSnapshot>> {
+    let snapshot = unsafe { snapshot.into_inner() };
+    match Arc::try_unwrap(snapshot) {
+        Ok(snapshot) => {
+            drop(snapshot);
+            OptionalValue::None
+        }
+        Err(snapshot) => OptionalValue::Some(snapshot.into()),
+    }
+}
+
 /// Perform a checkpoint write on the given snapshot. Mirrors the kernel's
 /// [`delta_kernel::snapshot::Snapshot::checkpoint`] API across the C ABI.
 ///
@@ -1759,6 +1785,86 @@ pub unsafe extern "C" fn snapshot_log_segment_stats(
         .log_segment_stats()
         .map(FfiLogSegmentStats::from)
         .into_extern_result(&engine_ref)
+}
+
+/// Returns the selected checkpoint's bytes, including top-level files and sidecars.
+///
+/// Successful inspection is cached in the snapshot. Returns zero without a checkpoint.
+/// Both handles are borrowed; the scalar result requires no release.
+///
+/// # Errors
+///
+/// Returns an error if checkpoint inspection fails or the sum exceeds `u64::MAX`.
+///
+/// # Safety
+///
+/// Caller must pass valid snapshot and engine handles and retain ownership of both.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_checkpoint_size_in_bytes(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<u64> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .checkpoint_size_in_bytes(engine_ref.engine().as_ref())
+        .into_extern_result(&engine_ref)
+}
+
+/// Borrowed description of checkpoint files sharing a physical schema.
+#[repr(C)]
+pub struct FfiCheckpointFileGroup {
+    /// Number of files carrying file actions.
+    pub num_files: u64,
+    /// Delta schema JSON, or an empty string for a JSON checkpoint without sidecars.
+    /// Valid only for the duration of the callback.
+    pub parquet_schema_json: KernelStringSlice,
+}
+
+/// Visits all checkpoint file-action groups in one borrowed slice.
+///
+/// Resolves sidecars and physical schemas through `engine`, without replaying file actions.
+/// Calls `visit` once and returns `true` on success, including for an empty result. Handles stay
+/// owned by the caller; the callback must copy any data it retains.
+///
+/// # Errors
+///
+/// Returns an error if checkpoint metadata cannot be read, decoded, or serialized.
+///
+/// # Safety
+///
+/// Both handles must be valid. `visit` must be valid for one synchronous call with `context`,
+/// must not unwind, and must not retain the borrowed slice or its strings.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_checkpoint_file_groups(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    context: NullableCvoid,
+    visit: unsafe extern "C" fn(NullableCvoid, FfiSlice<FfiCheckpointFileGroup>),
+) -> ExternResult<bool> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.as_ref() };
+    let result = (|| -> KernelResult<bool> {
+        let groups = snapshot.checkpoint_file_groups(engine_ref.engine().as_ref())?;
+        let schemas: Vec<String> = groups
+            .iter()
+            .map(|group| match &group.parquet_schema {
+                Some(schema) => serde_json::to_string(schema),
+                None => Ok(String::new()),
+            })
+            .collect::<Result<_, _>>()?;
+        let views: Vec<_> = groups
+            .iter()
+            .zip(&schemas)
+            .map(|(group, schema)| FfiCheckpointFileGroup {
+                num_files: group.num_files,
+                parquet_schema_json: kernel_string_slice!(schema),
+            })
+            .collect();
+        unsafe { visit(context, FfiSlice::new_unsafe(views.as_slice())) };
+        Ok(true)
+    })();
+    result.into_extern_result(&engine_ref)
 }
 
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.

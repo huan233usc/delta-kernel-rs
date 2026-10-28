@@ -2416,7 +2416,7 @@ fn scan_builder_stats_output_schemas_match_scan_output(#[case] column_mapping_mo
 #[case::no_column_mapping(None)]
 #[case::name_column_mapping(Some("name"))]
 #[case::id_column_mapping(Some("id"))]
-fn scan_builder_stats_output_schemas_returns_none_without_data_columns(
+fn scan_builder_stats_output_schemas_preserve_file_stats_without_data_columns(
     #[case] column_mapping_mode: Option<&str>,
 ) {
     let table_root = format!(
@@ -2447,10 +2447,19 @@ fn scan_builder_stats_output_schemas_returns_none_without_data_columns(
         .unwrap()
         .scan_builder()
         .with_stats(StatsOptions::all_struct());
-    assert!(builder.stats_output_schemas().unwrap().is_none());
+    let schemas = builder.stats_output_schemas().unwrap().unwrap();
+    let expected = schema_ref! {
+        nullable "numRecords": LONG,
+        nullable "tightBounds": BOOLEAN,
+    };
+    assert_eq!(schemas.logical, expected);
+    assert_eq!(schemas.physical, expected);
 
     let scan = builder.build().unwrap();
-    assert!(scan.state_info.physical_stats_output_schema().is_none());
+    assert_eq!(
+        scan.state_info.physical_stats_output_schema(),
+        Some(&expected)
+    );
 }
 
 #[rstest]

@@ -2,9 +2,9 @@
 //! has schema etc.)
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use delta_kernel_derive::internal_api;
 use tracing::{debug, error, info, instrument, warn};
@@ -31,7 +31,7 @@ use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::log_segment::LastManifestCommitResolution;
-use crate::log_segment::{DomainMetadataMap, LogSegment, PmResolution};
+use crate::log_segment::{CheckpointFileInfo, DomainMetadataMap, LogSegment, PmResolution};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::{
     emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
@@ -62,7 +62,7 @@ pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness}
 use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;
-pub use crate::log_segment::LogSegmentStats;
+pub use crate::log_segment::{CheckpointFileGroup, LogSegmentStats};
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -94,6 +94,9 @@ pub enum CheckpointWriteResult {
 pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
+    // Log files are immutable. Cache successful inspection only; a failed read can be retried.
+    // Serialize discovery so concurrent consumers do not repeat footer or sidecar reads.
+    checkpoint_file_info: Mutex<Option<Arc<CheckpointFileInfo>>>,
     table_configuration: TableConfiguration,
     /// The newest CRC resolved at construction, kept so later queries and CRC writes reuse it
     /// instead of re-reading from disk. Queried via [`Snapshot::crc_at_version`] (authoritative,
@@ -279,6 +282,7 @@ impl Snapshot {
         Self {
             span,
             log_segment,
+            checkpoint_file_info: Mutex::new(None),
             table_configuration,
             crc,
             built_as_latest,
@@ -555,6 +559,68 @@ impl Snapshot {
     /// Returns an error if the total commit file size exceeds [`u64::MAX`].
     pub fn log_segment_stats(&self) -> KernelResult<LogSegmentStats> {
         self.log_segment.stats()
+    }
+
+    /// Returns the checkpoint file-action groups selected for this snapshot.
+    ///
+    /// Uses `engine` to resolve sidecars and read physical Parquet schemas when necessary.
+    /// Returns an empty vector when no checkpoint was selected. JSON checkpoints without
+    /// sidecars have no Parquet schema. Does not read commit files or replay file actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint or sidecar metadata cannot be read or decoded.
+    pub fn checkpoint_file_groups(
+        &self,
+        engine: &dyn Engine,
+    ) -> KernelResult<Vec<CheckpointFileGroup>> {
+        let info = self.checkpoint_file_info(engine)?;
+        if self.log_segment.listed.checkpoint_parts.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![CheckpointFileGroup {
+            num_files: if info.sidecars.is_empty() {
+                self.log_segment.listed.checkpoint_parts.len() as u64
+            } else {
+                info.sidecars.len() as u64
+            },
+            parquet_schema: info.parquet_schema.clone(),
+        }])
+    }
+
+    /// Returns the selected checkpoint's physical size, including every top-level part and
+    /// referenced sidecar. Returns zero without a checkpoint. Successful inspection is cached
+    /// and shared with [`Self::checkpoint_file_groups`] and declarative scan planning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checkpoint metadata cannot be read or the sum exceeds [`u64::MAX`].
+    pub fn checkpoint_size_in_bytes(&self, engine: &dyn Engine) -> KernelResult<u64> {
+        Ok(self.checkpoint_file_info(engine)?.size_in_bytes)
+    }
+
+    fn checkpoint_file_info(&self, engine: &dyn Engine) -> KernelResult<Arc<CheckpointFileInfo>> {
+        let mut cached = self
+            .checkpoint_file_info
+            .lock()
+            .map_err(|_| KernelError::generic("Checkpoint inspection lock poisoned"))?;
+        if let Some(info) = cached.as_ref() {
+            return Ok(info.clone());
+        }
+        let info = Arc::new(self.log_segment.checkpoint_file_info(engine)?);
+        *cached = Some(info.clone());
+        Ok(info)
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn cached_checkpoint_file_info(
+        &self,
+    ) -> KernelResult<Option<Arc<CheckpointFileInfo>>> {
+        Ok(self
+            .checkpoint_file_info
+            .lock()
+            .map_err(|_| KernelError::generic("Checkpoint inspection lock poisoned"))?
+            .clone())
     }
 
     /// Captures retained snapshot state as an owned hint without engine I/O.
@@ -1768,8 +1834,39 @@ mod tests {
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::transaction::create_table::create_table;
-    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, load_test_table, string_array_to_engine_data,
+    };
     use crate::utils::FoldWithOption as _;
+
+    #[rstest]
+    #[case("table-without-dv-small", 0)]
+    #[case("v1-single-part-struct-stats-only", 1)]
+    #[case("v1-multi-part-struct-stats-only", 3)]
+    #[case("v1-multi-part-partitioned-struct-stats-only", 3)]
+    #[case("v2-json-sidecars-struct-stats-only", 1)]
+    #[case("v2-parquet-sidecars-struct-stats-only", 1)]
+    #[case("v2-classic-parquet-struct-stats-only", 1)]
+    fn checkpoint_file_groups_describe_file_actions(
+        #[case] table: &str,
+        #[case] expected_files: u64,
+    ) -> KernelResult<()> {
+        let (engine, snapshot, _temp) = load_test_table(table)?;
+        let groups = snapshot.checkpoint_file_groups(engine.as_ref())?;
+        if expected_files == 0 {
+            assert!(groups.is_empty());
+        } else {
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].num_files, expected_files);
+            let schema = groups[0].parquet_schema.as_ref().unwrap();
+            let DataType::Struct(add) = schema.field("add").unwrap().data_type() else {
+                panic!("checkpoint add field must be a struct");
+            };
+            assert!(add.field("stats_parsed").is_some());
+            assert!(add.field("path").is_some());
+        }
+        Ok(())
+    }
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
