@@ -1615,6 +1615,32 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
     snapshot.drop_handle();
 }
 
+/// Releases a snapshot only when its handle is the sole strong owner.
+///
+/// Consumes `snapshot` on every call. Returns `None` after destroying a uniquely owned snapshot,
+/// or `Some` with the still-owned snapshot handle when another strong owner exists. The returned
+/// handle must be retained or released with [`free_snapshot`]. Shared child objects may outlive the
+/// snapshot independently.
+///
+/// # Safety
+///
+/// The input must be a valid owned handle with no concurrent borrowed access through that handle.
+/// The caller must not use or free the consumed handle; use the returned handle when present.
+#[cfg(feature = "internal-api")]
+#[no_mangle]
+pub unsafe extern "C" fn try_free_snapshot(
+    snapshot: Handle<SharedSnapshot>,
+) -> OptionalValue<Handle<SharedSnapshot>> {
+    let snapshot = unsafe { snapshot.into_inner() };
+    match Arc::try_unwrap(snapshot) {
+        Ok(snapshot) => {
+            drop(snapshot);
+            OptionalValue::None
+        }
+        Err(snapshot) => OptionalValue::Some(snapshot.into()),
+    }
+}
+
 /// Perform a checkpoint write on the given snapshot. Mirrors the kernel's
 /// [`delta_kernel::snapshot::Snapshot::checkpoint`] API across the C ABI.
 ///

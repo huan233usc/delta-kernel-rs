@@ -293,6 +293,39 @@ fn read_snapshot_metadata(snapshot: &Handle<SharedSnapshot>) -> Metadata {
     result.unwrap().unwrap()
 }
 
+#[cfg(feature = "internal-api")]
+#[rstest::rstest]
+fn try_free_snapshot_preserves_shared_ownership_and_releases_unique_ownership(
+    #[values(false, true)] shared: bool,
+) {
+    let engine = test_engine();
+    let snapshot = unsafe {
+        let builder = with_minimal_hint(test_builder(&engine));
+        ok_or_panic(snapshot_builder_build(builder))
+    };
+    let other_owner = shared.then(|| unsafe { snapshot.clone_as_arc() });
+    let weak = {
+        let reference = unsafe { snapshot.clone_as_arc() };
+        Arc::downgrade(&reference)
+    };
+    let remaining = unsafe { crate::try_free_snapshot(snapshot) };
+    match remaining {
+        OptionalValue::Some(snapshot) => {
+            assert!(shared);
+            assert_eq!(unsafe { snapshot.as_ref() }.version(), 0);
+            assert_eq!(other_owner.as_ref().unwrap().version(), 0);
+            drop(other_owner);
+            assert!(matches!(
+                unsafe { crate::try_free_snapshot(snapshot) },
+                OptionalValue::None
+            ));
+        }
+        OptionalValue::None => assert!(!shared),
+    }
+    assert!(weak.upgrade().is_none());
+    unsafe { free_engine(engine) };
+}
+
 #[test]
 fn metadata_visit_preserves_original_schema_json_and_does_not_consume_snapshot() {
     let engine = test_engine();
