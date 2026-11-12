@@ -181,7 +181,7 @@ message ServerStats {
 message Error {
   enum Code { INTERNAL = 0; UNSUPPORTED = 1; TABLE_NOT_FOUND = 2; PROTOCOL_UNSUPPORTED = 3;
               VERSION_MISMATCH = 4; OP_FAILED = 5; CANCELLED = 6; DEADLINE = 7;
-              PERMISSION_DENIED = 8; }
+              PERMISSION_DENIED = 8; UNAVAILABLE = 9; }
   Code code = 1; string message = 2; bool retryable = 3;
 }
 

@@ -391,18 +391,16 @@ impl Core {
         };
         let key: TableKey = (table_id, location.clone());
         // Credentials first, also on what will be a cache hit: this is the authz check (SPEC v9).
+        // Runs in both IO modes (SPEC v9.1); forward mode discards the IO built on it.
+        let url = url::Url::parse(&location)
+            .map_err(|e| ServerError::new(Code::TableNotFound, format!("bad location: {e}")))?;
+        let cred = self
+            .creds
+            .credential_for(req.auth.as_ref(), &key.0, &url)
+            .await?;
         let io = match self.config.io_mode {
             IoMode::Forward => None,
-            IoMode::Local => {
-                let url = url::Url::parse(&location).map_err(|e| {
-                    ServerError::new(Code::TableNotFound, format!("bad location: {e}"))
-                })?;
-                let cred = self
-                    .creds
-                    .credential_for(req.auth.as_ref(), &key.0, &url)
-                    .await?;
-                Some(cred.map_or_else(|| self.local_fs.clone(), |c| c.io.clone()))
-            }
+            IoMode::Local => Some(cred.map_or_else(|| self.local_fs.clone(), |c| c.io.clone())),
         };
         let target = match req.at.as_ref().and_then(|a| a.spec.as_ref()) {
             Some(version_spec::Spec::Version(v)) => Target::Version(*v),
@@ -665,6 +663,8 @@ impl Core {
             .await;
             let channel = &job.channel;
             let result = match built {
+                // A deadline anywhere in the job fails it, even if kernel got past the op.
+                Ok(Ok(_)) if channel.cancel_reason().is_some() => Err(deadline_or_cancel(channel)),
                 // A getter failure caused by a client storage error is a failed op, not a
                 // property of the table.
                 Ok(Ok(Built::Renewed(base))) => {
@@ -681,12 +681,15 @@ impl Core {
                     if info.clustering_error.is_some() && channel.first_op_failure().is_some() =>
                 {
                     let op_err = channel.first_op_failure();
-                    Err(classify_kernel_error(
-                        &delta_kernel::KernelError::generic(
-                            info.clustering_error.map(|e| e.message).unwrap_or_default(),
+                    Err(local_unavailable(
+                        channel,
+                        classify_kernel_error(
+                            &delta_kernel::KernelError::generic(
+                                info.clustering_error.map(|e| e.message).unwrap_or_default(),
+                            ),
+                            channel.cancel_reason(),
+                            op_err.as_ref(),
                         ),
-                        channel.cancel_reason(),
-                        op_err.as_ref(),
                     ))
                 }
                 Ok(Ok(Built::New(snapshot, info, kind))) => {
@@ -710,10 +713,13 @@ impl Core {
                     };
                     Ok(BuildOutcome { instance, kind })
                 }
-                Ok(Err(e)) => Err(classify_build_error(
-                    &e,
-                    channel.cancel_reason(),
-                    channel.first_op_failure().as_ref(),
+                Ok(Err(e)) => Err(local_unavailable(
+                    channel,
+                    classify_build_error(
+                        &e,
+                        channel.cancel_reason(),
+                        channel.first_op_failure().as_ref(),
+                    ),
                 )),
                 Err(join_err) => Err(ServerError::internal(format!(
                     "snapshot build panicked: {join_err}"
@@ -870,11 +876,17 @@ impl Core {
             .await;
             let channel = &job.channel;
             let result = match outcome {
+                Ok(PlanOutcome::Result(_)) if channel.cancel_reason().is_some() => {
+                    Err(deadline_or_cancel(channel))
+                }
                 Ok(PlanOutcome::Result(r)) => Ok(r),
-                Ok(PlanOutcome::Failed(e)) => Err(classify_kernel_error(
-                    &e,
-                    channel.cancel_reason(),
-                    channel.first_op_failure().as_ref(),
+                Ok(PlanOutcome::Failed(e)) => Err(local_unavailable(
+                    channel,
+                    classify_kernel_error(
+                        &e,
+                        channel.cancel_reason(),
+                        channel.first_op_failure().as_ref(),
+                    ),
                 )),
                 Err(join_err) => Err(ServerError::internal(format!(
                     "plan generation panicked: {join_err}"
@@ -894,6 +906,29 @@ impl Core {
             job.complete(result);
         });
     }
+}
+
+/// SPEC v9.1: a job that failed because a server-side IO op failed is `UNAVAILABLE` (retryable),
+/// not `OP_FAILED` (which reports client-side op failures).
+fn local_unavailable(channel: &OpChannel, err: ServerError) -> ServerError {
+    if err.code == Code::OpFailed && channel.first_failure_is_local() {
+        ServerError::new(
+            Code::Unavailable,
+            err.message
+                .replacen("client op failed", "server-side IO failed", 1),
+        )
+    } else {
+        err
+    }
+}
+
+/// The error for a job whose op channel was cancelled although kernel returned a result.
+fn deadline_or_cancel(channel: &OpChannel) -> ServerError {
+    classify_kernel_error(
+        &delta_kernel::KernelError::Cancelled,
+        channel.cancel_reason(),
+        None,
+    )
 }
 
 /// Table locations are directory URLs; make the trailing slash canonical for the cache key.

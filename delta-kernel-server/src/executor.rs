@@ -207,6 +207,8 @@ pub struct OpChannel {
     cancel: Mutex<Option<CancelReason>>,
     tainted: AtomicBool,
     first_op_failure: Mutex<Option<proto::KernelError>>,
+    /// Whether `first_op_failure` came from a server-side op (SPEC v9.1: UNAVAILABLE).
+    first_failure_local: AtomicBool,
     /// Target version of a snapshot build, used to fill `ListingHint.end_version`.
     target_version: Option<i64>,
     counters: Arc<ServerCounters>,
@@ -226,6 +228,7 @@ impl OpChannel {
             cancel: Mutex::new(None),
             tainted: AtomicBool::new(false),
             first_op_failure: Mutex::new(None),
+            first_failure_local: AtomicBool::new(false),
             target_version,
             counters,
             faults,
@@ -264,6 +267,11 @@ impl OpChannel {
         self.first_op_failure.lock().unwrap().clone()
     }
 
+    /// Whether the first op failure was a server-side IO error (not a client-reported one).
+    pub fn first_failure_is_local(&self) -> bool {
+        self.first_failure_local.load(Ordering::Relaxed)
+    }
+
     fn set_cancel(&self, reason: CancelReason) {
         self.cancel.lock().unwrap().get_or_insert(reason);
     }
@@ -271,14 +279,19 @@ impl OpChannel {
     /// Records a client-reported error. `FileNotFound` is an expected answer (e.g. a missing
     /// `_last_checkpoint`), so it neither taints the job nor counts as an op failure.
     fn observe_error(&self, err: &proto::KernelError) {
+        self.observe(err, false);
+    }
+
+    fn observe(&self, err: &proto::KernelError, local: bool) {
         if err.code == codes::FILE_NOT_FOUND {
             return;
         }
         self.tainted.store(true, Ordering::Relaxed);
-        self.first_op_failure
-            .lock()
-            .unwrap()
-            .get_or_insert_with(|| err.clone());
+        let mut first = self.first_op_failure.lock().unwrap();
+        if first.is_none() {
+            *first = Some(err.clone());
+            self.first_failure_local.store(local, Ordering::Relaxed);
+        }
     }
 
     fn listing_hint(&self, url: &Url) -> Option<proto::ListingHint> {
@@ -295,6 +308,14 @@ pub fn listing_hint_for(url: &Url, target_version: Option<i64>) -> Option<proto:
         end_version: target_version,
         stop_at_first_non_versioned: true,
     })
+}
+
+/// Raw result of a server-side op, before error bookkeeping.
+enum LocalOut {
+    List(KernelResult<Vec<KernelResult<FileMeta>>>),
+    Read(KernelResult<Vec<KernelResult<Bytes>>>),
+    Head(KernelResult<FileMeta>),
+    Footer(KernelResult<ParquetFooter>),
 }
 
 /// Expected result shape of an op, captured before the op is moved into proto bytes.
@@ -319,7 +340,7 @@ impl RemotePlanExecutor {
 
     /// Records a server-side error with the same rules as a client-reported one.
     fn observe_local(&self, e: &KernelError) {
-        self.channel.observe_error(&to_wire_kernel_error(e));
+        self.channel.observe(&to_wire_kernel_error(e), true);
     }
 
     fn observe_items<T>(&self, items: &[KernelResult<T>]) {
@@ -335,66 +356,106 @@ impl RemotePlanExecutor {
     }
 
     /// Executes a simple IO op on the server.
-    fn execute_local(&self, local: &LocalIo, io: IoOperation) -> KernelResult<PlanResult> {
+    fn execute_local(&self, local: &Arc<LocalIo>, io: IoOperation) -> KernelResult<PlanResult> {
         let ch = &self.channel;
+        if matches!(
+            io,
+            IoOperation::WriteBytes { .. } | IoOperation::AtomicCopy { .. }
+        ) {
+            return Err(KernelError::unsupported(
+                "delta-kernel-server is read-only: write ops are rejected",
+            ));
+        }
         ch.counters.ops_local_total.fetch_add(1, Ordering::Relaxed);
         ch.starter.ops_local.fetch_add(1, Ordering::Relaxed);
-        let delay = ch.faults.local_io_delay();
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
-        }
-        match io {
-            IoOperation::FileListing { url } => match local.list(&url) {
-                Ok(items) => {
-                    let items = match ch.listing_hint(&url) {
-                        Some(hint) => {
-                            let listed = items.len();
-                            let kept = apply_listing_hint(&url, items, &hint);
-                            ch.counters
-                                .listing_items_dropped
-                                .fetch_add((listed - kept.len()) as i64, Ordering::Relaxed);
-                            kept
-                        }
-                        None => items,
-                    };
-                    self.observe_items(&items);
-                    Ok(PlanResult::FileMeta(Box::new(items.into_iter())))
-                }
-                Err(e) => {
-                    self.observe_local(&e);
-                    Err(e)
-                }
-            },
-            IoOperation::ReadBytes { files } => match local.read(files) {
-                Ok(items) => {
-                    self.observe_items(&items);
-                    Ok(PlanResult::Bytes(Box::new(items.into_iter())))
-                }
-                Err(e) => {
-                    self.observe_local(&e);
-                    Err(e)
-                }
-            },
+        let listing_url = match &io {
+            IoOperation::FileListing { url } => Some(url.clone()),
+            _ => None,
+        };
+        let raw = match self.run_local_bounded(local, io) {
+            Some(raw) => raw,
+            None => {
+                // SPEC v9.1: a local op past the driver's op deadline fails the whole job with
+                // DEADLINE (driver and every waiter), and the result is never cached.
+                tracing::info!(
+                    deadline_ms = ch.starter.op_deadline.as_millis() as u64,
+                    "server-side IO op exceeded the op deadline"
+                );
+                ch.tainted.store(true, Ordering::Relaxed);
+                ch.set_cancel(CancelReason::Deadline);
+                return Err(KernelError::Cancelled);
+            }
+        };
+        match raw {
+            LocalOut::List(Ok(items)) => {
+                let url = listing_url.expect("listing op");
+                let items = match ch.listing_hint(&url) {
+                    Some(hint) => {
+                        let listed = items.len();
+                        let kept = apply_listing_hint(&url, items, &hint);
+                        ch.counters
+                            .listing_items_dropped
+                            .fetch_add((listed - kept.len()) as i64, Ordering::Relaxed);
+                        kept
+                    }
+                    None => items,
+                };
+                self.observe_items(&items);
+                Ok(PlanResult::FileMeta(Box::new(items.into_iter())))
+            }
+            LocalOut::Read(Ok(items)) => {
+                self.observe_items(&items);
+                Ok(PlanResult::Bytes(Box::new(items.into_iter())))
+            }
             // Same shape as a forwarded HeadFile: one item, possibly an error.
-            IoOperation::HeadFile { url } => {
-                let item = local.head(&url);
+            LocalOut::Head(item) => {
                 if let Err(e) = &item {
                     self.observe_local(e);
                 }
                 Ok(PlanResult::FileMeta(Box::new(std::iter::once(item))))
             }
-            IoOperation::ParquetFooter { file } => match local.footer(&file) {
-                Ok(footer) => Ok(PlanResult::ParquetFooter(footer)),
-                Err(e) => {
-                    self.observe_local(&e);
-                    Err(e)
-                }
-            },
-            IoOperation::WriteBytes { .. } | IoOperation::AtomicCopy { .. } => {
-                Err(KernelError::unsupported(
-                    "delta-kernel-server is read-only: write ops are rejected",
-                ))
+            LocalOut::Footer(Ok(footer)) => Ok(PlanResult::ParquetFooter(footer)),
+            LocalOut::List(Err(e)) | LocalOut::Read(Err(e)) | LocalOut::Footer(Err(e)) => {
+                self.observe_local(&e);
+                Err(e)
             }
+        }
+    }
+
+    /// Runs the raw local op on its own thread and waits at most the driver's op deadline.
+    /// `None` on timeout; the abandoned op finishes in the background and its result is dropped.
+    fn run_local_bounded(&self, local: &Arc<LocalIo>, io: IoOperation) -> Option<LocalOut> {
+        let (tx, rx) = sync_channel(1);
+        let local = local.clone();
+        let delay = self.channel.faults.local_io_delay();
+        let spawned = std::thread::Builder::new()
+            .name("dks-local-io".into())
+            .spawn(move || {
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                let out = match io {
+                    IoOperation::FileListing { url } => LocalOut::List(local.list(&url)),
+                    IoOperation::ReadBytes { files } => LocalOut::Read(local.read(files)),
+                    IoOperation::HeadFile { url } => LocalOut::Head(local.head(&url)),
+                    IoOperation::ParquetFooter { file } => LocalOut::Footer(local.footer(&file)),
+                    IoOperation::WriteBytes { .. } | IoOperation::AtomicCopy { .. } => {
+                        unreachable!("write ops are rejected before dispatch")
+                    }
+                };
+                let _ = tx.send(out);
+            });
+        if let Err(e) = spawned {
+            return Some(LocalOut::Footer(Err(KernelError::generic(format!(
+                "spawn local IO thread: {e}"
+            )))));
+        }
+        match rx.recv_timeout(self.channel.starter.op_deadline) {
+            Ok(out) => Some(out),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => Some(LocalOut::Footer(Err(
+                KernelError::internal_error("local IO thread panicked"),
+            ))),
         }
     }
 

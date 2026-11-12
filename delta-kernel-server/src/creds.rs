@@ -162,6 +162,50 @@ pub fn build_store(
     Ok(Arc::new(store))
 }
 
+/// Longest UC-provided text kept in an error message.
+pub const MAX_UC_TEXT: usize = 256;
+
+/// Makes UC-provided text safe for errors and logs: the caller's token and anything that looks
+/// like a credential (`Bearer …`, `dapi…` PATs, JWTs, long opaque tokens) are replaced by
+/// `[REDACTED]`, control characters are dropped, and the result is cut to [`MAX_UC_TEXT`] chars.
+pub fn sanitize_uc_text(text: &str, token: &str) -> String {
+    let text = if token.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(token, "[REDACTED]")
+    };
+    let looks_secret = |w: &str| {
+        let core = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let lower = core.to_ascii_lowercase();
+        lower.starts_with("dapi")
+            || core.starts_with("eyJ")
+            || (core.len() >= 24
+                && core
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.=+/".contains(c)))
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut redact_next = false;
+    for word in text.split_whitespace() {
+        if redact_next || looks_secret(word) {
+            out.push("[REDACTED]".into());
+            redact_next = false;
+            continue;
+        }
+        if word.eq_ignore_ascii_case("bearer") || word.eq_ignore_ascii_case("bearer:") {
+            redact_next = true;
+        }
+        out.push(word.chars().filter(|c| !c.is_control()).collect());
+    }
+    let joined = out.join(" ");
+    if joined.chars().count() > MAX_UC_TEXT {
+        let cut: String = joined.chars().take(MAX_UC_TEXT).collect();
+        format!("{cut}…")
+    } else {
+        joined
+    }
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -276,10 +320,14 @@ impl CredentialProvider {
     ) -> Result<Value, ServerError> {
         self.fetches.fetch_add(1, Ordering::Relaxed);
         let url = format!("{}{}", self.base_url(auth), req.endpoint());
-        let unavailable = |what: String| ServerError {
-            code: Code::Internal,
-            message: format!("UC unavailable: {what}"),
-            retryable: true,
+        let unavailable = |what: String| {
+            ServerError::new(
+                Code::Unavailable,
+                format!(
+                    "UC unavailable: {}",
+                    sanitize_uc_text(&what, &auth.bearer_token)
+                ),
+            )
         };
         let resp = self
             .http
@@ -297,6 +345,8 @@ impl CredentialProvider {
             .await
             .map_err(|e| unavailable(e.without_url().to_string()))?;
         let parsed: Option<Value> = serde_json::from_slice(&body).ok();
+        // UC error text is untrusted: it may echo request data. Only a sanitized, bounded copy
+        // reaches ServerError (and therefore logs and the client).
         let uc_message = parsed
             .as_ref()
             .map(|v| {
@@ -306,6 +356,7 @@ impl CredentialProvider {
                     v.get("message").and_then(Value::as_str).unwrap_or("")
                 )
             })
+            .map(|m| sanitize_uc_text(&m, &auth.bearer_token))
             .unwrap_or_default();
         match status.as_u16() {
             200..=299 => {
@@ -392,6 +443,30 @@ mod tests {
         let o = storage_options("gs", &resp).unwrap();
         assert_eq!(opts(o.clone())["google_bearer_token"], "ya29.x");
         build_store(&Url::parse("gs://bucket/t/").unwrap(), &o).unwrap();
+    }
+
+    #[test]
+    fn uc_text_is_sanitized_and_bounded() {
+        let tok = "dapiabc123def456";
+        let s = sanitize_uc_text(
+            &format!("denied for {tok}; header was Bearer {tok} jwt eyJhbGciOi.x.y ok\u{7}"),
+            tok,
+        );
+        assert!(!s.contains(tok) && !s.contains("eyJ"), "{s}");
+        assert!(s.contains("denied for") && s.contains("[REDACTED]"));
+        // Token text that is not on a word boundary is still removed.
+        assert!(!sanitize_uc_text(&format!("x{tok}y"), tok).contains(tok));
+        // A long opaque value is redacted even if it is not the caller's token.
+        assert!(
+            !sanitize_uc_text("key opaqueOpaqueOpaqueOpaqueValue123 here", "t")
+                .contains("opaqueOpaque")
+        );
+        let long = "word ".repeat(200);
+        assert!(sanitize_uc_text(&long, "t").chars().count() <= MAX_UC_TEXT + 1);
+        assert_eq!(
+            sanitize_uc_text("PERMISSION_DENIED no access", "t"),
+            "PERMISSION_DENIED no access"
+        );
     }
 
     #[test]

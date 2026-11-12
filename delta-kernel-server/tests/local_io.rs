@@ -362,6 +362,7 @@ async fn uc_5xx_is_retryable() {
     )
     .await
     .err();
+    assert_eq!(err.code, Code::Unavailable as i32, "{err:?}");
     assert!(err.retryable, "{err:?}");
     assert!(err.message.contains("UC unavailable"), "{}", err.message);
 
@@ -388,7 +389,24 @@ async fn uc_5xx_is_retryable() {
     )
     .await
     .err();
+    assert_eq!(
+        err.code,
+        Code::Unavailable as i32,
+        "connection refused: {err:?}"
+    );
     assert!(err.retryable, "{err:?}");
+
+    // UC 404 stays TABLE_NOT_FOUND (not retryable).
+    uc.answer("tok-404", UcAnswer::Status(404));
+    let err = run(
+        &mut c,
+        with_auth(request(&fx, 0, default_specs()), "tok-404"),
+        Behavior::default(),
+    )
+    .await
+    .err();
+    assert_eq!(err.code, Code::TableNotFound as i32, "{err:?}");
+    assert!(!err.retryable);
 }
 
 /// A snapshot cached for one caller is not served to a caller whose token UC rejects.
@@ -525,5 +543,292 @@ async fn token_absent_from_logs() {
             !logs.contains(secret),
             "token fragment {secret} found in server logs"
         );
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Round-6 (SPEC v9.1)
+// ------------------------------------------------------------------------------------------------
+
+/// B1: a server-side IO failure that fails the build is UNAVAILABLE (retryable), not OP_FAILED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unreachable_local_io_is_unavailable() {
+    let fx = fixture("table-with-dv-small");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let err = {
+        // The log directory cannot be listed or read: every server-side op fails (not
+        // FileNotFound).
+        let _guard = Unreadable::new(fx.log_dir());
+        run(
+            &mut c,
+            request(&fx, 1, default_specs()),
+            Behavior::default(),
+        )
+        .await
+        .err()
+    };
+    assert_eq!(err.code, Code::Unavailable as i32, "{err:?}");
+    assert!(err.retryable);
+    assert!(
+        err.message.contains("server-side IO failed"),
+        "{}",
+        err.message
+    );
+    assert!(server.core.cached_instances_per_table().is_empty());
+    let (ok, _) = run(
+        &mut c,
+        request(&fx, 1, default_specs()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&ok), ResolveKind::FullBuild);
+}
+
+/// B2: forward mode still checks the caller's UC credential before the snapshot cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forward_mode_cache_hit_requires_valid_credential() {
+    let uc = MockUc::start();
+    uc.answer(
+        "tok-good",
+        UcAnswer::Grant {
+            ttl: Duration::from_secs(3600),
+        },
+    );
+    uc.answer("tok-bad", UcAnswer::Status(403));
+    let server = TestServer::start_with(
+        delta_kernel_server::cache::CacheConfig {
+            io_mode: IoMode::Forward,
+            uc_endpoint_override: Some(uc.base_url.clone()),
+            credentials_for_file: true,
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    let mut c = server.client().await;
+    let fx = fixture("table-with-dv-small");
+    let (r1, ops) = run(
+        &mut c,
+        with_auth(request(&fx, 1, default_specs()), "tok-good"),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert!(
+        ops.iter().any(|o| o.kind == "FileListing"),
+        "forward mode: client does IO"
+    );
+    assert_eq!(ops_local(&r1), 0);
+    assert_eq!(uc.calls().len(), 1, "UC is called in forward mode too");
+    let before = server.stats().await;
+    for req in [
+        with_auth(
+            request_with_segment(&fx, 1, default_specs(), &r1),
+            "tok-bad",
+        ),
+        with_auth(request(&fx, 1, default_specs()), "tok-bad"),
+        request_with_segment(&fx, 1, default_specs(), &r1),
+    ] {
+        let out = run(&mut c, req, Behavior::default()).await;
+        assert!(out.ops.is_empty());
+        assert_eq!(out.err().code, Code::PermissionDenied as i32);
+    }
+    let after = server.stats().await;
+    assert_eq!(after.builds_started, before.builds_started);
+    assert_eq!(after.ops_issued_total, before.ops_issued_total);
+    let (hit, _) = run(
+        &mut c,
+        with_auth(
+            request_with_segment(&fx, 1, default_specs(), &r1),
+            "tok-good",
+        ),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&hit), ResolveKind::CacheHit);
+}
+
+/// B3: server-side IO is bounded by the driver's op deadline; on timeout the driver and every
+/// coalesced waiter get DEADLINE and nothing is cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_io_deadline_fails_driver_and_waiters() {
+    let fx = std::sync::Arc::new(fixture("v2-classic-checkpoint-parquet"));
+    let server = TestServer::start().await;
+    let v = latest_version(&fx);
+    server
+        .core
+        .faults
+        .set_local_io_delay(Duration::from_millis(1_500));
+    let started = std::time::Instant::now();
+    let mut c0 = server.client().await;
+    let mut req = request(&fx, v, default_specs());
+    req.client.as_mut().unwrap().op_deadline_ms = 300;
+    let driver = tokio::spawn(async move { run(&mut c0, req, Behavior::default()).await });
+    server.wait_builds_started(1).await;
+    let mut waiters = Vec::new();
+    for _ in 0..3 {
+        let mut c = server.client().await;
+        let req = request(&fx, v, default_specs());
+        waiters.push(tokio::spawn(async move {
+            run(&mut c, req, Behavior::default()).await
+        }));
+    }
+    let d = driver.await.unwrap().err();
+    assert_eq!(d.code, Code::Deadline as i32, "{d:?}");
+    assert!(d.retryable);
+    assert!(
+        started.elapsed() < Duration::from_millis(1_400),
+        "the deadline fired before the slow op finished ({:?})",
+        started.elapsed()
+    );
+    for w in waiters {
+        let e = w.await.unwrap().err();
+        assert_eq!(e.code, Code::Deadline as i32, "coalesced waiter: {e:?}");
+    }
+    assert!(
+        server.core.cached_instances_per_table().is_empty(),
+        "tainted: not cached"
+    );
+    let stats = server.stats().await;
+    assert_eq!((stats.builds_started, stats.builds_coalesced), (1, 3));
+
+    server.core.faults.set_local_io_delay(Duration::ZERO);
+    let (ok, _) = run(
+        &mut server.client().await,
+        request(&fx, v, default_specs()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&ok), ResolveKind::FullBuild);
+    assert_parity(&fx, &ok, &default_specs());
+}
+
+/// NB: a UC error body that echoes the token does not reach the response or the logs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uc_error_body_is_sanitized() {
+    const TOKEN: &str = "dapi-FAKE-test-token-echoed-by-uc";
+    let uc = MockUc::start();
+    uc.answer(
+        TOKEN,
+        UcAnswer::StatusMessage(
+            403,
+            format!("token {TOKEN} lacks READ; got header Authorization: Bearer {TOKEN}"),
+        ),
+    );
+    // In-process: the error message the client receives.
+    let server = server_with_uc(&uc).await;
+    let fx = fixture("table-with-dv-small");
+    let err = run(
+        &mut server.client().await,
+        with_auth(request(&fx, 1, default_specs()), TOKEN),
+        Behavior::default(),
+    )
+    .await
+    .err();
+    assert_eq!(err.code, Code::PermissionDenied as i32);
+    assert!(!err.message.contains(TOKEN), "{}", err.message);
+    assert!(!err.message.contains("dapi"), "{}", err.message);
+    assert!(
+        err.message.contains("lacks READ"),
+        "UC's explanation is kept: {}",
+        err.message
+    );
+
+    // Real binary at trace level: the logs do not contain it either.
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = dir.path().join("endpoint");
+    let log = dir.path().join("stderr.log");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_delta-kernel-server"))
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--enable-test-hooks",
+            "--test-uc-credentials-for-file",
+        ])
+        .arg("--uc-endpoint-override")
+        .arg(&uc.base_url)
+        .arg("--endpoint-file")
+        .arg(&endpoint)
+        .env("RUST_LOG", "trace")
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut addr = None;
+    for _ in 0..400 {
+        if let Ok(s) = std::fs::read_to_string(&endpoint) {
+            addr = Some(s.trim().parse().unwrap());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let err = run(
+        &mut connect(addr.expect("endpoint file written")).await,
+        with_auth(request(&fx, 1, default_specs()), TOKEN),
+        Behavior::default(),
+    )
+    .await
+    .err();
+    assert!(!err.message.contains(TOKEN));
+    std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    child.wait().unwrap();
+    let logs = std::fs::read_to_string(&log).unwrap();
+    assert!(logs.contains("request failed"), "the denial was logged");
+    assert!(!logs.contains(TOKEN), "token echoed by UC reached the logs");
+}
+
+/// Suggestion: the server's own ParquetFooter result equals the forwarded one, as schema protos.
+#[test]
+fn local_and_forward_parquet_footer_schemas_match() {
+    use delta_kernel::plans::proto::schema as proto_schema;
+    use delta_kernel::{FileMeta, IoOperation, Operation};
+    use delta_kernel_server::local_io::LocalIo;
+    use delta_kernel_server::proto::op_result;
+    use prost::Message as _;
+
+    let fx = fixture("v2-checkpoints-parquet-with-sidecars");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(fx.log_dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .collect();
+    files.extend(
+        std::fs::read_dir(fx.log_dir().join("_sidecars"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet")),
+    );
+    assert!(files.len() >= 2, "checkpoint and sidecar parquet files");
+    let local = LocalIo::local_fs();
+    for path in files {
+        let meta = FileMeta {
+            location: url::Url::from_file_path(&path).unwrap(),
+            last_modified: 0,
+            size: std::fs::metadata(&path).unwrap().len(),
+        };
+        let local_schema = proto_schema::StructType::from(
+            local
+                .footer(&meta)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                .schema
+                .as_ref(),
+        );
+        let op = proto::OpRequest {
+            op_id: 1,
+            operation: Operation::IoOperation(IoOperation::parquet_footer(meta)).to_proto_bytes(),
+            listing_hint: None,
+        };
+        let (result, _) = execute_op(&op, &Behavior::default());
+        let Some(op_result::Result::FooterSchema(bytes)) = result.result else {
+            panic!("forwarded footer failed for {}", path.display());
+        };
+        let forwarded = proto_schema::StructType::decode(bytes.as_slice()).unwrap();
+        assert_eq!(local_schema, forwarded, "{}", path.display());
     }
 }

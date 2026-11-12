@@ -75,8 +75,13 @@ level (default `info`). Max gRPC message size is 256 MiB in both directions.
 - **Local IO** (SPEC v9) keeps the forwarded-op rules: per-item results for listings, reads and
   HEAD; `FileNotFound` is benign (a missing `_last_checkpoint`); any other error taints the job,
   so its result is returned but not cached. The server computes and applies the `ListingHint`
-  itself. Cloud IO calls time out after 60 s (object_store client timeout); forwarded ops keep the
-  client's `op_deadline_ms`. Handoff to another waiter only applies to forwarded ops.
+  itself. Handoff to another waiter only applies to forwarded ops.
+- **Local op deadline** (SPEC v9.1): each server-side op runs on its own thread and the job waits at
+  most the driver's `op_deadline_ms`. On timeout the job fails with `DEADLINE` for the driver and
+  every waiter, is tainted and not cached; the abandoned op's result is dropped. Cloud stores also
+  get a 60 s object_store client timeout.
+- **Server-side IO failure** that fails a job → `UNAVAILABLE` (retryable); a client-reported op
+  failure stays `OP_FAILED`.
 - **Counters**: `ServerStats.ops_issued` = ops forwarded to this request's stream;
   `ServerStats.ops_local` = server-side ops run by jobs this request started (a coalesced waiter
   that only waited reports 0). `DebugStats.ops_local_total` sums all server-side ops.
@@ -88,10 +93,13 @@ level (default `info`). Max gRPC message size is 256 MiB in both directions.
     `azure_storage_sas_token`; `gcp_oauth_token` → `google_bearer_token`.
   - Cached per `(sha256(token), table key)` until `expiration_time - 60 s`. The token is never
     logged or stored in clear.
-  - Checked on every request before the snapshot cache, so a cache hit still needs a valid
-    credential for the caller's token (POC authz).
+  - Checked on every request before the snapshot cache, in both `--io-mode`s (SPEC v9.1), so a
+    cache hit still needs a valid credential for the caller's token (POC authz).
   - UC 401/403 → `PERMISSION_DENIED`; 404 → `TABLE_NOT_FOUND`; 5xx or network errors →
-    `INTERNAL` with `retryable = true` ("UC unavailable"); missing `auth` → `PERMISSION_DENIED`.
+    `UNAVAILABLE` (retryable); missing `auth` → `PERMISSION_DENIED`.
+  - UC error text is untrusted: before it enters an error or a log it is sanitized (the caller's
+    token, `Bearer …`, `dapi…`, JWT-like and long opaque words → `[REDACTED]`, control characters
+    dropped) and cut to 256 characters.
 
 - **Cache entry**: `{Arc<Snapshot>, SnapshotInfo, plans: ScanPlanSpec -> ScanPlanResult}`.
   `SnapshotInfo` is computed once, during the build, through the build's op channel.

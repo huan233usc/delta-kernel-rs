@@ -160,7 +160,9 @@ impl ServerError {
     pub fn new(code: proto::error::Code, message: impl Into<String>) -> Self {
         let retryable = matches!(
             code,
-            proto::error::Code::Cancelled | proto::error::Code::Deadline
+            proto::error::Code::Cancelled
+                | proto::error::Code::Deadline
+                | proto::error::Code::Unavailable
         );
         Self {
             code,

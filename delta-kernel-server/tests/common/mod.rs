@@ -920,20 +920,20 @@ pub fn op_counts(resp: &proto::GetSnapshotResponse) -> (i32, i32) {
 }
 
 /// Makes a file unreadable until the guard drops (a real local IO error, not FileNotFound).
-pub struct Unreadable(PathBuf);
+pub struct Unreadable(PathBuf, std::fs::Permissions);
 
 impl Unreadable {
     pub fn new(path: PathBuf) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
+        let original = std::fs::metadata(&path).unwrap().permissions();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        Self(path)
+        Self(path, original)
     }
 }
 
 impl Drop for Unreadable {
     fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::set_permissions(&self.0, self.1.clone());
     }
 }
 
@@ -987,6 +987,8 @@ pub enum UcAnswer {
     Grant { ttl: Duration },
     /// HTTP status with a UC-style error body.
     Status(u16),
+    /// HTTP status with this `message` in the UC error body (e.g. one echoing the token).
+    StatusMessage(u16, String),
 }
 
 /// One request the mock UC received.
@@ -1103,6 +1105,10 @@ fn serve_one(
             UcAnswer::Status(code) => (
                 code,
                 serde_json::json!({"error_code": "PERMISSION_DENIED", "message": "mock UC says no"}),
+            ),
+            UcAnswer::StatusMessage(code, message) => (
+                code,
+                serde_json::json!({"error_code": "PERMISSION_DENIED", "message": message}),
             ),
         };
         let payload = payload.to_string();
