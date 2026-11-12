@@ -20,9 +20,11 @@ use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::{LogPath, Snapshot, SnapshotRef};
 use tokio::sync::watch;
 
+use crate::creds::CredentialProvider;
 use crate::errors::{ServerError, classify_build_error, classify_kernel_error};
 use crate::executor::{OpChannel, RemotePlanExecutor, StreamPort};
 use crate::info::{SegmentId, compute_snapshot_info, has_staged_commits, segment_id};
+use crate::local_io::LocalIo;
 use crate::plan::{PlanOutcome, generate_plan, spec_key};
 use crate::proto::error::Code;
 use crate::proto::{self, version_spec};
@@ -50,6 +52,12 @@ const DEFAULT_OP_DEADLINE: Duration = Duration::from_secs(60);
 pub struct CacheConfig {
     pub max_instances_per_table: usize,
     pub max_cache_bytes: usize,
+    /// Where simple IO ops run (SPEC v9).
+    pub io_mode: IoMode,
+    /// UC base URL replacing `https://{workspace_host}` (tests).
+    pub uc_endpoint_override: Option<String>,
+    /// Test hook: require and check UC credentials for `file://` tables too.
+    pub credentials_for_file: bool,
 }
 
 impl Default for CacheConfig {
@@ -57,8 +65,19 @@ impl Default for CacheConfig {
         Self {
             max_instances_per_table: 2,
             max_cache_bytes: 4 << 30,
+            io_mode: IoMode::Local,
+            uc_endpoint_override: None,
+            credentials_for_file: false,
         }
     }
+}
+
+/// `--io-mode`: run simple IO ops on the server (`local`, default) or forward every op to the
+/// client (`forward`, the pre-v9 behavior, kept for A/B runs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum IoMode {
+    Local,
+    Forward,
 }
 
 type TableKey = (String, String);
@@ -203,6 +222,18 @@ impl<T: Clone> Job<T> {
     }
 }
 
+/// Everything a snapshot build job needs besides its op channel.
+struct BuildInputs {
+    key: TableKey,
+    location: String,
+    target: Target,
+    build_key: Option<BuildKey>,
+    /// Cached instance to build incrementally from.
+    base: Option<Arc<Instance>>,
+    /// Server-side IO (`None` in forward mode).
+    io: Option<Arc<LocalIo>>,
+}
+
 /// Result of the blocking part of a build.
 enum Built {
     New(SnapshotRef, Box<proto::SnapshotInfo>, proto::ResolveKind),
@@ -244,6 +275,8 @@ pub struct Core {
     pub config: CacheConfig,
     pub counters: Arc<ServerCounters>,
     pub faults: Arc<Faults>,
+    pub creds: CredentialProvider,
+    local_fs: Arc<LocalIo>,
     state: Mutex<CacheState>,
     clock: AtomicU64,
 }
@@ -271,11 +304,17 @@ enum Target {
 
 impl Core {
     pub fn new(instance_id: String, config: CacheConfig) -> Arc<Self> {
+        let creds = CredentialProvider::new(
+            config.uc_endpoint_override.clone(),
+            config.credentials_for_file,
+        );
         Arc::new(Self {
             instance_id,
             config,
             counters: Arc::default(),
             faults: Arc::default(),
+            creds,
+            local_fs: Arc::new(LocalIo::local_fs()),
             state: Mutex::default(),
             clock: AtomicU64::new(0),
         })
@@ -351,6 +390,20 @@ impl Core {
             table.table_id.clone()
         };
         let key: TableKey = (table_id, location.clone());
+        // Credentials first, also on what will be a cache hit: this is the authz check (SPEC v9).
+        let io = match self.config.io_mode {
+            IoMode::Forward => None,
+            IoMode::Local => {
+                let url = url::Url::parse(&location).map_err(|e| {
+                    ServerError::new(Code::TableNotFound, format!("bad location: {e}"))
+                })?;
+                let cred = self
+                    .creds
+                    .credential_for(req.auth.as_ref(), &key.0, &url)
+                    .await?;
+                Some(cred.map_or_else(|| self.local_fs.clone(), |c| c.io.clone()))
+            }
+        };
         let target = match req.at.as_ref().and_then(|a| a.spec.as_ref()) {
             Some(version_spec::Spec::Version(v)) => Target::Version(*v),
             Some(version_spec::Spec::CatalogLatest(c)) => {
@@ -378,7 +431,8 @@ impl Core {
             },
         };
 
-        let (instance, resolved_by) = match self.resolve(&key, &location, &target, &req, port) {
+        let (instance, resolved_by) = match self.resolve(&key, &location, &target, &req, port, &io)
+        {
             Resolution::Hit(inst) => (inst, proto::ResolveKind::CacheHit),
             Resolution::Wait(job, coalesced) => {
                 let outcome = job.wait().await;
@@ -395,7 +449,7 @@ impl Core {
 
         let mut plans = Vec::with_capacity(req.plans.len());
         for spec in &req.plans {
-            plans.push(self.plan_for(&instance, spec, port).await?);
+            plans.push(self.plan_for(&instance, spec, port, &io).await?);
         }
         instance.last_used.store(self.tick(), Ordering::Relaxed);
         // Plans grew the instance; re-apply the memory bound.
@@ -412,6 +466,7 @@ impl Core {
                 server_time_us: started.elapsed().as_micros() as i64,
                 client_op_time_us: port.client_op_time_us(),
                 instance_id: self.instance_id.clone(),
+                ops_local: port.ops_local(),
             }),
         })
     }
@@ -424,6 +479,7 @@ impl Core {
         target: &Target,
         req: &proto::GetSnapshotRequest,
         port: &Arc<StreamPort>,
+        io: &Option<Arc<LocalIo>>,
     ) -> Resolution {
         let mut st = self.state.lock().unwrap();
         let expected = req.expected_log_segment.as_ref();
@@ -525,24 +581,27 @@ impl Core {
         self.counters.builds_started.fetch_add(1, Ordering::Relaxed);
         self.spawn_build(
             job.clone(),
-            key.clone(),
-            location.to_string(),
-            target.clone(),
-            build_key,
-            base,
+            BuildInputs {
+                key: key.clone(),
+                location: location.to_string(),
+                target: target.clone(),
+                build_key,
+                base,
+                io: io.clone(),
+            },
         );
         Resolution::Wait(job, false)
     }
 
-    fn spawn_build(
-        self: &Arc<Self>,
-        job: Arc<Job<BuildOutcome>>,
-        key: TableKey,
-        location: String,
-        target: Target,
-        build_key: Option<BuildKey>,
-        base: Option<Arc<Instance>>,
-    ) {
+    fn spawn_build(self: &Arc<Self>, job: Arc<Job<BuildOutcome>>, inputs: BuildInputs) {
+        let BuildInputs {
+            key,
+            location,
+            target,
+            build_key,
+            base,
+            io,
+        } = inputs;
         let core = self.clone();
         tokio::spawn(async move {
             let channel = job.channel.clone();
@@ -558,7 +617,8 @@ impl Core {
             // Confirmation time of a latest result: when its listing started, not when it ended.
             let started = Instant::now();
             let built = tokio::task::spawn_blocking(move || {
-                let engine = PlanBasedEngine::new(None, Arc::new(RemotePlanExecutor::new(channel)));
+                let engine =
+                    PlanBasedEngine::new(None, Arc::new(RemotePlanExecutor::new(channel, io)));
                 let kind = if base.is_some() {
                     proto::ResolveKind::Incremental
                 } else {
@@ -757,6 +817,7 @@ impl Core {
         instance: &Arc<Instance>,
         spec: &proto::ScanPlanSpec,
         port: &Arc<StreamPort>,
+        io: &Option<Arc<LocalIo>>,
     ) -> Result<proto::ScanPlanResult, ServerError> {
         let key = spec_key(spec);
         let job = {
@@ -780,7 +841,7 @@ impl Core {
                     );
                     let job = Job::new(channel);
                     plans.insert(key.clone(), PlanSlot::InFlight(job.clone()));
-                    self.spawn_plan(job.clone(), instance.clone(), spec.clone(), key);
+                    self.spawn_plan(job.clone(), instance.clone(), spec.clone(), key, io.clone());
                     job
                 }
             }
@@ -796,12 +857,14 @@ impl Core {
         instance: Arc<Instance>,
         spec: proto::ScanPlanSpec,
         key: Vec<u8>,
+        io: Option<Arc<LocalIo>>,
     ) {
         tokio::spawn(async move {
             let channel = job.channel.clone();
             let snapshot = instance.snapshot.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                let engine = PlanBasedEngine::new(None, Arc::new(RemotePlanExecutor::new(channel)));
+                let engine =
+                    PlanBasedEngine::new(None, Arc::new(RemotePlanExecutor::new(channel, io)));
                 generate_plan(&snapshot, &spec, &engine)
             })
             .await;

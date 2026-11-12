@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use delta_kernel_server::cache::{CacheConfig, Core, KERNEL_REV};
+use delta_kernel_server::cache::{CacheConfig, Core, IoMode, KERNEL_REV};
 use delta_kernel_server::service::{KernelService, bind, serve, write_endpoint_file};
 
 #[derive(Parser, Debug)]
@@ -31,6 +31,21 @@ struct Args {
     /// Global bound on estimated cache memory, in bytes (LRU eviction across tables).
     #[arg(long, default_value_t = 4 << 30)]
     max_cache_bytes: usize,
+    /// Where FileListing / ReadBytes / HeadFile / ParquetFooter run: on the server (`local`) or
+    /// on the client like every other op (`forward`). QueryPlan ops are always forwarded.
+    #[arg(long, value_enum, default_value_t = IoMode::Local)]
+    io_mode: IoMode,
+    /// UC base URL used instead of `https://{auth.workspace_host}` for temporary credentials.
+    #[arg(long)]
+    uc_endpoint_override: Option<String>,
+    /// Test only (requires --enable-test-hooks): require UC credentials for file:// tables too.
+    #[arg(
+        long,
+        hide = true,
+        default_value_t = false,
+        requires = "enable_test_hooks"
+    )]
+    test_uc_credentials_for_file: bool,
 }
 
 #[tokio::main]
@@ -55,6 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CacheConfig {
             max_instances_per_table: args.max_instances_per_table,
             max_cache_bytes: args.max_cache_bytes,
+            io_mode: args.io_mode,
+            uc_endpoint_override: args.uc_endpoint_override.clone(),
+            credentials_for_file: args.test_uc_credentials_for_file,
         },
     );
     let (listener, addr) = bind(args.listen).await?;
@@ -66,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         %instance_id,
         kernel_rev = KERNEL_REV,
         test_hooks = args.enable_test_hooks,
+        io_mode = ?args.io_mode,
         "delta-kernel-server listening"
     );
     let shutdown = async {

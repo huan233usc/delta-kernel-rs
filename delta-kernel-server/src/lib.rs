@@ -1,15 +1,18 @@
 //! delta-kernel-server (POC, not for merge).
 //!
 //! A long-running gRPC service that builds delta_kernel snapshots, `SnapshotInfo`, and declarative
-//! metadata scan plans, and caches them across queries. The service performs no storage IO: every
-//! kernel IO or query op is sent to the requesting client over the bidi stream (see
-//! [`executor::RemotePlanExecutor`]). The wire contract is `proto/delta_kernel_server.proto`.
+//! metadata scan plans, and caches them across queries. Simple IO ops run on the server
+//! ([`local_io`], with UC-vended credentials from [`creds`]); query-plan ops are sent to the
+//! requesting client over the bidi stream (see [`executor::RemotePlanExecutor`]). The wire
+//! contract is `proto/delta_kernel_server.proto`.
 
 pub mod cache;
+pub mod creds;
 pub mod decode;
 pub mod errors;
 pub mod executor;
 pub mod info;
+pub mod local_io;
 pub mod normalize;
 pub mod plan;
 pub mod service;

@@ -71,8 +71,12 @@ message GetSnapshotRequest {
   // Log segment the client already has; on a cache hit the server compares it with the cached
   // instance and treats a mismatch as a miss.
   optional LogSegmentInfo expected_log_segment = 5;
+  // v9: caller credentials the server exchanges with UC for storage credentials. Not needed for
+  // file:// tables. The token is never logged; caches key on its SHA-256 only.
+  Auth auth = 6;
   // 10-19 reserved for query-dependent plan parameters (predicate, read_schema).
 }
+message Auth { string workspace_host = 1; string bearer_token = 2; }
 message ClientInfo {
   string dbr_version = 1;
   string kernel_rev = 2;
@@ -172,10 +176,12 @@ enum ResolveKind { CACHE_HIT = 0; INCREMENTAL = 1; FULL_BUILD = 2; COALESCED = 3
 message ServerStats {
   int32 ops_issued = 1; int64 server_time_us = 2; int64 client_op_time_us = 3;
   string instance_id = 4;
+  int32 ops_local = 5;          // v9: ops this request's jobs executed on the server
 }
 message Error {
   enum Code { INTERNAL = 0; UNSUPPORTED = 1; TABLE_NOT_FOUND = 2; PROTOCOL_UNSUPPORTED = 3;
-              VERSION_MISMATCH = 4; OP_FAILED = 5; CANCELLED = 6; DEADLINE = 7; }
+              VERSION_MISMATCH = 4; OP_FAILED = 5; CANCELLED = 6; DEADLINE = 7;
+              PERMISSION_DENIED = 8; }
   Code code = 1; string message = 2; bool retryable = 3;
 }
 
@@ -185,6 +191,7 @@ message DebugStatsRequest {}
 message DebugStats {
   int64 builds_started = 1; int64 builds_coalesced = 2; int64 ops_issued_total = 3;
   map<string, int32> cached_instances_per_table = 4;
+  int64 ops_local_total = 5;    // v9
 }
 message ResetCacheRequest {} message ResetCacheResponse {}
 message FaultSpec {

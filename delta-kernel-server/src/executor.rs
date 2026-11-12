@@ -1,5 +1,10 @@
-//! [`RemotePlanExecutor`]: a kernel [`PlanExecutor`] that ships every [`Operation`] to a client
-//! stream and blocks (on a `spawn_blocking` thread) for the matching `OpResult`.
+//! [`RemotePlanExecutor`]: the kernel [`PlanExecutor`] of a server job.
+//!
+//! In `local` IO mode (SPEC v9) simple IO ops (`FileListing`, `ReadBytes`, `HeadFile`,
+//! `ParquetFooter`) run on the server through [`LocalIo`]; `QueryPlan` ops are shipped to a client
+//! stream, and the executor blocks (on a `spawn_blocking` thread) for the matching `OpResult`. In
+//! `forward` mode every op is shipped. Both paths share the same error bookkeeping: per-item
+//! errors, `FileNotFound` is benign, any other error taints the job.
 //!
 //! A kernel job (a snapshot build or a plan generation) owns one [`OpChannel`]. The channel holds
 //! the candidate client streams that are waiting for that job's result, in join order. The first
@@ -29,7 +34,8 @@ use tokio::sync::mpsc;
 use tonic::Status;
 use url::Url;
 
-use crate::errors::{CancelReason, codes, kernel_error_from_code};
+use crate::errors::{CancelReason, codes, kernel_error_from_code, to_wire_kernel_error};
+use crate::local_io::{LocalIo, apply_listing_hint};
 use crate::proto::{self, op_result, server_msg};
 use crate::stats::{Faults, ServerCounters};
 
@@ -46,6 +52,8 @@ pub struct StreamPort {
     state: Mutex<PortState>,
     op_deadline: Duration,
     ops_issued: AtomicI32,
+    /// Ops executed on the server by jobs this stream started (SPEC v9 `ops_local`).
+    ops_local: AtomicI32,
     client_op_time_us: AtomicI64,
 }
 
@@ -70,6 +78,7 @@ impl StreamPort {
             }),
             op_deadline,
             ops_issued: AtomicI32::new(0),
+            ops_local: AtomicI32::new(0),
             client_op_time_us: AtomicI64::new(0),
         })
     }
@@ -84,6 +93,10 @@ impl StreamPort {
 
     pub fn ops_issued(&self) -> i32 {
         self.ops_issued.load(Ordering::Relaxed)
+    }
+
+    pub fn ops_local(&self) -> i32 {
+        self.ops_local.load(Ordering::Relaxed)
     }
 
     pub fn client_op_time_us(&self) -> i64 {
@@ -188,6 +201,8 @@ impl StreamPort {
 
 /// The op channel of one kernel job: candidate streams plus the job's error bookkeeping.
 pub struct OpChannel {
+    /// The stream that started the job; local ops are attributed to it.
+    starter: Arc<StreamPort>,
     candidates: Mutex<Vec<Arc<StreamPort>>>,
     cancel: Mutex<Option<CancelReason>>,
     tainted: AtomicBool,
@@ -206,6 +221,7 @@ impl OpChannel {
         faults: Arc<Faults>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            starter: driver.clone(),
             candidates: Mutex::new(vec![driver]),
             cancel: Mutex::new(None),
             tainted: AtomicBool::new(false),
@@ -289,14 +305,97 @@ enum OpShape {
     Data,
 }
 
-/// [`PlanExecutor`] that forwards ops to the job's driving client stream.
+/// [`PlanExecutor`] of one job: local simple IO (when `local` is set) plus forwarded ops.
 pub struct RemotePlanExecutor {
     channel: Arc<OpChannel>,
+    local: Option<Arc<LocalIo>>,
 }
 
 impl RemotePlanExecutor {
-    pub fn new(channel: Arc<OpChannel>) -> Self {
-        Self { channel }
+    /// `local = None` forwards every op (`--io-mode forward`).
+    pub fn new(channel: Arc<OpChannel>, local: Option<Arc<LocalIo>>) -> Self {
+        Self { channel, local }
+    }
+
+    /// Records a server-side error with the same rules as a client-reported one.
+    fn observe_local(&self, e: &KernelError) {
+        self.channel.observe_error(&to_wire_kernel_error(e));
+    }
+
+    fn observe_items<T>(&self, items: &[KernelResult<T>]) {
+        for e in items.iter().filter_map(|r| r.as_ref().err()) {
+            if crate::errors::kernel_error_code(e) == codes::FILE_NOT_FOUND {
+                self.channel
+                    .counters
+                    .local_not_found_items
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.observe_local(e);
+        }
+    }
+
+    /// Executes a simple IO op on the server.
+    fn execute_local(&self, local: &LocalIo, io: IoOperation) -> KernelResult<PlanResult> {
+        let ch = &self.channel;
+        ch.counters.ops_local_total.fetch_add(1, Ordering::Relaxed);
+        ch.starter.ops_local.fetch_add(1, Ordering::Relaxed);
+        let delay = ch.faults.local_io_delay();
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        match io {
+            IoOperation::FileListing { url } => match local.list(&url) {
+                Ok(items) => {
+                    let items = match ch.listing_hint(&url) {
+                        Some(hint) => {
+                            let listed = items.len();
+                            let kept = apply_listing_hint(&url, items, &hint);
+                            ch.counters
+                                .listing_items_dropped
+                                .fetch_add((listed - kept.len()) as i64, Ordering::Relaxed);
+                            kept
+                        }
+                        None => items,
+                    };
+                    self.observe_items(&items);
+                    Ok(PlanResult::FileMeta(Box::new(items.into_iter())))
+                }
+                Err(e) => {
+                    self.observe_local(&e);
+                    Err(e)
+                }
+            },
+            IoOperation::ReadBytes { files } => match local.read(files) {
+                Ok(items) => {
+                    self.observe_items(&items);
+                    Ok(PlanResult::Bytes(Box::new(items.into_iter())))
+                }
+                Err(e) => {
+                    self.observe_local(&e);
+                    Err(e)
+                }
+            },
+            // Same shape as a forwarded HeadFile: one item, possibly an error.
+            IoOperation::HeadFile { url } => {
+                let item = local.head(&url);
+                if let Err(e) = &item {
+                    self.observe_local(e);
+                }
+                Ok(PlanResult::FileMeta(Box::new(std::iter::once(item))))
+            }
+            IoOperation::ParquetFooter { file } => match local.footer(&file) {
+                Ok(footer) => Ok(PlanResult::ParquetFooter(footer)),
+                Err(e) => {
+                    self.observe_local(&e);
+                    Err(e)
+                }
+            },
+            IoOperation::WriteBytes { .. } | IoOperation::AtomicCopy { .. } => {
+                Err(KernelError::unsupported(
+                    "delta-kernel-server is read-only: write ops are rejected",
+                ))
+            }
+        }
     }
 
     fn convert(&self, shape: OpShape, result: proto::OpResult) -> KernelResult<PlanResult> {
@@ -392,6 +491,10 @@ pub fn file_meta_from_status(f: &proto::FileStatus) -> KernelResult<FileMeta> {
 
 impl PlanExecutor for RemotePlanExecutor {
     fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
+        let op = match (&self.local, op) {
+            (Some(local), Operation::IoOperation(io)) => return self.execute_local(local, io),
+            (_, op) => op,
+        };
         let (shape, hint) = match &op {
             Operation::IoOperation(IoOperation::FileListing { url }) => {
                 (OpShape::Files, self.channel.listing_hint(url))

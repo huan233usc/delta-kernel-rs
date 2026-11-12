@@ -152,6 +152,7 @@ impl DeltaKernelService for KernelService {
             builds_coalesced: c.builds_coalesced.load(Ordering::Relaxed),
             ops_issued_total: c.ops_issued_total.load(Ordering::Relaxed),
             cached_instances_per_table: self.core.cached_instances_per_table(),
+            ops_local_total: c.ops_local_total.load(Ordering::Relaxed),
         }))
     }
 

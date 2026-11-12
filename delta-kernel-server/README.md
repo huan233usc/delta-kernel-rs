@@ -4,12 +4,18 @@ A long-running gRPC service that runs the driver-side delta_kernel work of the D
 path: snapshot build (full or incremental), `SnapshotInfo`, and
 `Scan::declarative_metadata_scan_plan`. It caches all three across queries.
 
-The server does no storage IO and holds no credentials. Every kernel IO or query op is sent to the
-requesting client as an `OpRequest` on the same bidi stream. The client executes it (in DBR, with
-the existing `DeltaV2KernelPlanExecutor`) and sends back an `OpResult`.
+IO is hybrid (SPEC v9):
 
-- Wire contract: [`proto/delta_kernel_server.proto`](proto/delta_kernel_server.proto) (SPEC v5 §5,
-  plus two additive fields marked `DEVIATION`).
+- **On the server**: `FileListing`, `ReadBytes`, `HeadFile`, `ParquetFooter`, through the default
+  engine's object_store handlers on one shared multi-thread tokio runtime. Cloud tables use
+  storage credentials the server gets from UC with the caller's forwarded token.
+- **On the client**: `QueryPlan` ops (P&M replay, sidecar / checkpoint scans) are sent to the
+  requesting client as an `OpRequest` on the same bidi stream. The client executes them (in DBR,
+  with the existing `DeltaV2KernelPlanExecutor`) and sends back an `OpResult`.
+- `--io-mode forward` restores the pre-v9 behavior (every op forwarded) for A/B runs.
+
+- Wire contract: [`proto/delta_kernel_server.proto`](proto/delta_kernel_server.proto) (SPEC v9 §5
+  plus the additive fields of the v6-v9 revisions).
 - Kernel: the in-tree `kernel` crate at `4633926ff40ff39e5ba8bc690a965b4fb793c073`.
 
 ## Build
@@ -57,11 +63,35 @@ delta-kernel-server \
 | `--enable-test-hooks` | off | enables `Ping`, `GetDebugStats`, `ResetCache`, `InjectFault`; without it they return `PERMISSION_DENIED` |
 | `--max-instances-per-table` | `2` | cached snapshot instances kept per `(table_id, location)` |
 | `--max-cache-bytes` | `4 GiB` | global LRU bound over estimated memory (snapshot heap + plan bytes) |
+| `--io-mode` | `local` | `local`: simple IO ops run on the server; `forward`: every op goes to the client |
+| `--uc-endpoint-override` | none | UC base URL instead of `https://{auth.workspace_host}` (tests, proxies) |
+| `--test-uc-credentials-for-file` | off, hidden | test only, needs `--enable-test-hooks`: run the UC credential check for `file://` tables too |
 
 SIGTERM or Ctrl-C shuts the server down gracefully. Logs go to stderr; `RUST_LOG` controls the
 level (default `info`). Max gRPC message size is 256 MiB in both directions.
 
 ## Server semantics (SPEC §7)
+
+- **Local IO** (SPEC v9) keeps the forwarded-op rules: per-item results for listings, reads and
+  HEAD; `FileNotFound` is benign (a missing `_last_checkpoint`); any other error taints the job,
+  so its result is returned but not cached. The server computes and applies the `ListingHint`
+  itself. Cloud IO calls time out after 60 s (object_store client timeout); forwarded ops keep the
+  client's `op_deadline_ms`. Handoff to another waiter only applies to forwarded ops.
+- **Counters**: `ServerStats.ops_issued` = ops forwarded to this request's stream;
+  `ServerStats.ops_local` = server-side ops run by jobs this request started (a coalesced waiter
+  that only waited reports 0). `DebugStats.ops_local_total` sums all server-side ops.
+- **Credentials** (SPEC v9): `file://` tables need none. For s3/abfss/gs tables:
+  - `table_id` is a UC UUID → `POST /api/2.1/unity-catalog/temporary-table-credentials
+    {table_id, operation: READ}`; otherwise `temporary-path-credentials {url, operation: PATH_READ}`.
+  - The response maps to object_store options: `aws_temp_credentials` → `aws_access_key_id`,
+    `aws_secret_access_key`, `aws_session_token`; `azure_user_delegation_sas` →
+    `azure_storage_sas_token`; `gcp_oauth_token` → `google_bearer_token`.
+  - Cached per `(sha256(token), table key)` until `expiration_time - 60 s`. The token is never
+    logged or stored in clear.
+  - Checked on every request before the snapshot cache, so a cache hit still needs a valid
+    credential for the caller's token (POC authz).
+  - UC 401/403 → `PERMISSION_DENIED`; 404 → `TABLE_NOT_FOUND`; 5xx or network errors →
+    `INTERNAL` with `retryable = true` ("UC unavailable"); missing `auth` → `PERMISSION_DENIED`.
 
 - **Cache entry**: `{Arc<Snapshot>, SnapshotInfo, plans: ScanPlanSpec -> ScanPlanResult}`.
   `SnapshotInfo` is computed once, during the build, through the build's op channel.
@@ -120,7 +150,13 @@ cargo +1.95.0 clippy -p delta-kernel-server --all-targets -- -D warnings
 cargo +nightly fmt -- --check   # the repo's rustfmt.toml uses nightly-only options
 ```
 
-`tests/loopback.rs` (L0a) starts the server in-process on `127.0.0.1:0`. Its test client decodes
+`tests/local_io.rs` covers SPEC v9: cold-build op split (forwarded = QueryPlan ops only), local
+FileNotFound / taint / ListingHint, a forward-mode smoke run, and the UC credential provider
+against a mock UC HTTP server (endpoint choice, caching and expiry, 401/403/5xx, authz on cache
+hit, token absent from trace logs of the real binary).
+
+`tests/loopback.rs` (L0a) starts the server in-process on `127.0.0.1:0` (default `local` IO mode;
+forward-specific mechanics such as handoff of a listing op run in `forward` mode). Its test client decodes
 each forwarded `Operation` (`src/decode.rs`) and executes it with kernel's `SyncPlanExecutor`
 (dev-only `test-utils`) over copies of `kernel/tests/data` fixtures. Every parity test checks:
 

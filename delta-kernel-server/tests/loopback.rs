@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use delta_kernel_server::cache::CacheConfig;
+use delta_kernel_server::cache::{CacheConfig, IoMode};
 use delta_kernel_server::errors::codes;
 use delta_kernel_server::normalize::normalize_plan_bytes;
 use delta_kernel_server::proto::error::Code;
@@ -19,14 +19,22 @@ use tokio::sync::Notify;
 // (a) semantic parity over the fixture matrix
 // ------------------------------------------------------------------------------------------------
 
-/// FULL_BUILD at the latest version, then parity with the in-process plan and SnapshotInfo.
+/// FULL_BUILD at the latest version (default `local` IO mode), then parity with the in-process
+/// plan and SnapshotInfo.
 async fn parity_case(name: &str) -> (Fixture, proto::GetSnapshotResponse, Vec<OpLog>) {
-    let fx = fixture(name);
-    parity_on(fx).await
+    parity_on_mode(fixture(name), IoMode::Local).await
 }
 
 async fn parity_on(fx: Fixture) -> (Fixture, proto::GetSnapshotResponse, Vec<OpLog>) {
-    let server = TestServer::start().await;
+    parity_on_mode(fx, IoMode::Local).await
+}
+
+/// Parity in `mode`. Local mode: the client sees only QueryPlan ops and the server ran the rest.
+async fn parity_on_mode(
+    fx: Fixture,
+    mode: IoMode,
+) -> (Fixture, proto::GetSnapshotResponse, Vec<OpLog>) {
+    let server = TestServer::start_mode(mode).await;
     let mut client = server.client().await;
     let version = latest_version(&fx);
     let specs = default_specs();
@@ -39,8 +47,28 @@ async fn parity_on(fx: Fixture) -> (Fixture, proto::GetSnapshotResponse, Vec<OpL
     .ok();
     assert_eq!(resp.version, version);
     assert_eq!(resolved(&resp), ResolveKind::FullBuild);
-    assert!(ops_issued(&resp) > 0);
-    assert_eq!(ops_issued(&resp) as usize, ops.len());
+    assert_eq!(
+        ops_issued(&resp) as usize,
+        ops.len(),
+        "forwarded = ops the client saw"
+    );
+    match mode {
+        IoMode::Local => {
+            assert!(
+                ops_local(&resp) > 0,
+                "listing / _last_checkpoint ran on the server"
+            );
+            assert!(
+                ops.iter().all(|o| o.kind == "QueryPlan"),
+                "local mode forwards QueryPlan only: {:?}",
+                ops.iter().map(|o| o.kind).collect::<Vec<_>>()
+            );
+        }
+        IoMode::Forward => {
+            assert!(ops_issued(&resp) > 0);
+            assert_eq!(ops_local(&resp), 0);
+        }
+    }
     assert_parity(&fx, &resp, &specs);
     (fx, resp, ops)
 }
@@ -62,8 +90,16 @@ fn segment(resp: &proto::GetSnapshotResponse) -> &proto::LogSegmentInfo {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parity_v2_checkpoint_with_sidecars() {
-    let (_fx, resp, ops) = parity_case("v2-checkpoints-parquet-with-sidecars").await;
-    assert!(segment(&resp).checkpoint_version.is_some());
+    let (_fx, local, _) = parity_case("v2-checkpoints-parquet-with-sidecars").await;
+    assert!(segment(&local).checkpoint_version.is_some());
+    // Forward mode shows which files are read: sidecars must be among them.
+    let (_fx, resp, ops) = parity_on_mode(
+        fixture("v2-checkpoints-parquet-with-sidecars"),
+        IoMode::Forward,
+    )
+    .await;
+    assert_eq!(info(&resp).metadata, info(&local).metadata);
+    assert_eq!(info(&resp).crc, info(&local).crc);
     let plans_mention_sidecars = resp
         .plans
         .iter()
@@ -113,8 +149,9 @@ async fn parity_crc_malformed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parity_no_last_checkpoint() {
     // Fewer than 10 commits: `_last_checkpoint` does not exist, so its read comes back as a
-    // per-item FileNotFound and the build must still succeed (SPEC B1 regression).
-    let (fx, resp, ops) = parity_case("table-without-dv-small").await;
+    // per-item FileNotFound and the build must still succeed (SPEC B1 regression). Local mode is
+    // covered by `local_last_checkpoint_not_found_is_benign`; forward mode shows the item here.
+    let (fx, resp, ops) = parity_on_mode(fixture("table-without-dv-small"), IoMode::Forward).await;
     assert!(!fx.log_dir().join("_last_checkpoint").exists());
     assert!(segment(&resp).checkpoint_version.is_none());
     let fnf = ops.iter().any(|o| {
@@ -216,7 +253,11 @@ async fn timestamp_partition_with_timezone_is_unsupported() {
     .await
     .ok();
     assert_eq!(resolved(&again), ResolveKind::CacheHit);
-    assert_eq!(ops_issued(&again), 0);
+    assert_eq!(
+        op_counts(&again),
+        (0, 0),
+        "cache hit: nothing forwarded, nothing local"
+    );
     assert!(again.plans[0].cache_hit);
 }
 
@@ -271,7 +312,11 @@ async fn resolve_sequence_full_hit_incremental_checkpoint() {
     .await
     .ok();
     assert_eq!(resolved(&r2), ResolveKind::CacheHit);
-    assert_eq!(ops_issued(&r2), 0);
+    assert_eq!(
+        op_counts(&r2),
+        (0, 0),
+        "cache hit: nothing forwarded, nothing local"
+    );
     assert!(ops2.is_empty());
     assert!(r2.plans.iter().all(|p| p.cache_hit));
     assert_eq!(
@@ -347,23 +392,45 @@ async fn resolve_sequence_full_hit_incremental_checkpoint() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_streams_coalesce_into_one_build() {
+    coalesce_case(IoMode::Local).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_streams_coalesce_into_one_build_forward() {
+    coalesce_case(IoMode::Forward).await;
+}
+
+async fn coalesce_case(mode: IoMode) {
     let fx = Arc::new(fixture("v2-checkpoints-parquet-with-sidecars"));
-    let server = TestServer::start().await;
+    let server = TestServer::start_mode(mode).await;
     let before = server.stats().await;
     let version = latest_version(&fx);
     let specs = default_specs();
 
-    // The driver answers slowly, so the build is still in flight when the others arrive.
+    // The build is slow (slow client answers, or slow server-side IO), so it is still in flight
+    // when the others arrive.
     let first_op = Arc::new(Notify::new());
     let mut c0 = server.client().await;
     let req = request(&fx, version, specs.clone());
-    let driver_behavior = Behavior {
-        op_delay: Duration::from_millis(150),
-        first_op: Some(first_op.clone()),
-        ..Default::default()
+    let driver_behavior = match mode {
+        IoMode::Forward => Behavior {
+            op_delay: Duration::from_millis(150),
+            first_op: Some(first_op.clone()),
+            ..Default::default()
+        },
+        IoMode::Local => {
+            server
+                .core
+                .faults
+                .set_local_io_delay(Duration::from_millis(150));
+            Behavior::default()
+        }
     };
     let driver = tokio::spawn(async move { run(&mut c0, req, driver_behavior).await });
-    first_op.notified().await;
+    match mode {
+        IoMode::Forward => first_op.notified().await,
+        IoMode::Local => server.wait_builds_started(before.builds_started + 1).await,
+    }
 
     let mut waiters = Vec::new();
     for _ in 0..7 {
@@ -374,10 +441,14 @@ async fn concurrent_streams_coalesce_into_one_build() {
         }));
     }
     let (driver_resp, _) = driver.await.unwrap().ok();
+    server.core.faults.set_local_io_delay(Duration::ZERO);
     let mut kinds = vec![resolved(&driver_resp)];
+    let mut local_ops = ops_local(&driver_resp) as i64;
     for w in waiters {
         let (r, _) = w.await.unwrap().ok();
         assert_eq!(r.version, version);
+        // A waiter may start a plan job (plans coalesce separately), so it can own local ops.
+        local_ops += ops_local(&r) as i64;
         assert_eq!(r.info, driver_resp.info);
         let norm = |r: &proto::GetSnapshotResponse| -> Vec<Vec<u8>> {
             r.plans
@@ -395,6 +466,14 @@ async fn concurrent_streams_coalesce_into_one_build() {
         "exactly one build for 8 concurrent streams"
     );
     assert_eq!(after.builds_coalesced - before.builds_coalesced, 7);
+    assert_eq!(
+        after.ops_local_total - before.ops_local_total,
+        local_ops,
+        "every server-side op is attributed to exactly one request"
+    );
+    if mode == IoMode::Local {
+        assert!(ops_local(&driver_resp) > 0, "the driver ran the build's IO");
+    }
     assert_eq!(kinds[0], ResolveKind::FullBuild);
     assert!(
         kinds[1..].iter().all(|k| *k == ResolveKind::Coalesced),
@@ -404,10 +483,20 @@ async fn concurrent_streams_coalesce_into_one_build() {
 }
 
 /// The driving stream dies mid-build; the waiting stream receives the in-flight op and finishes.
+/// In local mode only QueryPlan ops travel over streams, so the fixture must issue several.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn driver_killed_mid_build_waiter_takes_over() {
-    let fx = Arc::new(fixture("v2-classic-checkpoint-parquet"));
-    let server = TestServer::start().await;
+    takeover_case(IoMode::Local, "with_checkpoint_no_last_checkpoint").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn driver_killed_mid_build_waiter_takes_over_forward() {
+    takeover_case(IoMode::Forward, "v2-classic-checkpoint-parquet").await;
+}
+
+async fn takeover_case(mode: IoMode, name: &str) {
+    let fx = Arc::new(fixture(name));
+    let server = TestServer::start_mode(mode).await;
     let before = server.stats().await;
     let version = latest_version(&fx);
     let specs = default_specs();
@@ -461,8 +550,17 @@ async fn driver_killed_mid_build_waiter_takes_over() {
 /// Same takeover, but the server kills the driving stream with the op in flight (InjectFault).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn injected_kill_mid_op_hands_op_to_waiter() {
-    let fx = Arc::new(fixture("crc-full"));
-    let server = TestServer::start().await;
+    injected_kill_case(IoMode::Local, "with_checkpoint_no_last_checkpoint").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn injected_kill_mid_op_hands_op_to_waiter_forward() {
+    injected_kill_case(IoMode::Forward, "crc-full").await;
+}
+
+async fn injected_kill_case(mode: IoMode, name: &str) {
+    let fx = Arc::new(fixture(name));
+    let server = TestServer::start_mode(mode).await;
     let version = latest_version(&fx);
     let specs = default_specs();
     server
@@ -619,7 +717,7 @@ async fn client_never_answers_is_deadline() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn last_checkpoint_not_found_does_not_taint() {
     let fx = fixture("basic_partitioned");
-    let server = TestServer::start().await;
+    let server = TestServer::start_mode(IoMode::Forward).await;
     let version = latest_version(&fx);
     let mut c = server.client().await;
     let (r1, ops) = run(
@@ -648,27 +746,61 @@ async fn last_checkpoint_not_found_does_not_taint() {
     );
 }
 
+/// Forward mode: the client reports a per-item IO error for the CRC read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transient_crc_failure_returns_result_but_does_not_cache() {
+    transient_crc_case(IoMode::Forward).await;
+}
+
+/// Local mode: the server's own read of the CRC fails (file unreadable, not FileNotFound).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_io_error_taints_and_is_not_cached() {
+    transient_crc_case(IoMode::Local).await;
+}
+
+async fn transient_crc_case(mode: IoMode) {
     let fx = fixture("crc-full");
-    let server = TestServer::start().await;
+    let server = TestServer::start_mode(mode).await;
     let version = latest_version(&fx);
     let specs = default_specs();
     let mut c = server.client().await;
-    let (r1, ops) = run(
-        &mut c,
-        request(&fx, version, specs.clone()),
-        Behavior {
-            fail_read_suffix: Some((".crc".into(), codes::IO)),
-            ..Default::default()
-        },
-    )
-    .await
-    .ok();
-    assert!(
-        ops.iter().any(|o| o.item_error_codes.contains(&codes::IO)),
-        "the CRC read must have been attempted and failed"
-    );
+    let (r1, ops) = match mode {
+        IoMode::Forward => {
+            let out = run(
+                &mut c,
+                request(&fx, version, specs.clone()),
+                Behavior {
+                    fail_read_suffix: Some((".crc".into(), codes::IO)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok();
+            assert!(
+                out.1
+                    .iter()
+                    .any(|o| o.item_error_codes.contains(&codes::IO)),
+                "the CRC read must have been attempted and failed"
+            );
+            out
+        }
+        IoMode::Local => {
+            let _guard = Unreadable::new(fx.log_dir().join("00000000000000000000.crc"));
+            run(
+                &mut c,
+                request(&fx, version, specs.clone()),
+                Behavior::default(),
+            )
+            .await
+            .ok()
+        }
+    };
+    if mode == IoMode::Local {
+        // Without the CRC kernel replays the log: those reads are the only forwarded ops.
+        assert!(ops.iter().all(|o| o.kind == "QueryPlan"));
+        assert_eq!(ops_issued(&r1) as usize, ops.len());
+        assert!(ops_local(&r1) > 0);
+    }
     assert!(
         info(&r1).crc.is_none(),
         "kernel falls back to log replay without the CRC"
@@ -799,6 +931,7 @@ async fn global_memory_bound_evicts_lru_across_tables() {
         CacheConfig {
             max_instances_per_table: 2,
             max_cache_bytes: 1,
+            ..CacheConfig::default()
         },
         true,
     )
@@ -969,8 +1102,9 @@ async fn binary_endpoint_file_ping_and_snapshot() {
 /// waiter must receive the very same op: same op_id, same Operation bytes, same hint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn handoff_resends_same_listing_op_with_same_hint() {
+    // FileListing is only forwarded in `forward` IO mode.
     let fx = Arc::new(fixture("with_checkpoint_no_last_checkpoint"));
-    let server = TestServer::start().await;
+    let server = TestServer::start_mode(IoMode::Forward).await;
     let version = latest_version(&fx);
     let specs = default_specs();
 
@@ -1039,7 +1173,11 @@ async fn exact_version_hit_requires_matching_expected_segment() {
         ResolveKind::CacheHit,
         "absent segment hits"
     );
-    assert_eq!(ops_issued(&absent), 0);
+    assert_eq!(
+        op_counts(&absent),
+        (0, 0),
+        "cache hit: nothing forwarded, nothing local"
+    );
     assert!(absent_ops.is_empty());
     assert_eq!(segment(&absent), segment(&r1));
 
@@ -1239,8 +1377,9 @@ async fn catalog_latest_staged_tail_not_cached_not_coalesced() {
 /// result still yields the correct snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn listing_hint_is_sent_and_honored() {
+    // Client-side hint handling (forward mode); server-side: `listing_hint_honored_server_side`.
     let fx = fixture("with_checkpoint_no_last_checkpoint");
-    let server = TestServer::start().await;
+    let server = TestServer::start_mode(IoMode::Forward).await;
     let mut c = server.client().await;
     let specs = default_specs();
     let (resp, ops) = run(&mut c, request(&fx, 1, specs.clone()), Behavior::default())
@@ -1598,7 +1737,11 @@ async fn latest_within_staleness_hits_with_zero_ops() {
     .await
     .ok();
     assert_eq!(resolved(&r2), ResolveKind::CacheHit);
-    assert_eq!(ops_issued(&r2), 0);
+    assert_eq!(
+        op_counts(&r2),
+        (0, 0),
+        "cache hit: nothing forwarded, nothing local"
+    );
     assert!(ops.is_empty());
     assert_eq!(r2.version, r1.version);
     assert!(r2.plans.iter().all(|p| p.cache_hit));
@@ -1626,9 +1769,9 @@ async fn latest_stale_unchanged_renews_with_one_listing() {
     .await
     .ok();
     assert_eq!(resolved(&r2), ResolveKind::CacheHit);
-    assert_eq!(ops_issued(&r2), 1);
-    assert_eq!(ops.len(), 1);
-    assert_eq!(ops[0].kind, "FileListing");
+    // The renewal listing ran on the server: 0 forwarded, 1 local.
+    assert_eq!(op_counts(&r2), (0, 1));
+    assert!(ops.is_empty());
     assert_eq!(r2.version, r1.version);
     assert_eq!(r2.info, r1.info, "renewal serves the stored SnapshotInfo");
     assert!(
@@ -1644,7 +1787,30 @@ async fn latest_stale_unchanged_renews_with_one_listing() {
     .await
     .ok();
     assert_eq!(resolved(&r3), ResolveKind::CacheHit);
-    assert_eq!(ops_issued(&r3), 0);
+    assert_eq!(op_counts(&r3), (0, 0));
+}
+
+/// Forward mode: the renewal listing is the one forwarded op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn latest_stale_unchanged_renews_with_one_listing_forward() {
+    let fx = fixture("v2-classic-checkpoint-parquet");
+    let server = TestServer::start_mode(IoMode::Forward).await;
+    let mut c = server.client().await;
+    let specs = default_specs();
+    run(
+        &mut c,
+        latest_request(&fx, 0, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    let (r2, ops) = run(&mut c, latest_request(&fx, 0, specs), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(resolved(&r2), ResolveKind::CacheHit);
+    assert_eq!(op_counts(&r2), (1, 0));
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].kind, "FileListing");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1697,8 +1863,8 @@ async fn latest_stale_with_new_commit_is_incremental() {
     .await
     .ok();
     assert_eq!(
-        (resolved(&r4), r4.version, ops_issued(&r4)),
-        (ResolveKind::CacheHit, v0 + 1, 0)
+        (resolved(&r4), r4.version, op_counts(&r4)),
+        (ResolveKind::CacheHit, v0 + 1, (0, 0))
     );
     // The new latest instance also serves exact-version requests with its segment.
     let (r5, _) = run(
@@ -1726,16 +1892,15 @@ async fn concurrent_latest_requests_share_one_listing() {
     .ok();
     let before = server.stats().await;
 
-    let first_op = Arc::new(Notify::new());
+    // The renewal listing runs on the server; slow it down so the others pile up behind it.
+    server
+        .core
+        .faults
+        .set_local_io_delay(Duration::from_millis(300));
     let mut c0 = server.client().await;
     let req = latest_request(&fx, 0, specs.clone());
-    let slow = Behavior {
-        op_delay: Duration::from_millis(300),
-        first_op: Some(first_op.clone()),
-        ..Default::default()
-    };
-    let driver = tokio::spawn(async move { run(&mut c0, req, slow).await });
-    first_op.notified().await;
+    let driver = tokio::spawn(async move { run(&mut c0, req, Behavior::default()).await });
+    server.wait_builds_started(before.builds_started + 1).await;
     let mut waiters = Vec::new();
     for _ in 0..7 {
         let mut c = server.client().await;
@@ -1745,16 +1910,28 @@ async fn concurrent_latest_requests_share_one_listing() {
         }));
     }
     let (d, d_ops) = driver.await.unwrap().ok();
+    server.core.faults.set_local_io_delay(Duration::ZERO);
     assert_eq!(resolved(&d), ResolveKind::CacheHit);
-    let mut listings = d_ops.iter().filter(|o| o.kind == "FileListing").count();
+    assert_eq!(
+        op_counts(&d),
+        (0, 1),
+        "the one renewal listing, on the server"
+    );
+    assert!(d_ops.is_empty());
     for w in waiters {
         let (r, ops) = w.await.unwrap().ok();
         assert_eq!(resolved(&r), ResolveKind::Coalesced);
         assert_eq!(r.version, d.version);
-        listings += ops.iter().filter(|o| o.kind == "FileListing").count();
+        assert_eq!(op_counts(&r), (0, 0));
+        assert!(ops.is_empty());
     }
-    assert_eq!(listings, 1, "8 concurrent latest requests -> one listing");
     let after = server.stats().await;
+    assert_eq!(
+        after.ops_local_total - before.ops_local_total,
+        1,
+        "8 concurrent latest requests -> one listing"
+    );
+    assert_eq!(after.ops_issued_total, before.ops_issued_total);
     assert_eq!(after.builds_started - before.builds_started, 1);
     assert_eq!(after.builds_coalesced - before.builds_coalesced, 7);
 }
@@ -1789,7 +1966,11 @@ async fn latest_after_eviction_is_full_build() {
     .await
     .ok();
     assert_eq!(resolved(&warm), ResolveKind::CacheHit);
-    assert_eq!(ops_issued(&warm), 0);
+    assert_eq!(
+        op_counts(&warm),
+        (0, 0),
+        "cache hit: nothing forwarded, nothing local"
+    );
     assert!(warm_ops.is_empty());
     // An exact-version build of v1 evicts the latest instance (one instance per table).
     run(&mut c, request(&fx, 1, specs.clone()), Behavior::default())
@@ -1898,17 +2079,17 @@ async fn latest_tainted_result_does_not_confirm() {
     let mut c = server.client().await;
     let specs = default_specs();
 
-    let (tainted, ops) = run(
-        &mut c,
-        latest_request(&fx, 60_000, specs.clone()),
-        Behavior {
-            fail_read_suffix: Some((".crc".into(), codes::IO)),
-            ..Default::default()
-        },
-    )
-    .await
-    .ok();
-    assert!(ops.iter().any(|o| o.item_error_codes.contains(&codes::IO)));
+    let (tainted, _) = {
+        // A real server-side read failure (not FileNotFound) on the CRC.
+        let _guard = Unreadable::new(fx.log_dir().join("00000000000000000000.crc"));
+        run(
+            &mut c,
+            latest_request(&fx, 60_000, specs.clone()),
+            Behavior::default(),
+        )
+        .await
+        .ok()
+    };
     assert_eq!(resolved(&tainted), ResolveKind::FullBuild);
     assert!(info(&tainted).crc.is_none());
     assert!(server.core.cached_instances_per_table().is_empty());

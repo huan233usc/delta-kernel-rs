@@ -31,6 +31,13 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
 bytes = "1.10"
+# v9 hybrid IO: FileListing / ReadBytes / HeadFile / ParquetFooter run on the server through the
+# default engine's object_store handlers.
+delta_kernel_default_engine = { path = "../default-engine", default-features = false, features = ["arrow-60", "rustls"] }
+hex = "0.4"
+# UC temporary-credential calls.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+sha2 = "0.10"
 clap = { version = "4.5", features = ["derive"] }
 prost = "0.13"
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "time"] }
@@ -56,7 +63,6 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
   "test-utils",
 ] }
-delta_kernel_default_engine = { path = "../default-engine", default-features = false, features = ["arrow-60"] }
 tar = "0.4"
 tempfile = "3"
 zstd = "0.13"

@@ -16,7 +16,7 @@ use delta_kernel::engine::sync::plan::SyncPlanExecutor;
 use delta_kernel::plans::proto::{plan as proto_plan, schema as proto_schema};
 use delta_kernel::scan::{PartitionValuesOptions, StatsOptions};
 use delta_kernel::{IoOperation, KernelResult, Operation, PlanExecutor, Snapshot, SnapshotRef};
-use delta_kernel_server::cache::{CacheConfig, Core, KERNEL_FEATURES, KERNEL_REV};
+use delta_kernel_server::cache::{CacheConfig, Core, IoMode, KERNEL_FEATURES, KERNEL_REV};
 use delta_kernel_server::decode::{decode_operation, decode_plan};
 use delta_kernel_server::errors::{codes, to_wire_kernel_error};
 use delta_kernel_server::normalize::normalize_plan_bytes;
@@ -46,6 +46,29 @@ pub struct TestServer {
 impl TestServer {
     pub async fn start() -> Self {
         Self::start_with(CacheConfig::default(), true).await
+    }
+
+    /// Server in the given IO mode (`start()` is `local`, the default).
+    pub async fn start_mode(io_mode: IoMode) -> Self {
+        Self::start_with(
+            CacheConfig {
+                io_mode,
+                ..CacheConfig::default()
+            },
+            true,
+        )
+        .await
+    }
+
+    /// Waits until `builds_started` reaches `n` (a build is in flight).
+    pub async fn wait_builds_started(&self, n: i64) {
+        for _ in 0..500 {
+            if self.stats().await.builds_started >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("build {n} never started");
     }
 
     pub async fn start_with(config: CacheConfig, test_hooks: bool) -> Self {
@@ -320,6 +343,7 @@ pub fn request(
         plans,
         client: Some(client_info()),
         expected_log_segment: None,
+        auth: None,
     }
 }
 
@@ -880,8 +904,37 @@ pub fn resolved(resp: &proto::GetSnapshotResponse) -> proto::ResolveKind {
     proto::ResolveKind::try_from(resp.resolved_by).unwrap()
 }
 
+/// Ops forwarded to the client stream.
 pub fn ops_issued(resp: &proto::GetSnapshotResponse) -> i32 {
     resp.stats.as_ref().unwrap().ops_issued
+}
+
+/// Ops the server executed itself (SPEC v9).
+pub fn ops_local(resp: &proto::GetSnapshotResponse) -> i32 {
+    resp.stats.as_ref().unwrap().ops_local
+}
+
+/// `(forwarded, local)` op counts of a response.
+pub fn op_counts(resp: &proto::GetSnapshotResponse) -> (i32, i32) {
+    (ops_issued(resp), ops_local(resp))
+}
+
+/// Makes a file unreadable until the guard drops (a real local IO error, not FileNotFound).
+pub struct Unreadable(PathBuf);
+
+impl Unreadable {
+    pub fn new(path: PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+    }
 }
 
 /// Appends a commit with one add of a (nonexistent) data file; metadata plans never read it.
@@ -922,3 +975,163 @@ pub fn write_checkpoint(fx: &Fixture, version: i64) {
 
 /// Shared op log for tests that inspect what several streams saw.
 pub type SharedLog = Arc<Mutex<Vec<OpLog>>>;
+
+// ------------------------------------------------------------------------------------------------
+// Mock Unity Catalog (SPEC v9 credentials)
+// ------------------------------------------------------------------------------------------------
+
+/// How the mock UC answers a token.
+#[derive(Clone, Debug)]
+pub enum UcAnswer {
+    /// 200 with a credential valid for `ttl` from now.
+    Grant { ttl: Duration },
+    /// HTTP status with a UC-style error body.
+    Status(u16),
+}
+
+/// One request the mock UC received.
+#[derive(Clone, Debug)]
+pub struct UcCall {
+    pub path: String,
+    pub body: serde_json::Value,
+    pub authorization: String,
+}
+
+/// Minimal HTTP/1.1 server standing in for UC's temporary-credentials endpoints.
+pub struct MockUc {
+    pub base_url: String,
+    pub calls: Arc<Mutex<Vec<UcCall>>>,
+    pub answers: Arc<Mutex<std::collections::HashMap<String, UcAnswer>>>,
+}
+
+impl MockUc {
+    pub fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let calls: Arc<Mutex<Vec<UcCall>>> = Arc::default();
+        let answers: Arc<Mutex<std::collections::HashMap<String, UcAnswer>>> = Arc::default();
+        let (c, a) = (calls.clone(), answers.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let (c, a) = (c.clone(), a.clone());
+                std::thread::spawn(move || {
+                    let _ = serve_one(stream, &c, &a);
+                });
+            }
+        });
+        Self {
+            base_url,
+            calls,
+            answers,
+        }
+    }
+
+    pub fn answer(&self, token: &str, answer: UcAnswer) {
+        self.answers
+            .lock()
+            .unwrap()
+            .insert(token.to_string(), answer);
+    }
+
+    pub fn calls(&self) -> Vec<UcCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+fn serve_one(
+    mut stream: std::net::TcpStream,
+    calls: &Mutex<Vec<UcCall>>,
+    answers: &Mutex<std::collections::HashMap<String, UcAnswer>>,
+) -> std::io::Result<()> {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    let mut reader = BufReader::new(stream.try_clone()?);
+    loop {
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line)? == 0 {
+            return Ok(());
+        }
+        let path = request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+        let (mut len, mut authorization) = (0usize, String::new());
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            let (k, v) = line.split_once(':').unwrap_or((line, ""));
+            match k.to_ascii_lowercase().as_str() {
+                "content-length" => len = v.trim().parse().unwrap_or(0),
+                "authorization" => authorization = v.trim().to_string(),
+                _ => {}
+            }
+        }
+        let mut body = vec![0; len];
+        reader.read_exact(&mut body)?;
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        calls.lock().unwrap().push(UcCall {
+            path,
+            body,
+            authorization: authorization.clone(),
+        });
+        let token = authorization.strip_prefix("Bearer ").unwrap_or_default();
+        let answer = answers
+            .lock()
+            .unwrap()
+            .get(token)
+            .cloned()
+            .unwrap_or(UcAnswer::Status(401));
+        let (status, payload) = match answer {
+            UcAnswer::Grant { ttl } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                (
+                    200,
+                    serde_json::json!({
+                        "expiration_time": now + ttl.as_millis() as i64,
+                        "url": "file:///ignored",
+                    }),
+                )
+            }
+            UcAnswer::Status(code) => (
+                code,
+                serde_json::json!({"error_code": "PERMISSION_DENIED", "message": "mock UC says no"}),
+            ),
+        };
+        let payload = payload.to_string();
+        write!(
+            stream,
+            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+            payload.len()
+        )?;
+        stream.flush()?;
+    }
+}
+
+/// A server whose `file://` tables go through the UC credential path against `uc`.
+pub async fn server_with_uc(uc: &MockUc) -> TestServer {
+    TestServer::start_with(
+        CacheConfig {
+            uc_endpoint_override: Some(uc.base_url.clone()),
+            credentials_for_file: true,
+            ..CacheConfig::default()
+        },
+        true,
+    )
+    .await
+}
+
+pub fn with_auth(mut req: proto::GetSnapshotRequest, token: &str) -> proto::GetSnapshotRequest {
+    req.auth = Some(proto::Auth {
+        workspace_host: "workspace.example.invalid".into(),
+        bearer_token: token.into(),
+    });
+    req
+}
