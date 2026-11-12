@@ -64,6 +64,7 @@ delta-kernel-server \
 | `--max-instances-per-table` | `2` | cached snapshot instances kept per `(table_id, location)` |
 | `--max-cache-bytes` | `4 GiB` | global LRU bound over estimated memory (snapshot heap + plan bytes) |
 | `--io-mode` | `local` | `local`: simple IO ops run on the server; `forward`: every op goes to the client |
+| `--local-io-threads` | `8` | worker threads and in-flight cap for server-side IO; when all are busy, requests fail with `UNAVAILABLE` |
 | `--uc-endpoint-override` | none | UC base URL instead of `https://{auth.workspace_host}` (tests, proxies) |
 | `--test-uc-credentials-for-file` | off, hidden | test only, needs `--enable-test-hooks`: run the UC credential check for `file://` tables too |
 
@@ -76,10 +77,14 @@ level (default `info`). Max gRPC message size is 256 MiB in both directions.
   HEAD; `FileNotFound` is benign (a missing `_last_checkpoint`); any other error taints the job,
   so its result is returned but not cached. The server computes and applies the `ListingHint`
   itself. Handoff to another waiter only applies to forwarded ops.
-- **Local op deadline** (SPEC v9.1): each server-side op runs on its own thread and the job waits at
-  most the driver's `op_deadline_ms`. On timeout the job fails with `DEADLINE` for the driver and
-  every waiter, is tainted and not cached; the abandoned op's result is dropped. Cloud stores also
-  get a 60 s object_store client timeout.
+- **Local op deadline** (SPEC v9.1): server-side ops run on a fixed-size pool
+  (`--local-io-threads`, default 8) and the job waits at most the driver's `op_deadline_ms`. On
+  timeout the job fails with `DEADLINE` for the driver and every waiter, is tainted and not
+  cached. The abandoned op keeps its worker and permit until it really returns, then its result is
+  dropped. With every permit taken, new server-side ops fail at once with `UNAVAILABLE`
+  (retryable): no queueing, no extra threads. The default-engine handlers are synchronous, so a
+  timed-out op cannot be dropped; cloud stores' 60 s object_store client timeout bounds how long a
+  stuck call can hold a permit.
 - **Server-side IO failure** that fails a job → `UNAVAILABLE` (retryable); a client-reported op
   failure stays `OP_FAILED`.
 - **Counters**: `ServerStats.ops_issued` = ops forwarded to this request's stream;

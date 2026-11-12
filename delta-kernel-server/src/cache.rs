@@ -22,9 +22,9 @@ use tokio::sync::watch;
 
 use crate::creds::CredentialProvider;
 use crate::errors::{ServerError, classify_build_error, classify_kernel_error};
-use crate::executor::{OpChannel, RemotePlanExecutor, StreamPort};
+use crate::executor::{LocalCtx, OpChannel, RemotePlanExecutor, StreamPort};
 use crate::info::{SegmentId, compute_snapshot_info, has_staged_commits, segment_id};
-use crate::local_io::LocalIo;
+use crate::local_io::{LocalIo, LocalIoPool};
 use crate::plan::{PlanOutcome, generate_plan, spec_key};
 use crate::proto::error::Code;
 use crate::proto::{self, version_spec};
@@ -58,6 +58,8 @@ pub struct CacheConfig {
     pub uc_endpoint_override: Option<String>,
     /// Test hook: require and check UC credentials for `file://` tables too.
     pub credentials_for_file: bool,
+    /// Worker threads (and in-flight permits) for server-side IO.
+    pub local_io_threads: usize,
 }
 
 impl Default for CacheConfig {
@@ -68,9 +70,13 @@ impl Default for CacheConfig {
             io_mode: IoMode::Local,
             uc_endpoint_override: None,
             credentials_for_file: false,
+            local_io_threads: DEFAULT_LOCAL_IO_THREADS,
         }
     }
 }
+
+/// Default `--local-io-threads`.
+pub const DEFAULT_LOCAL_IO_THREADS: usize = 8;
 
 /// `--io-mode`: run simple IO ops on the server (`local`, default) or forward every op to the
 /// client (`forward`, the pre-v9 behavior, kept for A/B runs).
@@ -231,7 +237,7 @@ struct BuildInputs {
     /// Cached instance to build incrementally from.
     base: Option<Arc<Instance>>,
     /// Server-side IO (`None` in forward mode).
-    io: Option<Arc<LocalIo>>,
+    io: Option<LocalCtx>,
 }
 
 /// Result of the blocking part of a build.
@@ -277,6 +283,8 @@ pub struct Core {
     pub faults: Arc<Faults>,
     pub creds: CredentialProvider,
     local_fs: Arc<LocalIo>,
+    /// Bounded pool all server-side IO runs on (`--local-io-threads`).
+    pub io_pool: Arc<LocalIoPool>,
     state: Mutex<CacheState>,
     clock: AtomicU64,
 }
@@ -308,6 +316,7 @@ impl Core {
             config.uc_endpoint_override.clone(),
             config.credentials_for_file,
         );
+        let io_pool = LocalIoPool::new(config.local_io_threads);
         Arc::new(Self {
             instance_id,
             config,
@@ -315,6 +324,7 @@ impl Core {
             faults: Arc::default(),
             creds,
             local_fs: Arc::new(LocalIo::local_fs()),
+            io_pool,
             state: Mutex::default(),
             clock: AtomicU64::new(0),
         })
@@ -400,7 +410,10 @@ impl Core {
             .await?;
         let io = match self.config.io_mode {
             IoMode::Forward => None,
-            IoMode::Local => Some(cred.map_or_else(|| self.local_fs.clone(), |c| c.io.clone())),
+            IoMode::Local => Some(LocalCtx {
+                io: cred.map_or_else(|| self.local_fs.clone(), |c| c.io.clone()),
+                pool: self.io_pool.clone(),
+            }),
         };
         let target = match req.at.as_ref().and_then(|a| a.spec.as_ref()) {
             Some(version_spec::Spec::Version(v)) => Target::Version(*v),
@@ -477,7 +490,7 @@ impl Core {
         target: &Target,
         req: &proto::GetSnapshotRequest,
         port: &Arc<StreamPort>,
-        io: &Option<Arc<LocalIo>>,
+        io: &Option<LocalCtx>,
     ) -> Resolution {
         let mut st = self.state.lock().unwrap();
         let expected = req.expected_log_segment.as_ref();
@@ -823,7 +836,7 @@ impl Core {
         instance: &Arc<Instance>,
         spec: &proto::ScanPlanSpec,
         port: &Arc<StreamPort>,
-        io: &Option<Arc<LocalIo>>,
+        io: &Option<LocalCtx>,
     ) -> Result<proto::ScanPlanResult, ServerError> {
         let key = spec_key(spec);
         let job = {
@@ -863,7 +876,7 @@ impl Core {
         instance: Arc<Instance>,
         spec: proto::ScanPlanSpec,
         key: Vec<u8>,
-        io: Option<Arc<LocalIo>>,
+        io: Option<LocalCtx>,
     ) {
         tokio::spawn(async move {
             let channel = job.channel.clone();

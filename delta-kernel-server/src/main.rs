@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use delta_kernel_server::cache::{CacheConfig, Core, IoMode, KERNEL_REV};
+use delta_kernel_server::cache::{CacheConfig, Core, DEFAULT_LOCAL_IO_THREADS, IoMode, KERNEL_REV};
 use delta_kernel_server::service::{KernelService, bind, serve, write_endpoint_file};
 
 #[derive(Parser, Debug)]
@@ -38,6 +38,10 @@ struct Args {
     /// UC base URL used instead of `https://{auth.workspace_host}` for temporary credentials.
     #[arg(long)]
     uc_endpoint_override: Option<String>,
+    /// Worker threads for server-side IO. Also the cap on in-flight server-side ops, including
+    /// ones abandoned after their deadline; when all are busy, requests fail with UNAVAILABLE.
+    #[arg(long, default_value_t = DEFAULT_LOCAL_IO_THREADS as u16, value_parser = clap::value_parser!(u16).range(1..))]
+    local_io_threads: u16,
     /// Test only (requires --enable-test-hooks): require UC credentials for file:// tables too.
     #[arg(
         long,
@@ -73,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             io_mode: args.io_mode,
             uc_endpoint_override: args.uc_endpoint_override.clone(),
             credentials_for_file: args.test_uc_credentials_for_file,
+            local_io_threads: args.local_io_threads as usize,
         },
     );
     let (listener, addr) = bind(args.listen).await?;

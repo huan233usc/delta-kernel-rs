@@ -5,7 +5,10 @@
 //! client (see [`crate::executor::RemotePlanExecutor`]). All engines share one multi-thread tokio
 //! runtime instead of each owning a background executor thread.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, sync_channel};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -75,6 +78,158 @@ impl LocalIo {
 
     pub fn footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
         self.parquet.read_parquet_footer(file)
+    }
+}
+
+/// Outcome of [`LocalIoPool::run`].
+pub enum PoolRun<T> {
+    Done(T),
+    /// The op did not finish within the deadline. It keeps its worker and permit until it
+    /// actually returns; its result is then dropped.
+    TimedOut,
+    /// Every worker is busy (possibly with abandoned ops): rejected without queueing.
+    Saturated,
+    /// The op panicked.
+    Panicked,
+}
+
+type Task = Box<dyn FnOnce() + Send>;
+
+/// A fixed-size pool for blocking server-side IO (`--local-io-threads`).
+///
+/// The default-engine handlers are synchronous (they `block_on` their object_store futures), so a
+/// timed-out op cannot be dropped from here; it can only be abandoned. To keep abandoned ops from
+/// piling up, each op holds one of `size` permits from submission until it really returns, and
+/// there are never more than `size` worker threads. With every permit taken, new ops fail fast
+/// instead of queueing or spawning. Abandoned ops only drop their result: nothing they produce is
+/// written to shared state.
+pub struct LocalIoPool {
+    size: usize,
+    tx: Mutex<mpsc::Sender<Task>>,
+    rx: Arc<Mutex<mpsc::Receiver<Task>>>,
+    in_flight: Arc<AtomicUsize>,
+    workers: AtomicUsize,
+}
+
+/// Releases one pool permit when the op it guards ends (also on panic).
+struct Permit(Arc<AtomicUsize>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Name of pool worker threads (visible in `/proc/self/task/*/comm`).
+pub const WORKER_THREAD_NAME: &str = "dks-local-io";
+
+impl LocalIoPool {
+    pub fn new(size: usize) -> Arc<Self> {
+        let (tx, rx) = mpsc::channel::<Task>();
+        Arc::new(Self {
+            size: size.max(1),
+            tx: Mutex::new(tx),
+            rx: Arc::new(Mutex::new(rx)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            workers: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Ops currently holding a permit (running, including abandoned ones).
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Worker threads started so far (never more than `size`).
+    pub fn workers(&self) -> usize {
+        self.workers.load(Ordering::Acquire)
+    }
+
+    fn try_acquire(&self) -> Option<Permit> {
+        let mut cur = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if cur >= self.size {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Permit(self.in_flight.clone())),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Starts workers lazily so that there is one per permit in use, up to `size`.
+    fn ensure_workers(&self) -> std::io::Result<()> {
+        loop {
+            let have = self.workers.load(Ordering::Acquire);
+            if have >= self.size || have >= self.in_flight() {
+                return Ok(());
+            }
+            if self
+                .workers
+                .compare_exchange(have, have + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let rx = self.rx.clone();
+            let spawned = std::thread::Builder::new()
+                .name(WORKER_THREAD_NAME.into())
+                .spawn(move || {
+                    loop {
+                        let task = match rx.lock().unwrap().recv() {
+                            Ok(task) => task,
+                            Err(_) => return, // pool dropped
+                        };
+                        // A panicking op must not take the worker down; its permit is released
+                        // by unwinding.
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+                    }
+                });
+            if let Err(e) = spawned {
+                self.workers.fetch_sub(1, Ordering::AcqRel);
+                return Err(e);
+            }
+        }
+    }
+
+    /// Runs `f` on a pool worker and waits at most `timeout` for it.
+    pub fn run<T: Send + 'static>(
+        &self,
+        timeout: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> PoolRun<T> {
+        let Some(permit) = self.try_acquire() else {
+            return PoolRun::Saturated;
+        };
+        if self.ensure_workers().is_err() && self.workers() == 0 {
+            return PoolRun::Saturated;
+        }
+        let (done_tx, done_rx) = sync_channel::<T>(1);
+        let task: Task = Box::new(move || {
+            let out = f();
+            drop(permit);
+            // The waiter may be gone (timed out): then the result is simply dropped.
+            let _ = done_tx.send(out);
+        });
+        if self.tx.lock().unwrap().send(task).is_err() {
+            return PoolRun::Saturated;
+        }
+        match done_rx.recv_timeout(timeout) {
+            Ok(out) => PoolRun::Done(out),
+            Err(RecvTimeoutError::Timeout) => PoolRun::TimedOut,
+            // The op panicked (sender dropped without a result).
+            Err(RecvTimeoutError::Disconnected) => PoolRun::Panicked,
+        }
     }
 }
 
@@ -187,6 +342,61 @@ mod tests {
         );
         let none = proto::ListingHint::default();
         assert_eq!(apply_listing_hint(&url, items(), &none).len(), 6);
+    }
+
+    #[test]
+    fn pool_bounds_threads_and_fails_fast_when_saturated() {
+        let pool = LocalIoPool::new(2);
+        let gate = Arc::new(std::sync::Barrier::new(3));
+        // Two ops block until released; both time out and stay in flight.
+        for _ in 0..2 {
+            let g = gate.clone();
+            assert!(matches!(
+                pool.run(Duration::from_millis(20), move || {
+                    g.wait();
+                }),
+                PoolRun::TimedOut
+            ));
+        }
+        assert_eq!((pool.in_flight(), pool.workers()), (2, 2));
+        let t = std::time::Instant::now();
+        assert!(matches!(
+            pool.run(Duration::from_secs(5), || 1),
+            PoolRun::Saturated
+        ));
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "saturation fails fast"
+        );
+        assert_eq!(pool.workers(), 2, "no thread spawned on saturation");
+        gate.wait(); // release the abandoned ops
+        for _ in 0..200 {
+            if pool.in_flight() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(pool.in_flight(), 0, "abandoned ops returned their permits");
+        assert!(matches!(
+            pool.run(Duration::from_secs(5), || 7),
+            PoolRun::Done(7)
+        ));
+        // A panicking op frees its permit and keeps its worker.
+        assert!(matches!(
+            pool.run(Duration::from_secs(5), || -> i32 { panic!("boom") }),
+            PoolRun::Panicked
+        ));
+        for _ in 0..200 {
+            if pool.in_flight() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            pool.run(Duration::from_secs(5), || 8),
+            PoolRun::Done(8)
+        ));
+        assert_eq!(pool.workers(), 2);
     }
 
     #[test]

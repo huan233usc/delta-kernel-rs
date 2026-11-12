@@ -35,7 +35,7 @@ use tonic::Status;
 use url::Url;
 
 use crate::errors::{CancelReason, codes, kernel_error_from_code, to_wire_kernel_error};
-use crate::local_io::{LocalIo, apply_listing_hint};
+use crate::local_io::{LocalIo, LocalIoPool, PoolRun, apply_listing_hint};
 use crate::proto::{self, op_result, server_msg};
 use crate::stats::{Faults, ServerCounters};
 
@@ -326,15 +326,22 @@ enum OpShape {
     Data,
 }
 
+/// Server-side IO of a job: the table's handlers plus the process-wide bounded pool.
+#[derive(Clone)]
+pub struct LocalCtx {
+    pub io: Arc<LocalIo>,
+    pub pool: Arc<LocalIoPool>,
+}
+
 /// [`PlanExecutor`] of one job: local simple IO (when `local` is set) plus forwarded ops.
 pub struct RemotePlanExecutor {
     channel: Arc<OpChannel>,
-    local: Option<Arc<LocalIo>>,
+    local: Option<LocalCtx>,
 }
 
 impl RemotePlanExecutor {
     /// `local = None` forwards every op (`--io-mode forward`).
-    pub fn new(channel: Arc<OpChannel>, local: Option<Arc<LocalIo>>) -> Self {
+    pub fn new(channel: Arc<OpChannel>, local: Option<LocalCtx>) -> Self {
         Self { channel, local }
     }
 
@@ -356,7 +363,7 @@ impl RemotePlanExecutor {
     }
 
     /// Executes a simple IO op on the server.
-    fn execute_local(&self, local: &Arc<LocalIo>, io: IoOperation) -> KernelResult<PlanResult> {
+    fn execute_local(&self, local: &LocalCtx, io: IoOperation) -> KernelResult<PlanResult> {
         let ch = &self.channel;
         if matches!(
             io,
@@ -373,8 +380,23 @@ impl RemotePlanExecutor {
             _ => None,
         };
         let raw = match self.run_local_bounded(local, io) {
-            Some(raw) => raw,
-            None => {
+            PoolRun::Done(raw) => raw,
+            PoolRun::Saturated => {
+                // Every worker is busy (e.g. stuck behind abandoned ops): fail fast, retryable.
+                tracing::warn!(
+                    pool_size = local.pool.size(),
+                    "local IO pool saturated; rejecting op"
+                );
+                ch.tainted.store(true, Ordering::Relaxed);
+                ch.set_cancel(CancelReason::Saturated);
+                return Err(KernelError::Cancelled);
+            }
+            PoolRun::Panicked => {
+                let e = KernelError::internal_error("server-side IO op panicked");
+                self.observe_local(&e);
+                return Err(e);
+            }
+            PoolRun::TimedOut => {
                 // SPEC v9.1: a local op past the driver's op deadline fails the whole job with
                 // DEADLINE (driver and every waiter), and the result is never cached.
                 tracing::info!(
@@ -422,41 +444,24 @@ impl RemotePlanExecutor {
         }
     }
 
-    /// Runs the raw local op on its own thread and waits at most the driver's op deadline.
-    /// `None` on timeout; the abandoned op finishes in the background and its result is dropped.
-    fn run_local_bounded(&self, local: &Arc<LocalIo>, io: IoOperation) -> Option<LocalOut> {
-        let (tx, rx) = sync_channel(1);
-        let local = local.clone();
+    /// Runs the raw local op on the bounded pool, waiting at most the driver's op deadline.
+    fn run_local_bounded(&self, local: &LocalCtx, io: IoOperation) -> PoolRun<LocalOut> {
+        let io_handle = local.io.clone();
         let delay = self.channel.faults.local_io_delay();
-        let spawned = std::thread::Builder::new()
-            .name("dks-local-io".into())
-            .spawn(move || {
-                if !delay.is_zero() {
-                    std::thread::sleep(delay);
+        local.pool.run(self.channel.starter.op_deadline, move || {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            match io {
+                IoOperation::FileListing { url } => LocalOut::List(io_handle.list(&url)),
+                IoOperation::ReadBytes { files } => LocalOut::Read(io_handle.read(files)),
+                IoOperation::HeadFile { url } => LocalOut::Head(io_handle.head(&url)),
+                IoOperation::ParquetFooter { file } => LocalOut::Footer(io_handle.footer(&file)),
+                IoOperation::WriteBytes { .. } | IoOperation::AtomicCopy { .. } => {
+                    unreachable!("write ops are rejected before dispatch")
                 }
-                let out = match io {
-                    IoOperation::FileListing { url } => LocalOut::List(local.list(&url)),
-                    IoOperation::ReadBytes { files } => LocalOut::Read(local.read(files)),
-                    IoOperation::HeadFile { url } => LocalOut::Head(local.head(&url)),
-                    IoOperation::ParquetFooter { file } => LocalOut::Footer(local.footer(&file)),
-                    IoOperation::WriteBytes { .. } | IoOperation::AtomicCopy { .. } => {
-                        unreachable!("write ops are rejected before dispatch")
-                    }
-                };
-                let _ = tx.send(out);
-            });
-        if let Err(e) = spawned {
-            return Some(LocalOut::Footer(Err(KernelError::generic(format!(
-                "spawn local IO thread: {e}"
-            )))));
-        }
-        match rx.recv_timeout(self.channel.starter.op_deadline) {
-            Ok(out) => Some(out),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => Some(LocalOut::Footer(Err(
-                KernelError::internal_error("local IO thread panicked"),
-            ))),
-        }
+            }
+        })
     }
 
     fn convert(&self, shape: OpShape, result: proto::OpResult) -> KernelResult<PlanResult> {

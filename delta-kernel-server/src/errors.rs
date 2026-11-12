@@ -196,8 +196,10 @@ impl std::fmt::Display for ServerError {
 pub enum CancelReason {
     /// Every candidate stream closed before the op completed.
     StreamsGone,
-    /// The driving stream did not answer within its op deadline.
+    /// The driving stream did not answer within its op deadline (or a server-side op ran past it).
     Deadline,
+    /// The bounded server-side IO pool had no free worker (SPEC v9.1: UNAVAILABLE).
+    Saturated,
 }
 
 /// Classifies a snapshot build failure (kernel's top-level [`delta_kernel::Error`]).
@@ -236,6 +238,10 @@ pub fn classify_kernel_error(
     if let Some(reason) = cancel {
         return match reason {
             CancelReason::Deadline => ServerError::new(Code::Deadline, format!("op deadline: {e}")),
+            CancelReason::Saturated => ServerError::new(
+                Code::Unavailable,
+                format!("server-side IO pool saturated; retry later: {e}"),
+            ),
             CancelReason::StreamsGone => ServerError::new(
                 Code::Cancelled,
                 format!("all client streams closed during the job: {e}"),
