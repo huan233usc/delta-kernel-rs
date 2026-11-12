@@ -16,6 +16,7 @@ members = [
     "delta-kernel-unity-catalog", # WIP: this is an experimental UC catalog implementation
     "unity-catalog-delta-client-api", # WIP: transport-agnostic UC client API traits
     "xtask",
+    "delta-kernel-server", # POC: out-of-process kernel snapshot/plan server (not for merge)
 ]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table

@@ -1,0 +1,236 @@
+// Wire contract for delta-kernel-server (POC). Authoritative source: SPEC v5 §5.
+//
+// The server owns kernel state (snapshots, SnapshotInfo, metadata scan plans); the client owns all
+// storage IO. During a GetSnapshot call the server sends kernel `Operation`s (proto bytes from
+// `kernel/proto/operation.proto`) to the client as `OpRequest`s and blocks for the matching
+// `OpResult`.
+//
+// Additive deviations from SPEC §5 are marked "DEVIATION".
+
+syntax = "proto3";
+package delta.kernel.server.v1;
+
+service DeltaKernelService {
+  rpc GetSnapshot(stream ClientMsg) returns (stream ServerMsg);
+  // Test hooks: only available when the server is started with --enable-test-hooks.
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc GetDebugStats(DebugStatsRequest) returns (DebugStats);
+  rpc ResetCache(ResetCacheRequest) returns (ResetCacheResponse);
+  rpc InjectFault(FaultSpec) returns (InjectFaultResponse);
+}
+
+message ClientMsg { oneof msg { GetSnapshotRequest request = 1; OpResult op_result = 2; } }
+message ServerMsg { oneof msg { OpRequest op = 1; GetSnapshotResponse response = 2; Error error = 3; } }
+
+// ---------- request ----------
+message TableRef {
+  string table_id = 1;
+  string location = 2;          // full URL; cache key = (table_id, location)
+}
+
+message VersionSpec {
+  oneof spec {
+    int64 version = 1;                // exact version already resolved by the client
+    CatalogLatest catalog_latest = 2;
+    Latest latest = 3;                // path-based latest; not coalesced
+  }
+}
+message CatalogLatest { int64 max_catalog_version = 1; repeated FileStatus log_tail = 2; }
+message Latest {}
+
+message FileStatus {
+  string location = 1;          // full URL, same scheme/authority form as the request URL
+  int64 size = 2;
+  int64 last_modified = 3;
+}
+
+message ColumnPath { repeated string parts = 1; }
+message StatsOptions {
+  enum Kind { JSON_ONLY = 0; ALL_STRUCT_WITH_EXTRA_INDEXED = 1; }
+  Kind kind = 1;
+  repeated ColumnPath extra_indexed_columns = 2;
+}
+enum PartitionValuesMode { WITH_STRUCT = 0; }
+message ScanPlanSpec {
+  StatsOptions stats = 1;
+  PartitionValuesMode partition_values = 2;
+  // DEVIATION (additive): session timezone the client would pass to
+  // `PartitionValuesOptions::with_timestamp_timezone`. Kernel rejects it on tables with TIMESTAMP
+  // partition columns, which the server reports as a per-plan UNSUPPORTED result.
+  optional string timestamp_timezone = 3;
+}
+
+message GetSnapshotRequest {
+  TableRef table = 1;
+  VersionSpec at = 2;
+  repeated ScanPlanSpec plans = 3;
+  ClientInfo client = 4;
+  // Log segment the client already has; on a cache hit the server compares it with the cached
+  // instance and treats a mismatch as a miss.
+  optional LogSegmentInfo expected_log_segment = 5;
+  // 10-19 reserved for query-dependent plan parameters (predicate, read_schema).
+}
+message ClientInfo {
+  string dbr_version = 1;
+  string kernel_rev = 2;
+  repeated string kernel_features = 3;
+  int64 op_deadline_ms = 4;     // per-op timeout
+}
+
+// ---------- op round trip ----------
+message OpRequest {
+  int64 op_id = 1;
+  bytes operation = 2;          // delta.kernel.operation.Operation, verbatim
+  optional ListingHint listing_hint = 3;
+}
+message ListingHint {
+  optional int64 end_version = 1;
+  bool stop_at_first_non_versioned = 2;
+}
+
+message OpResult {
+  int64 op_id = 1;
+  oneof result {
+    ItemList items = 2;         // FileListing / HeadFile / ReadBytes: per-item results
+    ArrowResult arrow = 3;      // QueryPlan
+    bytes footer_schema = 4;    // ParquetFooter: kernel StructType proto
+    KernelError error = 5;      // whole op failed
+  }
+}
+message ItemList { repeated Item items = 1; }
+message Item {
+  oneof v {
+    FileStatus file = 1;
+    bytes data = 2;             // ReadBytes: one per requested slice, in order
+    KernelError error = 3;      // per-item failure, e.g. FileNotFound for _last_checkpoint
+  }
+}
+message ArrowResult {
+  bytes ipc_stream = 1;         // Arrow IPC stream, all batches
+  optional KernelError trailing_error = 2; // iterator failed part-way
+}
+message KernelError {
+  int32 code = 1;               // ffi KernelError numeric code (FileNotFound = 11, ...)
+  string message = 2;
+}
+
+// ---------- response ----------
+message GetSnapshotResponse {
+  int64 version = 1;
+  SnapshotInfo info = 2;
+  repeated ScanPlanResult plans = 3;
+  ResolveKind resolved_by = 4;
+  string kernel_rev = 5;
+  ServerStats stats = 6;
+}
+
+message SnapshotInfo {
+  string table_root = 1;
+  string log_path = 2;
+  int64 timestamp_ms = 3;               // kernel get_timestamp: ICT when enabled, else commit mtime
+  Metadata metadata = 4;
+  Protocol protocol = 5;
+  optional CrcInfo crc = 6;             // present iff the in-process snapshot has an at-version CRC
+  repeated ClusteringColumn clustering_columns = 7;
+  LogSegmentInfo log_segment = 8;
+  optional int64 row_tracking_high_water_mark = 9;
+  map<string, DomainMetadata> active_domain_metadata = 10;
+  optional int64 latest_txn_version_placeholder = 11;
+  // DEVIATION (additive): set instead of `clustering_columns` when kernel's clustering getter
+  // fails for this snapshot (e.g. the domain names a column missing from the schema). The client
+  // raises it when the clustering getter is called, matching the in-process failure point,
+  // instead of the whole snapshot failing.
+  Error clustering_error = 12;
+}
+message CrcInfo {
+  int64 num_files = 1;
+  int64 table_size_bytes = 2;
+  optional int64 num_delta_files = 3;
+  optional int64 total_delta_files_byte_size = 4;
+  optional FileSizeHistogram file_size_histogram = 5;
+  repeated SetTransaction set_transactions = 6;
+  repeated DomainMetadata domain_metadata = 7;
+  optional int64 num_deleted_records = 8;
+  optional string txn_id = 9;
+}
+message LogSegmentInfo {
+  int64 version = 1;
+  optional int64 checkpoint_version = 2;
+  repeated FileStatus checkpoint_parts = 3;   // ordered
+  repeated FileStatus deltas = 4;             // ordered
+  repeated bool delta_is_staged = 5;
+}
+message ScanPlanResult {
+  oneof result { bytes plan = 1; StaticallyEmpty empty = 2; Error unsupported = 3; }
+  bool cache_hit = 4;
+}
+message StaticallyEmpty {}
+enum ResolveKind { CACHE_HIT = 0; INCREMENTAL = 1; FULL_BUILD = 2; COALESCED = 3; }
+message ServerStats {
+  int32 ops_issued = 1; int64 server_time_us = 2; int64 client_op_time_us = 3;
+  string instance_id = 4;
+}
+message Error {
+  enum Code { INTERNAL = 0; UNSUPPORTED = 1; TABLE_NOT_FOUND = 2; PROTOCOL_UNSUPPORTED = 3;
+              VERSION_MISMATCH = 4; OP_FAILED = 5; CANCELLED = 6; DEADLINE = 7; }
+  Code code = 1; string message = 2; bool retryable = 3;
+}
+
+// ---------- test hooks ----------
+message PingRequest {} message PingResponse { string instance_id = 1; }
+message DebugStatsRequest {}
+message DebugStats {
+  int64 builds_started = 1; int64 builds_coalesced = 2; int64 ops_issued_total = 3;
+  map<string, int32> cached_instances_per_table = 4;
+}
+message ResetCacheRequest {} message ResetCacheResponse {}
+message FaultSpec {
+  int64 delay_before_response_ms = 1;
+  int32 fail_after_n_ops = 2;           // close the driving stream after its n-th op
+  bool kill_stream_mid_op = 3;
+}
+message InjectFaultResponse {}
+
+// ---------- action mirrors (fields follow the Delta protocol actions one-to-one) ----------
+message Format {
+  string provider = 1;
+  map<string, string> options = 2;
+}
+message Metadata {
+  string id = 1;
+  optional string name = 2;
+  optional string description = 3;
+  Format format = 4;
+  string schema_string = 5;
+  repeated string partition_columns = 6;
+  map<string, string> configuration = 7;
+  optional int64 created_time = 8;
+}
+// Wrapper so "absent" (legacy protocol) and "empty list" stay distinguishable.
+message FeatureList { repeated string features = 1; }
+message Protocol {
+  int32 min_reader_version = 1;
+  int32 min_writer_version = 2;
+  FeatureList reader_features = 3;
+  FeatureList writer_features = 4;
+}
+message ClusteringColumn {
+  ColumnPath physical_path = 1;         // as stored in the delta.clustering domain
+  ColumnPath logical_path = 2;          // resolved against the snapshot schema
+  string data_type_json = 3;            // kernel DataType serialized as Delta schema JSON
+}
+message DomainMetadata {
+  string domain = 1;
+  string configuration = 2;
+  bool removed = 3;
+}
+message SetTransaction {
+  string app_id = 1;
+  int64 version = 2;
+  optional int64 last_updated = 3;
+}
+message FileSizeHistogram {
+  repeated int64 sorted_bin_boundaries = 1;
+  repeated int64 file_counts = 2;
+  repeated int64 total_bytes = 3;
+}
