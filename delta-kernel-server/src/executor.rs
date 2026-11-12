@@ -265,9 +265,12 @@ impl OpChannel {
             .get_or_insert_with(|| err.clone());
     }
 
+    /// Hint for listings of the `_delta_log` directory itself. Subdirectories such as
+    /// `_delta_log/_sidecars/` hold non-versioned names and get no hint.
     fn listing_hint(&self, url: &Url) -> Option<proto::ListingHint> {
-        let in_log = url.path().contains("/_delta_log/");
-        in_log.then_some(proto::ListingHint {
+        let path = url.path();
+        let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        dir.ends_with("/_delta_log").then_some(proto::ListingHint {
             end_version: self.target_version,
             stop_at_first_non_versioned: true,
         })

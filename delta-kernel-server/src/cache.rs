@@ -62,12 +62,40 @@ impl Default for CacheConfig {
 
 type TableKey = (String, String);
 
+/// Canonical identity of a catalog log tail: `(version, location, size)` sorted by version.
+pub type TailId = Vec<(i64, String, i64)>;
+
+/// In-flight build key: table, target version, and the catalog tail for `catalog_latest` builds
+/// (`None` for exact-version builds).
+type BuildKey = (TableKey, i64, Option<TailId>);
+
+/// Canonicalizes a request's catalog log tail (SPEC v6 §7).
+pub fn tail_id(log_tail: &[proto::FileStatus]) -> TailId {
+    let mut id: TailId = log_tail
+        .iter()
+        .map(|f| {
+            let version = f
+                .location
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.get(..20))
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(-1);
+            (version, f.location.clone(), f.size)
+        })
+        .collect();
+    id.sort();
+    id
+}
+
 /// A cached snapshot instance.
 pub struct Instance {
     pub snapshot: SnapshotRef,
     pub info: proto::SnapshotInfo,
     plans: Mutex<HashMap<Vec<u8>, PlanSlot>>,
     last_used: AtomicU64,
+    /// Canonical log tail of a `catalog_latest` build; `None` for exact-version builds.
+    catalog_tail: Option<TailId>,
 }
 
 enum PlanSlot {
@@ -137,7 +165,7 @@ struct BuildOutcome {
 #[derive(Default)]
 struct CacheState {
     tables: HashMap<TableKey, Vec<Arc<Instance>>>,
-    inflight: HashMap<(TableKey, i64), Arc<Job<BuildOutcome>>>,
+    inflight: HashMap<BuildKey, Arc<Job<BuildOutcome>>>,
 }
 
 /// Server core shared by all streams.
@@ -163,6 +191,7 @@ enum Target {
     CatalogLatest {
         max_catalog_version: i64,
         log_tail: Vec<LogPath>,
+        tail_id: TailId,
         tail_has_staged: bool,
     },
     Latest,
@@ -252,6 +281,7 @@ impl Core {
             Some(version_spec::Spec::Version(v)) => Target::Version(*v),
             Some(version_spec::Spec::CatalogLatest(c)) => Target::CatalogLatest {
                 max_catalog_version: c.max_catalog_version,
+                tail_id: tail_id(&c.log_tail),
                 tail_has_staged: c
                     .log_tail
                     .iter()
@@ -318,36 +348,49 @@ impl Core {
     ) -> Resolution {
         let mut st = self.state.lock().unwrap();
         let expected = req.expected_log_segment.as_ref();
-        // The build's target version: the exact version, or the catalog's ratified latest
-        // version. Builds coalesce on it. Path-based latest has no known target, so it is neither
-        // coalesced nor served from cache (it must re-list to find new commits).
-        let (target_version, cache_lookup) = match target {
-            Target::Version(v) => (Some(*v), true),
-            // Cached instances never hold staged commits, so only a tail made entirely of
-            // published commits can match one; a staged tail still coalesces.
+        // Exact-version requests hit only when the client's expected log segment is present and
+        // equal to the cached one (SPEC v6: absent => miss). `catalog_latest` hits and coalesces
+        // on (max_catalog_version, canonical log tail); a tail with staged commits is neither
+        // served from cache nor coalesced. Path-based latest has no known target, so it is
+        // neither coalesced nor served from cache (it must re-list to find new commits).
+        let (target_version, build_key): (Option<i64>, Option<BuildKey>) = match target {
+            Target::Version(v) => (Some(*v), Some((key.clone(), *v, None))),
             Target::CatalogLatest {
                 max_catalog_version,
-                tail_has_staged,
+                tail_has_staged: true,
                 ..
-            } => (Some(*max_catalog_version), !tail_has_staged),
-            Target::Latest => (None, false),
+            } => (Some(*max_catalog_version), None),
+            Target::CatalogLatest {
+                max_catalog_version,
+                tail_id,
+                ..
+            } => (
+                Some(*max_catalog_version),
+                Some((key.clone(), *max_catalog_version, Some(tail_id.clone()))),
+            ),
+            Target::Latest => (None, None),
         };
 
-        if let Some(v) = target_version {
-            let hit = cache_lookup
-                .then(|| st.tables.get(key))
-                .flatten()
-                .and_then(|insts| {
-                    insts.iter().find(|i| {
-                        i.version() == v && expected.is_none_or(|e| i.segment() == Some(e))
-                    })
-                });
+        if let Some(bk) = &build_key {
+            let (_, v, tail) = bk;
+            let hit = st.tables.get(key).and_then(|insts| {
+                insts.iter().find(|i| {
+                    i.version() == *v
+                        && match tail {
+                            None => expected.is_some_and(|e| i.segment() == Some(e)),
+                            Some(t) => {
+                                i.catalog_tail.as_ref() == Some(t)
+                                    && expected.is_none_or(|e| i.segment() == Some(e))
+                            }
+                        }
+                })
+            });
             if let Some(inst) = hit {
                 let inst = inst.clone();
                 inst.last_used.store(self.tick(), Ordering::Relaxed);
                 return Resolution::Hit(inst);
             }
-            if let Some(job) = st.inflight.get(&(key.clone(), v)) {
+            if let Some(job) = st.inflight.get(bk) {
                 job.channel.join(port.clone());
                 self.counters
                     .builds_coalesced
@@ -375,8 +418,8 @@ impl Core {
             self.faults.clone(),
         );
         let job = Job::new(channel);
-        if let Some(v) = target_version {
-            st.inflight.insert((key.clone(), v), job.clone());
+        if let Some(bk) = &build_key {
+            st.inflight.insert(bk.clone(), job.clone());
         }
         drop(st);
         self.counters.builds_started.fetch_add(1, Ordering::Relaxed);
@@ -385,7 +428,7 @@ impl Core {
             key.clone(),
             location.to_string(),
             target.clone(),
-            target_version,
+            build_key,
             base,
         );
         Resolution::Wait(job, false)
@@ -397,12 +440,20 @@ impl Core {
         key: TableKey,
         location: String,
         target: Target,
-        target_version: Option<i64>,
+        build_key: Option<BuildKey>,
         base: Option<Arc<Instance>>,
     ) {
         let core = self.clone();
         tokio::spawn(async move {
             let channel = job.channel.clone();
+            let (catalog_tail, staged_tail) = match &target {
+                Target::CatalogLatest {
+                    tail_id,
+                    tail_has_staged,
+                    ..
+                } => (Some(tail_id.clone()), *tail_has_staged),
+                _ => (None, false),
+            };
             let built = tokio::task::spawn_blocking(move || {
                 let engine = PlanBasedEngine::new(None, Arc::new(RemotePlanExecutor::new(channel)));
                 let kind = if base.is_some() {
@@ -453,12 +504,14 @@ impl Core {
                     ))
                 }
                 Ok(Ok((snapshot, info, kind))) => {
-                    let cacheable = !channel.is_tainted() && !has_staged_commits(&snapshot);
+                    let cacheable =
+                        !channel.is_tainted() && !staged_tail && !has_staged_commits(&snapshot);
                     let instance = Arc::new(Instance {
                         snapshot,
                         info,
                         plans: Mutex::default(),
                         last_used: AtomicU64::new(core.tick()),
+                        catalog_tail,
                     });
                     let instance = if cacheable {
                         core.insert(&key, instance)
@@ -481,8 +534,8 @@ impl Core {
                     "snapshot build panicked: {join_err}"
                 ))),
             };
-            if let Some(v) = target_version {
-                core.state.lock().unwrap().inflight.remove(&(key, v));
+            if let Some(bk) = &build_key {
+                core.state.lock().unwrap().inflight.remove(bk);
             }
             job.complete(result);
         });
@@ -494,10 +547,11 @@ impl Core {
         let inserted = {
             let mut st = self.state.lock().unwrap();
             let insts = st.tables.entry(key.clone()).or_default();
-            if let Some(existing) = insts
-                .iter()
-                .find(|i| i.version() == instance.version() && i.segment() == instance.segment())
-            {
+            if let Some(existing) = insts.iter().find(|i| {
+                i.version() == instance.version()
+                    && i.segment() == instance.segment()
+                    && i.catalog_tail == instance.catalog_tail
+            }) {
                 existing.clone()
             } else {
                 insts.push(instance.clone());

@@ -198,6 +198,55 @@ pub fn default_specs() -> Vec<proto::ScanPlanSpec> {
     vec![spec_json(), spec_struct()]
 }
 
+/// Exact-version request carrying `prev`'s log segment, as the P1-b client always does.
+pub fn request_with_segment(
+    fx: &Fixture,
+    version: i64,
+    plans: Vec<proto::ScanPlanSpec>,
+    prev: &proto::GetSnapshotResponse,
+) -> proto::GetSnapshotRequest {
+    let mut req = request(fx, version, plans);
+    req.expected_log_segment = prev.info.as_ref().unwrap().log_segment.clone();
+    req
+}
+
+/// `catalog_latest` request with the given log tail files (paths relative to `_delta_log/`).
+pub fn catalog_request(
+    fx: &Fixture,
+    max_catalog_version: i64,
+    tail: &[&str],
+    plans: Vec<proto::ScanPlanSpec>,
+) -> proto::GetSnapshotRequest {
+    let log_tail = tail
+        .iter()
+        .map(|rel| {
+            let path = fx.log_dir().join(rel);
+            let meta = std::fs::metadata(&path).unwrap();
+            let mtime = meta
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            proto::FileStatus {
+                location: Url::from_file_path(&path).unwrap().to_string(),
+                size: meta.len() as i64,
+                last_modified: mtime,
+            }
+        })
+        .collect();
+    let mut req = request(fx, 0, plans);
+    req.at = Some(proto::VersionSpec {
+        spec: Some(proto::version_spec::Spec::CatalogLatest(
+            proto::CatalogLatest {
+                max_catalog_version,
+                log_tail,
+            },
+        )),
+    });
+    req
+}
+
 pub fn request(
     fx: &Fixture,
     version: i64,
@@ -228,6 +277,8 @@ pub struct Behavior {
     pub op_delay: Duration,
     /// Drop the whole stream when op number `n + 1` arrives (after answering `n` ops).
     pub kill_after_ops: Option<usize>,
+    /// Drop the whole stream when the first op of this kind (e.g. "FileListing") arrives.
+    pub kill_on_kind: Option<&'static str>,
     /// Never answer any op (the stream stays open).
     pub never_answer: bool,
     /// Answer every op with a whole-op error of this code.
@@ -241,8 +292,14 @@ pub struct Behavior {
 /// One op as the client saw it.
 #[derive(Clone, Debug)]
 pub struct OpLog {
+    pub op_id: i64,
     pub kind: &'static str,
     pub urls: Vec<String>,
+    /// Raw `Operation` bytes as received.
+    pub operation: Vec<u8>,
+    pub listing_hint: Option<proto::ListingHint>,
+    /// FileListing: locations returned after applying the hint.
+    pub returned_files: Vec<String>,
     pub item_error_codes: Vec<i32>,
     pub op_error_code: Option<i32>,
 }
@@ -250,7 +307,8 @@ pub struct OpLog {
 #[derive(Debug)]
 pub enum Ended {
     Error(proto::Error),
-    Killed,
+    /// The client dropped its stream; carries the op that was in flight at that moment.
+    Killed(Box<proto::OpRequest>),
     EndOfStream,
     Status(tonic::Status),
 }
@@ -326,11 +384,14 @@ pub async fn run(
                 {
                     n.notify_one();
                 }
-                if behavior.kill_after_ops.is_some_and(|k| seen > k) {
+                let kill_on_kind = behavior
+                    .kill_on_kind
+                    .is_some_and(|k| op_kind(&op.operation) == k);
+                if kill_on_kind || behavior.kill_after_ops.is_some_and(|k| seen > k) {
                     drop(tx);
                     drop(inbound);
                     return Outcome {
-                        result: Err(Ended::Killed),
+                        result: Err(Ended::Killed(Box::new(op))),
                         ops,
                     };
                 }
@@ -367,6 +428,44 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Kind of a forwarded op, by decoding its bytes.
+pub fn op_kind(bytes: &[u8]) -> &'static str {
+    match decode_operation(bytes).expect("decode forwarded operation") {
+        Operation::IoOperation(IoOperation::FileListing { .. }) => "FileListing",
+        Operation::IoOperation(IoOperation::HeadFile { .. }) => "HeadFile",
+        Operation::IoOperation(IoOperation::ReadBytes { .. }) => "ReadBytes",
+        Operation::IoOperation(IoOperation::ParquetFooter { .. }) => "ParquetFooter",
+        Operation::QueryPlan(_) => "QueryPlan",
+        Operation::IoOperation(_) => "Write",
+    }
+}
+
+/// Delta log version encoded in a file name (`<20 digits>.<...>`), if any.
+pub fn file_version(location: &str) -> Option<i64> {
+    let name = location.rsplit('/').next()?;
+    let (digits, rest) = (name.get(..20)?, name.get(20..)?);
+    (digits.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with('.'))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Truncates a sorted listing per `ListingHint` (SPEC §5): stop at the first non-versioned name
+/// if asked, and stop once versions pass `end_version`.
+fn apply_listing_hint(
+    files: Vec<delta_kernel::FileMeta>,
+    hint: &proto::ListingHint,
+) -> Vec<delta_kernel::FileMeta> {
+    let mut out = Vec::new();
+    for f in files {
+        match file_version(f.location.as_str()) {
+            None if hint.stop_at_first_non_versioned => break,
+            Some(v) if hint.end_version.is_some_and(|end| v > end) => break,
+            _ => out.push(f),
+        }
+    }
+    out
 }
 
 fn whole_error(op_id: i64, code: i32, message: String) -> proto::OpResult {
@@ -406,8 +505,12 @@ pub fn execute_op(op: &proto::OpRequest, b: &Behavior) -> (proto::OpResult, OpLo
     let exec = SyncPlanExecutor::default();
     let operation = decode_operation(&op.operation).expect("decode forwarded operation");
     let mut log = OpLog {
+        op_id: op.op_id,
         kind: "",
         urls: vec![],
+        operation: op.operation.clone(),
+        listing_hint: op.listing_hint,
+        returned_files: vec![],
         item_error_codes: vec![],
         op_error_code: None,
     };
@@ -437,6 +540,10 @@ pub fn execute_op(op: &proto::OpRequest, b: &Behavior) -> (proto::OpResult, OpLo
                         }
                     }
                     files.sort_by(|a, b| a.location.as_str().cmp(b.location.as_str()));
+                    if let Some(hint) = &op.listing_hint {
+                        files = apply_listing_hint(files, hint);
+                    }
+                    log.returned_files = files.iter().map(|f| f.location.to_string()).collect();
                     let mut v: Vec<item::V> = files
                         .iter()
                         .map(|f| item::V::File(file_status(f)))

@@ -210,7 +210,7 @@ async fn timestamp_partition_with_timezone_is_unsupported() {
     // The unsupported result is deterministic and cached like any other plan.
     let (again, _) = run(
         &mut client,
-        request(&fx, version, vec![tz]),
+        request_with_segment(&fx, version, vec![tz], &resp),
         Behavior::default(),
     )
     .await
@@ -251,9 +251,19 @@ async fn resolve_sequence_full_hit_incremental_checkpoint() {
     assert_eq!(resolved(&r1), ResolveKind::FullBuild);
     let rows_v0 = assert_parity(&fx, &r1, &specs);
 
-    let (r2, ops2) = run(
+    // Same version without an expected log segment is a miss (SPEC v6), never a hit.
+    let (r2_absent, _) = run(
         &mut client,
         request(&fx, v0, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_ne!(resolved(&r2_absent), ResolveKind::CacheHit);
+
+    let (r2, ops2) = run(
+        &mut client,
+        request_with_segment(&fx, v0, specs.clone(), &r1),
         Behavior::default(),
     )
     .await
@@ -420,7 +430,7 @@ async fn driver_killed_mid_build_waiter_takes_over() {
     )
     .await;
     let driver = driver.await.unwrap();
-    assert!(matches!(driver.result, Err(Ended::Killed)));
+    assert!(matches!(driver.result, Err(Ended::Killed(_))));
     assert_eq!(driver.ops.len(), 2);
     let (resp, waiter_ops) = waiter.ok();
     assert_eq!(resolved(&resp), ResolveKind::Coalesced);
@@ -438,7 +448,7 @@ async fn driver_killed_mid_build_waiter_takes_over() {
     // The build that survived the takeover is cached.
     let (hit, _) = run(
         &mut c1,
-        request(&fx, version, specs.clone()),
+        request_with_segment(&fx, version, specs.clone(), &resp),
         Behavior::default(),
     )
     .await
@@ -511,7 +521,7 @@ async fn driver_killed_without_waiters_caches_nothing() {
         },
     )
     .await;
-    assert!(matches!(killed.result, Err(Ended::Killed)));
+    assert!(matches!(killed.result, Err(Ended::Killed(_))));
     // Wait until the abandoned build has unwound.
     for _ in 0..100 {
         if server.core.cached_instances_per_table().is_empty()
@@ -624,7 +634,7 @@ async fn last_checkpoint_not_found_does_not_taint() {
     assert_eq!(resolved(&r1), ResolveKind::FullBuild);
     let (r2, _) = run(
         &mut c,
-        request(&fx, version, default_specs()),
+        request_with_segment(&fx, version, default_specs(), &r1),
         Behavior::default(),
     )
     .await
@@ -676,9 +686,13 @@ async fn transient_crc_failure_returns_result_but_does_not_cache() {
     assert_ne!(resolved(&r2), ResolveKind::CacheHit);
     assert!(info(&r2).crc.is_some(), "a clean rebuild sees the CRC");
     assert_parity(&fx, &r2, &specs);
-    let (r3, _) = run(&mut c, request(&fx, version, specs), Behavior::default())
-        .await
-        .ok();
+    let (r3, _) = run(
+        &mut c,
+        request_with_segment(&fx, version, specs, &r2),
+        Behavior::default(),
+    )
+    .await
+    .ok();
     assert_eq!(resolved(&r3), ResolveKind::CacheHit);
 }
 
@@ -738,21 +752,31 @@ async fn per_table_eviction_beyond_max_instances() {
     .await;
     let mut c = server.client().await;
     let specs = vec![spec_json()];
+    let mut responses = Vec::new();
     for v in [1, 2, 3] {
-        run(&mut c, request(&fx, v, specs.clone()), Behavior::default())
+        let (r, _) = run(&mut c, request(&fx, v, specs.clone()), Behavior::default())
             .await
             .ok();
+        responses.push(r);
     }
     let stats = server.stats().await;
     assert_eq!(stats.cached_instances_per_table.get(&fx.table_id), Some(&2));
     // v1 was least recently used and is gone; v3 is still cached.
-    let (r3, _) = run(&mut c, request(&fx, 3, specs.clone()), Behavior::default())
-        .await
-        .ok();
+    let (r3, _) = run(
+        &mut c,
+        request_with_segment(&fx, 3, specs.clone(), &responses[2]),
+        Behavior::default(),
+    )
+    .await
+    .ok();
     assert_eq!(resolved(&r3), ResolveKind::CacheHit);
-    let (r1, _) = run(&mut c, request(&fx, 1, specs.clone()), Behavior::default())
-        .await
-        .ok();
+    let (r1, _) = run(
+        &mut c,
+        request_with_segment(&fx, 1, specs.clone(), &responses[0]),
+        Behavior::default(),
+    )
+    .await
+    .ok();
     assert_eq!(resolved(&r1), ResolveKind::FullBuild);
     assert_parity(&fx, &r1, &specs);
     assert_eq!(
@@ -838,6 +862,14 @@ fn determinism_probe() {
             same_plan.len(),
             rebuilt_raw.len(),
             rebuilt_norm.len()
+        );
+        // Acceptance rule (SPEC v6): compare only normalized bytes or executed rows. Re-encoding
+        // one prost object is stable; the raw counts across conversions are recorded above (the
+        // ALL_STRUCT plan typically shows 2) but not asserted, since they depend on HashMap seeds.
+        assert_eq!(
+            same_object.len(),
+            1,
+            "re-encoding one prost object must be stable"
         );
         assert_eq!(rebuilt_norm.len(), 1, "normalized encoding must be stable");
     }
@@ -925,4 +957,362 @@ async fn binary_endpoint_file_ping_and_snapshot() {
         .unwrap();
     let status = child.wait().unwrap();
     assert!(status.success(), "{status:?}");
+}
+
+// ------------------------------------------------------------------------------------------------
+// Round-1 review additions
+// ------------------------------------------------------------------------------------------------
+
+/// B1: a FileListing op (which carries a ListingHint) is in flight when the driver dies. The next
+/// waiter must receive the very same op: same op_id, same Operation bytes, same hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handoff_resends_same_listing_op_with_same_hint() {
+    let fx = Arc::new(fixture("with_checkpoint_no_last_checkpoint"));
+    let server = TestServer::start().await;
+    let version = latest_version(&fx);
+    let specs = default_specs();
+
+    let first_op = Arc::new(Notify::new());
+    let mut c0 = server.client().await;
+    let req = request(&fx, version, specs.clone());
+    let driver_behavior = Behavior {
+        op_delay: Duration::from_millis(200),
+        kill_on_kind: Some("FileListing"),
+        first_op: Some(first_op.clone()),
+        ..Default::default()
+    };
+    let driver = tokio::spawn(async move { run(&mut c0, req, driver_behavior).await });
+    first_op.notified().await;
+    let mut c1 = server.client().await;
+    let waiter = run(
+        &mut c1,
+        request(&fx, version, specs.clone()),
+        Behavior::default(),
+    )
+    .await;
+
+    let driver = driver.await.unwrap();
+    let Err(Ended::Killed(in_flight)) = driver.result else {
+        panic!("driver must have dropped its stream on the FileListing op");
+    };
+    assert_eq!(op_kind(&in_flight.operation), "FileListing");
+    let hint = in_flight
+        .listing_hint
+        .expect("_delta_log listing carries a hint");
+    assert_eq!(hint.end_version, Some(version));
+    assert!(hint.stop_at_first_non_versioned);
+
+    let (resp, waiter_ops) = waiter.ok();
+    let first = &waiter_ops[0];
+    assert_eq!(
+        first.op_id, in_flight.op_id,
+        "same op handed over, not a new one"
+    );
+    assert_eq!(first.operation, in_flight.operation);
+    assert_eq!(first.listing_hint, in_flight.listing_hint);
+    assert_eq!(resolved(&resp), ResolveKind::Coalesced);
+    assert_parity(&fx, &resp, &specs);
+}
+
+/// B2: an exact-version hit needs `expected_log_segment` present and equal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exact_version_hit_requires_matching_expected_segment() {
+    let fx = fixture("table-with-dv-small");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let v = latest_version(&fx);
+    let specs = default_specs();
+    let (r1, _) = run(&mut c, request(&fx, v, specs.clone()), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(resolved(&r1), ResolveKind::FullBuild);
+
+    let (absent, _) = run(&mut c, request(&fx, v, specs.clone()), Behavior::default())
+        .await
+        .ok();
+    assert_ne!(
+        resolved(&absent),
+        ResolveKind::CacheHit,
+        "absent segment is a miss"
+    );
+    assert!(ops_issued(&absent) > 0);
+
+    let mut wrong = segment(&r1).clone();
+    wrong.deltas[0].size += 1;
+    let mut req = request(&fx, v, specs.clone());
+    req.expected_log_segment = Some(wrong);
+    let (mismatch, _) = run(&mut c, req, Behavior::default()).await.ok();
+    assert_ne!(
+        resolved(&mismatch),
+        ResolveKind::CacheHit,
+        "mismatched segment is a miss"
+    );
+
+    let (hit, ops) = run(
+        &mut c,
+        request_with_segment(&fx, v, specs.clone(), &r1),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&hit), ResolveKind::CacheHit);
+    assert!(ops.is_empty());
+    // The misses did not add duplicate instances for the same (version, segment).
+    assert_eq!(
+        server.core.cached_instances_per_table().get(&fx.table_id),
+        Some(&1)
+    );
+}
+
+const CL_TAIL_A: &[&str] = &["00000000000000000003.json"];
+const CL_TAIL_B: &[&str] = &["00000000000000000002.json", "00000000000000000003.json"];
+
+/// B3: identical non-staged catalog tail -> CACHE_HIT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_latest_identical_tail_hits() {
+    let fx = fixture("with_checkpoint_no_last_checkpoint");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let specs = default_specs();
+    let (r1, _) = run(
+        &mut c,
+        catalog_request(&fx, 3, CL_TAIL_A, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(r1.version, 3);
+    assert_eq!(resolved(&r1), ResolveKind::FullBuild);
+    assert_parity(&fx, &r1, &specs);
+    let (r2, ops) = run(
+        &mut c,
+        catalog_request(&fx, 3, CL_TAIL_A, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r2), ResolveKind::CacheHit);
+    assert!(ops.is_empty());
+}
+
+/// B3: same max_catalog_version, different tail -> no shared snapshot, neither from cache nor
+/// from an in-flight build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_latest_different_tail_does_not_share() {
+    let fx = Arc::new(fixture("with_checkpoint_no_last_checkpoint"));
+    let server = TestServer::start().await;
+    let specs = default_specs();
+    let mut c = server.client().await;
+    run(
+        &mut c,
+        catalog_request(&fx, 3, CL_TAIL_A, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    let (rb, _) = run(
+        &mut c,
+        catalog_request(&fx, 3, CL_TAIL_B, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(
+        resolved(&rb),
+        ResolveKind::FullBuild,
+        "cached tail A must not serve tail B"
+    );
+    // Exact-version tail-less lookups still find a matching instance by segment.
+    let (exact, _) = run(
+        &mut c,
+        request_with_segment(&fx, 3, specs.clone(), &rb),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&exact), ResolveKind::CacheHit);
+
+    // In flight: a slow tail-A build must not absorb a concurrent tail-B request.
+    server.core.reset_cache();
+    let before = server.stats().await;
+    let first_op = Arc::new(Notify::new());
+    let mut c0 = server.client().await;
+    let req = catalog_request(&fx, 3, CL_TAIL_A, specs.clone());
+    let slow = Behavior {
+        op_delay: Duration::from_millis(150),
+        first_op: Some(first_op.clone()),
+        ..Default::default()
+    };
+    let a = tokio::spawn(async move { run(&mut c0, req, slow).await });
+    first_op.notified().await;
+    let (b, _) = run(
+        &mut c,
+        catalog_request(&fx, 3, CL_TAIL_B, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    a.await.unwrap().ok();
+    assert_eq!(resolved(&b), ResolveKind::FullBuild);
+    let after = server.stats().await;
+    assert_eq!(after.builds_started - before.builds_started, 2);
+    assert_eq!(after.builds_coalesced - before.builds_coalesced, 0);
+}
+
+/// B3: a tail with a staged commit is neither cached nor coalesced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_latest_staged_tail_not_cached_not_coalesced() {
+    let fx = Arc::new(fixture("with_checkpoint_no_last_checkpoint"));
+    let staged_dir = fx.log_dir().join("_staged_commits");
+    std::fs::create_dir_all(&staged_dir).unwrap();
+    let staged = "_staged_commits/00000000000000000004.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json";
+    std::fs::write(
+        fx.log_dir().join(staged),
+        "{\"commitInfo\":{\"timestamp\":1700000000004,\"operation\":\"WRITE\"}}\n\
+         {\"add\":{\"path\":\"staged-part.parquet\",\"partitionValues\":{},\"size\":10,\
+         \"modificationTime\":1700000000004,\"dataChange\":true}}\n",
+    )
+    .unwrap();
+    let server = TestServer::start().await;
+    let specs = default_specs();
+    let mut c = server.client().await;
+
+    let (r1, _) = run(
+        &mut c,
+        catalog_request(&fx, 4, &[staged], specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(r1.version, 4);
+    assert_eq!(segment(&r1).delta_is_staged.last(), Some(&true));
+    assert!(
+        server.core.cached_instances_per_table().is_empty(),
+        "staged: not cached"
+    );
+    let (r2, _) = run(
+        &mut c,
+        catalog_request(&fx, 4, &[staged], specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r2), ResolveKind::FullBuild);
+
+    let before = server.stats().await;
+    let first_op = Arc::new(Notify::new());
+    let mut c0 = server.client().await;
+    let req = catalog_request(&fx, 4, &[staged], specs.clone());
+    let slow = Behavior {
+        op_delay: Duration::from_millis(150),
+        first_op: Some(first_op.clone()),
+        ..Default::default()
+    };
+    let a = tokio::spawn(async move { run(&mut c0, req, slow).await });
+    first_op.notified().await;
+    let (b, _) = run(
+        &mut c,
+        catalog_request(&fx, 4, &[staged], specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    a.await.unwrap().ok();
+    assert_eq!(
+        resolved(&b),
+        ResolveKind::FullBuild,
+        "staged: not coalesced"
+    );
+    let after = server.stats().await;
+    assert_eq!(after.builds_started - before.builds_started, 2);
+    assert_eq!(after.builds_coalesced - before.builds_coalesced, 0);
+    assert!(server.core.cached_instances_per_table().is_empty());
+}
+
+/// N1: the server sends a ListingHint for `_delta_log` listings and the client's truncated
+/// result still yields the correct snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listing_hint_is_sent_and_honored() {
+    let fx = fixture("with_checkpoint_no_last_checkpoint");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let specs = default_specs();
+    let (resp, ops) = run(&mut c, request(&fx, 1, specs.clone()), Behavior::default())
+        .await
+        .ok();
+    let listings: Vec<&OpLog> = ops.iter().filter(|o| o.kind == "FileListing").collect();
+    assert!(!listings.is_empty());
+    for l in &listings {
+        let hint = l
+            .listing_hint
+            .expect("every _delta_log listing carries a hint");
+        assert_eq!(hint.end_version, Some(1));
+        assert!(hint.stop_at_first_non_versioned);
+        assert!(
+            l.returned_files
+                .iter()
+                .all(|f| file_version(f).is_some_and(|v| v <= 1)),
+            "{:?}",
+            l.returned_files
+        );
+    }
+    // The log dir has commits 2, 3 and a checkpoint at 2; the hint cut them off.
+    assert!(fx.log_dir().join("00000000000000000003.json").exists());
+    assert_eq!(resp.version, 1);
+    assert_parity(&fx, &resp, &specs);
+
+    // Sidecar directory listings get no hint (their file names are not versioned).
+    let sc = fixture("v2-checkpoints-parquet-with-sidecars");
+    let (_, ops) = run(
+        &mut c,
+        request(&sc, latest_version(&sc), specs),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    for l in ops.iter().filter(|o| o.kind == "FileListing") {
+        if l.urls.iter().any(|u| u.contains("/_sidecars/")) {
+            assert!(l.listing_hint.is_none());
+        } else {
+            assert!(l.listing_hint.is_some());
+        }
+    }
+}
+
+/// N2: a missed op deadline fails the whole build for the driver and every waiter; nothing is
+/// handed over and nothing is cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_fails_driver_and_all_waiters_without_handoff() {
+    let fx = Arc::new(fixture("table-without-dv-small"));
+    let server = TestServer::start().await;
+    let version = latest_version(&fx);
+    let first_op = Arc::new(Notify::new());
+    let mut c0 = server.client().await;
+    let mut req = request(&fx, version, default_specs());
+    req.client.as_mut().unwrap().op_deadline_ms = 500;
+    let silent = Behavior {
+        never_answer: true,
+        first_op: Some(first_op.clone()),
+        ..Default::default()
+    };
+    let driver = tokio::spawn(async move { run(&mut c0, req, silent).await });
+    first_op.notified().await;
+    let mut waiters = Vec::new();
+    for _ in 0..3 {
+        let mut c = server.client().await;
+        let req = request(&fx, version, default_specs());
+        waiters.push(tokio::spawn(async move {
+            run(&mut c, req, Behavior::default()).await
+        }));
+    }
+    let d = driver.await.unwrap().err();
+    assert_eq!(d.code, Code::Deadline as i32, "{d:?}");
+    for w in waiters {
+        let o = w.await.unwrap();
+        assert!(o.ops.is_empty(), "no op may be handed over on a deadline");
+        let e = o.err();
+        assert_eq!(e.code, Code::Deadline as i32, "{e:?}");
+    }
+    assert!(server.core.cached_instances_per_table().is_empty());
+    assert_eq!(server.stats().await.builds_started, 1);
 }

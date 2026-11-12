@@ -67,8 +67,14 @@ level (default `info`). Max gRPC message size is 256 MiB in both directions.
   `SnapshotInfo` is computed once, during the build, through the build's op channel. A hit
   returns the stored copy. Clustering, ICT timestamp, domain metadata, and row-tracking getters do
   IO and kernel does not cache them, so they cannot be recomputed on a hit.
-- **Hit**: same version, and `expected_log_segment` (if sent) equals the cached segment. A hit
+- **Hit (exact version)**: same version, and `expected_log_segment` is present and equals the
+  cached segment. A request without `expected_log_segment` is always a miss (SPEC v6). A hit
   issues 0 ops when every requested plan is cached.
+- **Hit / coalescing (`catalog_latest`)**: keyed on `max_catalog_version` plus the canonical log
+  tail (`(version, location, size)` sorted by version). A tail containing staged commits is never
+  served from cache, never coalesced, and its result is never cached.
+- **ListingHint**: sent only for listings of `_delta_log/` itself (`end_version` = build target,
+  `stop_at_first_non_versioned = true`). `_delta_log/_sidecars/` listings get no hint.
 - **Miss**: incremental `Snapshot::builder_from(newest cached older instance)` if there is one,
   otherwise a full build.
 - **Coalescing**: builds coalesce on `(table_id, location, target version)`; plan generation
@@ -76,7 +82,9 @@ level (default `info`). Max gRPC message size is 256 MiB in both directions.
   driving stream dies, the in-flight op is re-sent to the next waiting stream. The job continues
   and does not restart. With no waiter left, the executor returns `KernelError::Cancelled`.
 - **Errors**: a stream loss or a missed op deadline makes `RemotePlanExecutor` return
-  `KernelError::Cancelled`, which surfaces as `CANCELLED` / `DEADLINE`. A client-reported op error
+  `KernelError::Cancelled`, which surfaces as `CANCELLED` / `DEADLINE`. Only a stream loss hands
+  the op to another waiter; a missed deadline fails the build for the driver and every waiter
+  (SPEC v6). A client-reported op error
   surfaces as `OP_FAILED`. Kernel `Unsupported` from plan generation (TIMESTAMP partitions with a
   timezone, adaptive-metadata checkpoint actions) is a per-plan `unsupported` result.
 - **Tainted builds**: any op error other than `FileNotFound` (whole-op or per-item) taints the job.
