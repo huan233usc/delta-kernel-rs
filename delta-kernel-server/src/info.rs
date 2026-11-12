@@ -40,10 +40,13 @@ pub fn compute_snapshot_info(
         ),
     };
     let row_tracking_high_water_mark = reader.get_row_tracking_high_water_mark(engine)?;
+    // Mirrors the JNR `getActiveDomainMetadataMap` getter, which is ffi `visit_domain_metadata`
+    // over `get_all_domain_metadata`: active user-controlled domains only. System `delta.*`
+    // domains (clustering, row tracking) are exposed through their own SnapshotInfo fields.
     let active_domain_metadata = reader
-        .get_domain_metadatas_internal(engine, None)?
-        .into_iter()
-        .map(|(k, v)| (k, domain_metadata(&v)))
+        .get_all_domain_metadata(engine)?
+        .iter()
+        .map(|d| (d.domain().to_string(), domain_metadata(d)))
         .collect();
 
     let crc = snapshot.crc_at_version().map(|crc| {
@@ -113,6 +116,52 @@ pub fn log_segment_info(seg: &LogSegment) -> proto::LogSegmentInfo {
             .iter()
             .map(|p| p.file_type == LogPathFileType::StagedCommit)
             .collect(),
+    }
+}
+
+/// Canonical identity of a log segment for cache-hit comparison (SPEC v7 §7).
+///
+/// Clients do not echo URLs byte-for-byte: DBR re-qualifies every location through Hadoop
+/// `Path.makeQualified`, which renders `file:///tmp/t` as `file:/tmp/t` and leaves spaces
+/// unescaped. Locations are therefore compared after parsing as URLs. `last_modified` is ignored:
+/// Delta log files are immutable and named by version, so (location, size) identifies a file, and
+/// listing sources disagree on mtime precision. Any difference in version, checkpoint version, the
+/// set of checkpoint parts or deltas, a size, or a staged flag is still a different segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentId {
+    version: i64,
+    checkpoint_version: Option<i64>,
+    checkpoint_parts: Vec<(String, i64)>,
+    deltas: Vec<(String, i64, bool)>,
+}
+
+/// Canonical form of a location: the parsed URL, or the raw string if it does not parse.
+pub fn canonical_location(location: &str) -> String {
+    url::Url::parse(location).map_or_else(|_| location.to_string(), |u| u.to_string())
+}
+
+pub fn segment_id(seg: &proto::LogSegmentInfo) -> SegmentId {
+    let mut checkpoint_parts: Vec<(String, i64)> = seg
+        .checkpoint_parts
+        .iter()
+        .map(|f| (canonical_location(&f.location), f.size))
+        .collect();
+    checkpoint_parts.sort();
+    let mut deltas: Vec<(String, i64, bool)> = seg
+        .deltas
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let staged = seg.delta_is_staged.get(i).copied().unwrap_or(false);
+            (canonical_location(&f.location), f.size, staged)
+        })
+        .collect();
+    deltas.sort();
+    SegmentId {
+        version: seg.version,
+        checkpoint_version: seg.checkpoint_version,
+        checkpoint_parts,
+        deltas,
     }
 }
 

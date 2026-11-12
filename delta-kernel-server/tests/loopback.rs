@@ -1316,3 +1316,482 @@ async fn deadline_fails_driver_and_all_waiters_without_handoff() {
     assert!(server.core.cached_instances_per_table().is_empty());
     assert_eq!(server.stats().await.builds_started, 1);
 }
+
+// ------------------------------------------------------------------------------------------------
+// Round-3: L1 integration findings and the v7 latest cache
+// ------------------------------------------------------------------------------------------------
+
+/// Builds a request the way DBR's `RemoteKernelClient` does: Hadoop-qualified table location and
+/// segment locations.
+fn client_request(
+    fx: &Fixture,
+    version: i64,
+    segment: proto::LogSegmentInfo,
+) -> proto::GetSnapshotRequest {
+    let mut req = request(fx, version, default_specs());
+    req.table.as_mut().unwrap().location = hadoop_table_location(fx);
+    req.expected_log_segment = Some(segment);
+    req
+}
+
+/// F1 (`P1A-CACHE-EXACT-NO-HIT`): the DBR client re-qualifies every location through Hadoop
+/// (`file:///p` -> `file:/p`) before sending `expected_log_segment`, so a raw proto comparison
+/// never matched. The table directory has a space to cover escaping as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exact_hit_with_client_qualified_segment() {
+    for name in ["v2-classic-checkpoint-parquet", "table-without-dv-small"] {
+        let fx = fixture_at_tar_or_dir(name);
+        let server = TestServer::start().await;
+        let mut c = server.client().await;
+        let v = latest_version(&fx);
+
+        // First request: the segment of the client's own in-process snapshot (JNR), in client
+        // form and with a coarser mtime, exactly like assertSnapshotAndPlanParity.
+        let jnr = local_snapshot(&fx, Some(v));
+        let jnr_seg = delta_kernel_server::info::log_segment_info(jnr.log_segment());
+        let (r1, _) = run(
+            &mut c,
+            client_request(&fx, v, client_form_segment(&jnr_seg, true)),
+            Behavior::default(),
+        )
+        .await
+        .ok();
+        assert_eq!(resolved(&r1), ResolveKind::FullBuild, "{name}");
+        assert!(
+            first_file(segment(&r1)).location.starts_with("file:///"),
+            "server reports url-crate form"
+        );
+
+        // Warm request: the server's segment echoed back after the client's toProto rewrite.
+        let warm = client_form_segment(segment(&r1), false);
+        assert!(
+            first_file(&warm).location.starts_with("file:/")
+                && !first_file(&warm).location.starts_with("file://")
+        );
+        let (r2, ops) = run(&mut c, client_request(&fx, v, warm), Behavior::default())
+            .await
+            .ok();
+        assert_eq!(resolved(&r2), ResolveKind::CacheHit, "{name}");
+        assert!(ops.is_empty());
+
+        // The JNR-derived segment also identifies the same files.
+        let (r3, _) = run(
+            &mut c,
+            client_request(&fx, v, client_form_segment(&jnr_seg, true)),
+            Behavior::default(),
+        )
+        .await
+        .ok();
+        assert_eq!(resolved(&r3), ResolveKind::CacheHit, "{name}");
+
+        // Safety: a different segment still misses.
+        let base = client_form_segment(segment(&r1), false);
+        let mut bigger = base.clone();
+        first_file_mut(&mut bigger).size += 1;
+        let mut fewer = base.clone();
+        if fewer.deltas.is_empty() {
+            fewer.checkpoint_parts.remove(0);
+        } else {
+            fewer.deltas.remove(0);
+            fewer.delta_is_staged.remove(0);
+        }
+        let mut other_ckpt = base.clone();
+        other_ckpt.checkpoint_version = Some(other_ckpt.checkpoint_version.map_or(0, |c| c + 1));
+        let mut renamed = base.clone();
+        let f = first_file_mut(&mut renamed);
+        f.location = f.location.replace("/_delta_log/", "/_delta_log/x");
+        for (what, seg) in [
+            ("size", bigger),
+            ("missing delta", fewer),
+            ("checkpoint version", other_ckpt),
+            ("location", renamed),
+        ] {
+            let (r, _) = run(&mut c, client_request(&fx, v, seg), Behavior::default())
+                .await
+                .ok();
+            assert_ne!(
+                resolved(&r),
+                ResolveKind::CacheHit,
+                "{name}: {what} differs"
+            );
+        }
+    }
+}
+
+fn first_file(seg: &proto::LogSegmentInfo) -> &proto::FileStatus {
+    seg.deltas.first().or(seg.checkpoint_parts.first()).unwrap()
+}
+
+fn first_file_mut(seg: &mut proto::LogSegmentInfo) -> &mut proto::FileStatus {
+    if seg.deltas.is_empty() {
+        &mut seg.checkpoint_parts[0]
+    } else {
+        &mut seg.deltas[0]
+    }
+}
+
+fn fixture_at_tar_or_dir(name: &str) -> Fixture {
+    if data_dir().join(name).is_dir() {
+        fixture_at(name, "table with space")
+    } else {
+        fixture(name)
+    }
+}
+
+/// F2 (`P1A-SNAPSHOTINFO-ACTIVE-DOMAIN-METADATA-MISMATCH`): `active_domain_metadata` mirrors JNR
+/// `getActiveDomainMetadataMap` = ffi `visit_domain_metadata` = kernel `get_all_domain_metadata`:
+/// active user domains only, no `delta.*` system domains, no removed domains. Liquid table built
+/// by log replay (no CRC).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn liquid_active_domain_metadata_matches_jnr_getter() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("liquid");
+    let log = root.join("_delta_log");
+    std::fs::create_dir_all(&log).unwrap();
+    let schema = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"#;
+    let commit0 = [
+        r#"{"commitInfo":{"timestamp":1700000000000,"operation":"CREATE TABLE"}}"#.to_string(),
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":7,"writerFeatures":["domainMetadata","clustering"]}}"#.to_string(),
+        format!(
+            r#"{{"metaData":{{"id":"liquid-1","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{schema}","partitionColumns":[],"configuration":{{}},"createdTime":1700000000000}}}}"#
+        ),
+        r#"{"domainMetadata":{"domain":"delta.clustering","configuration":"{\"clusteringColumns\":[[\"region\"]]}","removed":false}}"#.to_string(),
+        r#"{"domainMetadata":{"domain":"com.databricks.liquid","configuration":"{\"v\":1}","removed":false}}"#.to_string(),
+        r#"{"domainMetadata":{"domain":"com.databricks.liquid.shuffledToFileCompressionRatio","configuration":"{\"r\":2.5}","removed":false}}"#.to_string(),
+        r#"{"domainMetadata":{"domain":"myApp.gone","configuration":"{}","removed":false}}"#.to_string(),
+        r#"{"add":{"path":"part-0.parquet","partitionValues":{},"size":10,"modificationTime":1700000000000,"dataChange":true,"stats":"{\"numRecords\":1}"}}"#.to_string(),
+    ];
+    std::fs::write(
+        log.join(format!("{:020}.json", 0)),
+        commit0.join("\n") + "\n",
+    )
+    .unwrap();
+    let commit1 = [
+        r#"{"commitInfo":{"timestamp":1700000000001,"operation":"WRITE"}}"#,
+        r#"{"domainMetadata":{"domain":"myApp.gone","configuration":"{}","removed":true}}"#,
+        r#"{"domainMetadata":{"domain":"com.databricks.liquid","configuration":"{\"v\":2}","removed":false}}"#,
+    ];
+    std::fs::write(
+        log.join(format!("{:020}.json", 1)),
+        commit1.join("\n") + "\n",
+    )
+    .unwrap();
+    let root = root.canonicalize().unwrap();
+    let fx = Fixture {
+        url: url::Url::from_directory_path(&root).unwrap(),
+        root,
+        table_id: "tbl-liquid".into(),
+        _dir: dir,
+    };
+
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let specs = default_specs();
+    let (resp, _) = run(&mut c, request(&fx, 1, specs.clone()), Behavior::default())
+        .await
+        .ok();
+    let info = info(&resp);
+    let mut keys: Vec<&str> = info
+        .active_domain_metadata
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "com.databricks.liquid",
+            "com.databricks.liquid.shuffledToFileCompressionRatio"
+        ],
+        "user domains only: no delta.*, no removed"
+    );
+    assert_eq!(
+        info.active_domain_metadata["com.databricks.liquid"].configuration,
+        r#"{"v":2}"#
+    );
+    assert!(info.active_domain_metadata.values().all(|d| !d.removed));
+
+    // Exactly what the in-process getter behind JNR returns.
+    let local = local_snapshot(&fx, Some(1));
+    let mut jnr: Vec<(String, String)> = local
+        .reader()
+        .get_all_domain_metadata(&local_engine())
+        .unwrap()
+        .iter()
+        .map(|d| (d.domain().to_string(), d.configuration().to_string()))
+        .collect();
+    jnr.sort();
+    let mut remote: Vec<(String, String)> = info
+        .active_domain_metadata
+        .values()
+        .map(|d| (d.domain.clone(), d.configuration.clone()))
+        .collect();
+    remote.sort();
+    assert_eq!(remote, jnr);
+
+    // The system domain still drives clustering columns.
+    let cols: Vec<Vec<String>> = info
+        .clustering_columns
+        .iter()
+        .map(|c| c.logical_path.as_ref().unwrap().parts.clone())
+        .collect();
+    assert_eq!(cols, vec![vec!["region".to_string()]]);
+    assert_parity(&fx, &resp, &specs);
+}
+
+/// F2 on the CRC path: crc-full's CRC lists delta.clustering, delta.rowTracking and
+/// myApp.metadata; only the user domain is reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crc_active_domain_metadata_excludes_system_domains() {
+    let fx = fixture("crc-full");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let (resp, _) = run(
+        &mut c,
+        request(&fx, 0, default_specs()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    let keys: Vec<&String> = info(&resp).active_domain_metadata.keys().collect();
+    assert_eq!(keys, vec!["myApp.metadata"]);
+    assert_eq!(info(&resp).row_tracking_high_water_mark, Some(9));
+}
+
+// --- F3: v7 server-side path-based latest cache ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn latest_within_staleness_hits_with_zero_ops() {
+    let fx = fixture("table-with-dv-small");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let specs = default_specs();
+    let (r1, _) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r1), ResolveKind::FullBuild);
+    assert_eq!(r1.version, latest_version(&fx));
+    assert_parity(&fx, &r1, &specs);
+    let (r2, ops) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r2), ResolveKind::CacheHit);
+    assert_eq!(ops_issued(&r2), 0);
+    assert!(ops.is_empty());
+    assert_eq!(r2.version, r1.version);
+    assert!(r2.plans.iter().all(|p| p.cache_hit));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn latest_stale_unchanged_renews_with_one_listing() {
+    let fx = fixture("v2-classic-checkpoint-parquet");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let specs = default_specs();
+    let (r1, _) = run(
+        &mut c,
+        latest_request(&fx, 0, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r1), ResolveKind::FullBuild);
+    let (r2, ops) = run(
+        &mut c,
+        latest_request(&fx, 0, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r2), ResolveKind::CacheHit);
+    assert_eq!(ops_issued(&r2), 1);
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].kind, "FileListing");
+    assert_eq!(r2.version, r1.version);
+    assert_eq!(r2.info, r1.info, "renewal serves the stored SnapshotInfo");
+    assert!(
+        r2.plans.iter().all(|p| p.cache_hit),
+        "renewal keeps the plan cache"
+    );
+    // The renewal re-confirmed the instance: a staleness window now hits with 0 ops.
+    let (r3, _) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r3), ResolveKind::CacheHit);
+    assert_eq!(ops_issued(&r3), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn latest_stale_with_new_commit_is_incremental() {
+    let fx = fixture("basic_partitioned");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let specs = default_specs();
+    let v0 = latest_version(&fx);
+    let (r1, _) = run(
+        &mut c,
+        latest_request(&fx, 0, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(r1.version, v0);
+    append_commit(
+        &fx,
+        v0 + 1,
+        "letter=z/part-latest.parquet",
+        Some(("letter", "z")),
+    );
+
+    // Inside the staleness window the new commit is not seen yet.
+    let (r2, _) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!((resolved(&r2), r2.version), (ResolveKind::CacheHit, v0));
+
+    let (r3, _) = run(
+        &mut c,
+        latest_request(&fx, 0, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r3), ResolveKind::Incremental);
+    assert_eq!(r3.version, v0 + 1);
+    assert_parity(&fx, &r3, &specs);
+    let (r4, _) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(
+        (resolved(&r4), r4.version, ops_issued(&r4)),
+        (ResolveKind::CacheHit, v0 + 1, 0)
+    );
+    // The new latest instance also serves exact-version requests with its segment.
+    let (r5, _) = run(
+        &mut c,
+        request_with_segment(&fx, v0 + 1, specs, &r3),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r5), ResolveKind::CacheHit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_latest_requests_share_one_listing() {
+    let fx = Arc::new(fixture("v2-checkpoints-parquet-with-sidecars"));
+    let server = TestServer::start().await;
+    let specs = default_specs();
+    let mut c = server.client().await;
+    run(
+        &mut c,
+        latest_request(&fx, 0, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    let before = server.stats().await;
+
+    let first_op = Arc::new(Notify::new());
+    let mut c0 = server.client().await;
+    let req = latest_request(&fx, 0, specs.clone());
+    let slow = Behavior {
+        op_delay: Duration::from_millis(300),
+        first_op: Some(first_op.clone()),
+        ..Default::default()
+    };
+    let driver = tokio::spawn(async move { run(&mut c0, req, slow).await });
+    first_op.notified().await;
+    let mut waiters = Vec::new();
+    for _ in 0..7 {
+        let mut c = server.client().await;
+        let req = latest_request(&fx, 0, specs.clone());
+        waiters.push(tokio::spawn(async move {
+            run(&mut c, req, Behavior::default()).await
+        }));
+    }
+    let (d, d_ops) = driver.await.unwrap().ok();
+    assert_eq!(resolved(&d), ResolveKind::CacheHit);
+    let mut listings = d_ops.iter().filter(|o| o.kind == "FileListing").count();
+    for w in waiters {
+        let (r, ops) = w.await.unwrap().ok();
+        assert_eq!(resolved(&r), ResolveKind::Coalesced);
+        assert_eq!(r.version, d.version);
+        listings += ops.iter().filter(|o| o.kind == "FileListing").count();
+    }
+    assert_eq!(listings, 1, "8 concurrent latest requests -> one listing");
+    let after = server.stats().await;
+    assert_eq!(after.builds_started - before.builds_started, 1);
+    assert_eq!(after.builds_coalesced - before.builds_coalesced, 7);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn latest_after_eviction_is_full_build() {
+    let fx = fixture("with_checkpoint_no_last_checkpoint");
+    let server = TestServer::start_with(
+        CacheConfig {
+            max_instances_per_table: 1,
+            ..CacheConfig::default()
+        },
+        true,
+    )
+    .await;
+    let mut c = server.client().await;
+    let specs = vec![spec_json()];
+    let (r1, _) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!((resolved(&r1), r1.version), (ResolveKind::FullBuild, 3));
+    // An exact-version build of v1 evicts the latest instance (one instance per table).
+    run(&mut c, request(&fx, 1, specs.clone()), Behavior::default())
+        .await
+        .ok();
+    let (r2, _) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(
+        resolved(&r2),
+        ResolveKind::FullBuild,
+        "evicted latest cannot be served"
+    );
+    assert_eq!(r2.version, 3);
+    assert_parity(&fx, &r2, &specs);
+    // ResetCache also forgets the latest confirmation.
+    c.reset_cache(proto::ResetCacheRequest {}).await.unwrap();
+    let (r3, _) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r3), ResolveKind::FullBuild);
+}

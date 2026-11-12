@@ -32,11 +32,14 @@ message VersionSpec {
   oneof spec {
     int64 version = 1;                // exact version already resolved by the client
     CatalogLatest catalog_latest = 2;
-    Latest latest = 3;                // path-based latest; not coalesced
+    Latest latest = 3;                // path-based latest, cached server-side (v7)
   }
 }
 message CatalogLatest { int64 max_catalog_version = 1; repeated FileStatus log_tail = 2; }
-message Latest {}
+// v7: path-based latest resolved and cached by the server. Within `max_staleness_ms` of the
+// last confirmation the cached instance is returned with 0 ops; otherwise the server re-lists
+// once from the cached instance.
+message Latest { int64 max_staleness_ms = 1; }
 
 message FileStatus {
   string location = 1;          // full URL, same scheme/authority form as the request URL

@@ -21,7 +21,7 @@ use tokio::sync::watch;
 
 use crate::errors::{ServerError, classify_build_error, classify_kernel_error};
 use crate::executor::{OpChannel, RemotePlanExecutor, StreamPort};
-use crate::info::{compute_snapshot_info, has_staged_commits};
+use crate::info::{SegmentId, compute_snapshot_info, has_staged_commits, segment_id};
 use crate::plan::{PlanOutcome, generate_plan, spec_key};
 use crate::proto::error::Code;
 use crate::proto::{self, version_spec};
@@ -65,9 +65,24 @@ type TableKey = (String, String);
 /// Canonical identity of a catalog log tail: `(version, location, size)` sorted by version.
 pub type TailId = Vec<(i64, String, i64)>;
 
-/// In-flight build key: table, target version, and the catalog tail for `catalog_latest` builds
-/// (`None` for exact-version builds).
-type BuildKey = (TableKey, i64, Option<TailId>);
+/// What an in-flight build resolves; with the table it forms the coalescing key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum BuildTarget {
+    /// Exact version.
+    Version(i64),
+    /// `catalog_latest`: ratified version plus canonical log tail (SPEC v6).
+    Catalog(i64, TailId),
+    /// Path-based latest: one re-listing shared by every concurrent request (SPEC v7).
+    Latest,
+}
+
+type BuildKey = (TableKey, BuildTarget);
+
+/// The last confirmed path-based latest instance of a table (SPEC v7).
+struct LatestEntry {
+    instance: Arc<Instance>,
+    confirmed_at: Instant,
+}
 
 /// Canonicalizes a request's catalog log tail (SPEC v6 §7).
 pub fn tail_id(log_tail: &[proto::FileStatus]) -> TailId {
@@ -96,6 +111,8 @@ pub struct Instance {
     last_used: AtomicU64,
     /// Canonical log tail of a `catalog_latest` build; `None` for exact-version builds.
     catalog_tail: Option<TailId>,
+    /// Canonical identity of `info.log_segment`, compared against `expected_log_segment`.
+    segment_id: Option<SegmentId>,
 }
 
 enum PlanSlot {
@@ -108,8 +125,26 @@ impl Instance {
         self.snapshot.version() as i64
     }
 
-    fn segment(&self) -> Option<&proto::LogSegmentInfo> {
-        self.info.log_segment.as_ref()
+    fn new(
+        snapshot: SnapshotRef,
+        info: proto::SnapshotInfo,
+        catalog_tail: Option<TailId>,
+        tick: u64,
+    ) -> Self {
+        let segment_id = info.log_segment.as_ref().map(segment_id);
+        Self {
+            snapshot,
+            info,
+            plans: Mutex::default(),
+            last_used: AtomicU64::new(tick),
+            catalog_tail,
+            segment_id,
+        }
+    }
+
+    /// Whether the client's expected segment names the same files as this instance's.
+    fn matches_segment(&self, expected: &proto::LogSegmentInfo) -> bool {
+        self.segment_id.as_ref() == Some(&segment_id(expected))
     }
 
     /// Estimated memory: snapshot heap (includes a CRC's inline `allFiles`) plus plan bytes.
@@ -156,6 +191,13 @@ impl<T: Clone> Job<T> {
     }
 }
 
+/// Result of the blocking part of a build.
+enum Built {
+    New(SnapshotRef, Box<proto::SnapshotInfo>, proto::ResolveKind),
+    /// Path-based latest re-listing found no new commit.
+    Renewed(Arc<Instance>),
+}
+
 #[derive(Clone)]
 struct BuildOutcome {
     instance: Arc<Instance>,
@@ -166,6 +208,22 @@ struct BuildOutcome {
 struct CacheState {
     tables: HashMap<TableKey, Vec<Arc<Instance>>>,
     inflight: HashMap<BuildKey, Arc<Job<BuildOutcome>>>,
+    latest: HashMap<TableKey, LatestEntry>,
+}
+
+impl CacheState {
+    /// The table's latest entry if its instance is still cached; drops it once evicted.
+    fn live_latest(&mut self, key: &TableKey) -> Option<&LatestEntry> {
+        let cached = self.latest.get(key).is_some_and(|e| {
+            self.tables
+                .get(key)
+                .is_some_and(|insts| insts.iter().any(|i| Arc::ptr_eq(i, &e.instance)))
+        });
+        if !cached {
+            self.latest.remove(key);
+        }
+        self.latest.get(key)
+    }
 }
 
 /// Server core shared by all streams.
@@ -194,7 +252,9 @@ enum Target {
         tail_id: TailId,
         tail_has_staged: bool,
     },
-    Latest,
+    Latest {
+        max_staleness: Duration,
+    },
 }
 
 impl Core {
@@ -223,7 +283,9 @@ impl Core {
     }
 
     pub fn reset_cache(&self) {
-        self.state.lock().unwrap().tables.clear();
+        let mut st = self.state.lock().unwrap();
+        st.tables.clear();
+        st.latest.clear();
     }
 
     /// Validates the client's kernel build; any mismatch is `VERSION_MISMATCH`.
@@ -296,7 +358,12 @@ impl Core {
                     })
                     .collect::<Result<_, _>>()?,
             },
-            Some(version_spec::Spec::Latest(_)) | None => Target::Latest,
+            Some(version_spec::Spec::Latest(l)) => Target::Latest {
+                max_staleness: Duration::from_millis(l.max_staleness_ms.max(0) as u64),
+            },
+            None => Target::Latest {
+                max_staleness: Duration::ZERO,
+            },
         };
 
         let (instance, resolved_by) = match self.resolve(&key, &location, &target, &req, port) {
@@ -349,12 +416,13 @@ impl Core {
         let mut st = self.state.lock().unwrap();
         let expected = req.expected_log_segment.as_ref();
         // Exact-version requests hit only when the client's expected log segment is present and
-        // equal to the cached one (SPEC v6: absent => miss). `catalog_latest` hits and coalesces
-        // on (max_catalog_version, canonical log tail); a tail with staged commits is neither
-        // served from cache nor coalesced. Path-based latest has no known target, so it is
-        // neither coalesced nor served from cache (it must re-list to find new commits).
+        // names the same files as the cached one (SPEC v6/v7: absent => miss; compared by
+        // canonical identity). `catalog_latest` hits and coalesces on (max_catalog_version,
+        // canonical log tail); a tail with staged commits is neither served from cache nor
+        // coalesced. Path-based latest is served from the table's last confirmed latest instance
+        // within `max_staleness`, otherwise re-listed once for all concurrent requests.
         let (target_version, build_key): (Option<i64>, Option<BuildKey>) = match target {
-            Target::Version(v) => (Some(*v), Some((key.clone(), *v, None))),
+            Target::Version(v) => (Some(*v), Some((key.clone(), BuildTarget::Version(*v)))),
             Target::CatalogLatest {
                 max_catalog_version,
                 tail_has_staged: true,
@@ -366,27 +434,41 @@ impl Core {
                 ..
             } => (
                 Some(*max_catalog_version),
-                Some((key.clone(), *max_catalog_version, Some(tail_id.clone()))),
+                Some((
+                    key.clone(),
+                    BuildTarget::Catalog(*max_catalog_version, tail_id.clone()),
+                )),
             ),
-            Target::Latest => (None, None),
+            Target::Latest { .. } => (None, Some((key.clone(), BuildTarget::Latest))),
         };
 
         if let Some(bk) = &build_key {
-            let (_, v, tail) = bk;
-            let hit = st.tables.get(key).and_then(|insts| {
-                insts.iter().find(|i| {
-                    i.version() == *v
-                        && match tail {
-                            None => expected.is_some_and(|e| i.segment() == Some(e)),
-                            Some(t) => {
-                                i.catalog_tail.as_ref() == Some(t)
-                                    && expected.is_none_or(|e| i.segment() == Some(e))
-                            }
-                        }
-                })
-            });
+            let hit = match (&bk.1, target) {
+                (BuildTarget::Version(v), _) => st.tables.get(key).and_then(|insts| {
+                    insts
+                        .iter()
+                        .find(|i| {
+                            i.version() == *v && expected.is_some_and(|e| i.matches_segment(e))
+                        })
+                        .cloned()
+                }),
+                (BuildTarget::Catalog(v, t), _) => st.tables.get(key).and_then(|insts| {
+                    insts
+                        .iter()
+                        .find(|i| {
+                            i.version() == *v
+                                && i.catalog_tail.as_ref() == Some(t)
+                                && expected.is_none_or(|e| i.matches_segment(e))
+                        })
+                        .cloned()
+                }),
+                (BuildTarget::Latest, Target::Latest { max_staleness }) => st
+                    .live_latest(key)
+                    .filter(|e| e.confirmed_at.elapsed() <= *max_staleness)
+                    .map(|e| e.instance.clone()),
+                (BuildTarget::Latest, _) => None,
+            };
             if let Some(inst) = hit {
-                let inst = inst.clone();
                 inst.last_used.store(self.tick(), Ordering::Relaxed);
                 return Resolution::Hit(inst);
             }
@@ -409,7 +491,9 @@ impl Core {
                     .max_by_key(|i| i.version())
                     .cloned()
             }),
-            Target::CatalogLatest { .. } | Target::Latest => None,
+            // Re-list from the last confirmed latest instance, if it is still cached.
+            Target::Latest { .. } => st.live_latest(key).map(|e| e.instance.clone()),
+            Target::CatalogLatest { .. } => None,
         };
         let channel = OpChannel::new(
             port.clone(),
@@ -454,6 +538,9 @@ impl Core {
                 } => (Some(tail_id.clone()), *tail_has_staged),
                 _ => (None, false),
             };
+            let is_latest = matches!(target, Target::Latest { .. });
+            // Confirmation time of a latest result: when its listing started, not when it ended.
+            let started = Instant::now();
             let built = tokio::task::spawn_blocking(move || {
                 let engine = PlanBasedEngine::new(None, Arc::new(RemotePlanExecutor::new(channel)));
                 let kind = if base.is_some() {
@@ -461,6 +548,7 @@ impl Core {
                 } else {
                     proto::ResolveKind::FullBuild
                 };
+                let latest_base = base.clone().filter(|_| is_latest);
                 let snapshot = match (&target, base) {
                     (Target::Version(v), Some(base)) => {
                         Snapshot::builder_from(base.snapshot.clone())
@@ -481,17 +569,39 @@ impl Core {
                         .with_max_catalog_version(*max_catalog_version as u64)
                         .with_log_tail(log_tail.clone())
                         .build(&engine),
-                    (Target::Latest, _) => Snapshot::builder_for(&location).build(&engine),
+                    (Target::Latest { .. }, Some(base)) => {
+                        Snapshot::builder_from(base.snapshot.clone()).build(&engine)
+                    }
+                    (Target::Latest { .. }, None) => {
+                        Snapshot::builder_for(&location).build(&engine)
+                    }
                 }?;
+                // Latest re-listing found no new commit: keep serving the confirmed instance (and
+                // its plans) without recomputing SnapshotInfo.
+                if let Some(base) = latest_base
+                    && snapshot.version() == base.snapshot.version()
+                {
+                    return Ok::<_, delta_kernel::Error>(Built::Renewed(base));
+                }
                 let info = compute_snapshot_info(&snapshot, &engine)?;
-                Ok::<_, delta_kernel::Error>((snapshot, info, kind))
+                Ok(Built::New(snapshot, Box::new(info), kind))
             })
             .await;
             let channel = &job.channel;
             let result = match built {
                 // A getter failure caused by a client storage error is a failed op, not a
                 // property of the table.
-                Ok(Ok((_, info, _)))
+                Ok(Ok(Built::Renewed(base))) => {
+                    if !channel.is_tainted() {
+                        core.confirm_latest(&key, base.clone(), started);
+                    }
+                    base.last_used.store(core.tick(), Ordering::Relaxed);
+                    Ok(BuildOutcome {
+                        instance: base,
+                        kind: proto::ResolveKind::CacheHit,
+                    })
+                }
+                Ok(Ok(Built::New(_, info, _)))
                     if info.clustering_error.is_some() && channel.first_op_failure().is_some() =>
                 {
                     let op_err = channel.first_op_failure();
@@ -503,18 +613,17 @@ impl Core {
                         op_err.as_ref(),
                     ))
                 }
-                Ok(Ok((snapshot, info, kind))) => {
+                Ok(Ok(Built::New(snapshot, info, kind))) => {
                     let cacheable =
                         !channel.is_tainted() && !staged_tail && !has_staged_commits(&snapshot);
-                    let instance = Arc::new(Instance {
-                        snapshot,
-                        info,
-                        plans: Mutex::default(),
-                        last_used: AtomicU64::new(core.tick()),
-                        catalog_tail,
-                    });
+                    let instance =
+                        Arc::new(Instance::new(snapshot, *info, catalog_tail, core.tick()));
                     let instance = if cacheable {
-                        core.insert(&key, instance)
+                        let inserted = core.insert(&key, instance);
+                        if is_latest {
+                            core.confirm_latest(&key, inserted.clone(), started);
+                        }
+                        inserted
                     } else {
                         tracing::info!(
                             table = %key.0,
@@ -549,7 +658,7 @@ impl Core {
             let insts = st.tables.entry(key.clone()).or_default();
             if let Some(existing) = insts.iter().find(|i| {
                 i.version() == instance.version()
-                    && i.segment() == instance.segment()
+                    && i.segment_id == instance.segment_id
                     && i.catalog_tail == instance.catalog_tail
             }) {
                 existing.clone()
@@ -569,6 +678,25 @@ impl Core {
         };
         self.evict_global();
         inserted
+    }
+
+    /// Records `instance` as the table's confirmed latest as of `at`, unless a newer
+    /// confirmation already exists.
+    fn confirm_latest(&self, key: &TableKey, instance: Arc<Instance>, at: Instant) {
+        let mut st = self.state.lock().unwrap();
+        let newer = st
+            .latest
+            .get(key)
+            .is_some_and(|e| e.confirmed_at > at && e.instance.version() >= instance.version());
+        if !newer {
+            st.latest.insert(
+                key.clone(),
+                LatestEntry {
+                    instance,
+                    confirmed_at: at,
+                },
+            );
+        }
     }
 
     /// Global LRU over all tables by estimated memory. Always keeps at least one instance.

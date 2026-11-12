@@ -109,7 +109,7 @@ pub fn data_dir() -> PathBuf {
 }
 
 pub struct Fixture {
-    _dir: tempfile::TempDir,
+    pub _dir: tempfile::TempDir,
     pub root: PathBuf,
     pub url: Url,
     pub table_id: String,
@@ -137,10 +137,15 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// A private, mutable copy of `kernel/tests/data/<name>` (directory or `.tar.zst`). `name` may
 /// contain a sub-path such as `partition_cm/name`.
 pub fn fixture(name: &str) -> Fixture {
+    fixture_at(name, "table")
+}
+
+/// Like [`fixture`], but a directory fixture is copied into `table_dir` (e.g. a name with spaces).
+pub fn fixture_at(name: &str, table_dir: &str) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let src = data_dir().join(name);
     let root = if src.is_dir() {
-        let root = dir.path().join("table");
+        let root = dir.path().join(table_dir);
         copy_dir(&src, &root);
         root
     } else {
@@ -196,6 +201,58 @@ pub fn spec_struct() -> proto::ScanPlanSpec {
 
 pub fn default_specs() -> Vec<proto::ScanPlanSpec> {
     vec![spec_json(), spec_struct()]
+}
+
+/// What DBR's `RemoteKernelClient` does to every location before sending it: Hadoop
+/// `Path.makeQualified(..).toString`. Probed against hadoop-client-api:
+/// `file:///tmp/t%20x/a.json -> file:/tmp/t%20x/a.json` (escapes kept, authority dropped) and
+/// `/tmp/t x -> file:/tmp/t x` for a raw table path.
+pub fn hadoop_qualified(location: &str) -> String {
+    let url = Url::parse(location).unwrap();
+    assert_eq!(url.scheme(), "file");
+    format!("file:{}", url.path())
+}
+
+/// The table location as DBR sends it: the user's raw path, Hadoop-qualified (no trailing slash,
+/// spaces unescaped).
+pub fn hadoop_table_location(fx: &Fixture) -> String {
+    format!("file:{}", fx.root.display())
+}
+
+/// A segment in the shape the DBR client sends: every location Hadoop-qualified, and (when
+/// `jnr_mtime` is set) last_modified truncated to whole seconds, as a coarser listing would.
+pub fn client_form_segment(seg: &proto::LogSegmentInfo, jnr_mtime: bool) -> proto::LogSegmentInfo {
+    let conv = |f: &proto::FileStatus| proto::FileStatus {
+        location: hadoop_qualified(&f.location),
+        size: f.size,
+        last_modified: if jnr_mtime {
+            f.last_modified / 1000 * 1000 + 1
+        } else {
+            f.last_modified
+        },
+    };
+    proto::LogSegmentInfo {
+        version: seg.version,
+        checkpoint_version: seg.checkpoint_version,
+        checkpoint_parts: seg.checkpoint_parts.iter().map(conv).collect(),
+        deltas: seg.deltas.iter().map(conv).collect(),
+        delta_is_staged: seg.delta_is_staged.clone(),
+    }
+}
+
+/// Path-based latest request (SPEC v7).
+pub fn latest_request(
+    fx: &Fixture,
+    max_staleness_ms: i64,
+    plans: Vec<proto::ScanPlanSpec>,
+) -> proto::GetSnapshotRequest {
+    let mut req = request(fx, 0, plans);
+    req.at = Some(proto::VersionSpec {
+        spec: Some(proto::version_spec::Spec::Latest(proto::Latest {
+            max_staleness_ms,
+        })),
+    });
+    req
 }
 
 /// Exact-version request carrying `prev`'s log segment, as the P1-b client always does.

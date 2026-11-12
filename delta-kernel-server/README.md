@@ -64,12 +64,26 @@ level (default `info`). Max gRPC message size is 256 MiB in both directions.
 ## Server semantics (SPEC §7)
 
 - **Cache entry**: `{Arc<Snapshot>, SnapshotInfo, plans: ScanPlanSpec -> ScanPlanResult}`.
-  `SnapshotInfo` is computed once, during the build, through the build's op channel. A hit
+  `SnapshotInfo` is computed once, during the build, through the build's op channel.
+  `active_domain_metadata` mirrors JNR `getActiveDomainMetadataMap` (kernel
+  `get_all_domain_metadata`): active user domains only, no `delta.*` system domains. A hit
   returns the stored copy. Clustering, ICT timestamp, domain metadata, and row-tracking getters do
   IO and kernel does not cache them, so they cannot be recomputed on a hit.
-- **Hit (exact version)**: same version, and `expected_log_segment` is present and equals the
-  cached segment. A request without `expected_log_segment` is always a miss (SPEC v6). A hit
-  issues 0 ops when every requested plan is cached.
+- **Hit (exact version)**: same version, and `expected_log_segment` is present and names the same
+  files as the cached segment. A request without `expected_log_segment` is always a miss
+  (SPEC v6). A hit issues 0 ops when every requested plan is cached.
+  - Segments are compared by canonical identity: version, checkpoint version, and the sorted
+    `(parsed URL, size)` of checkpoint parts plus `(parsed URL, size, staged)` of deltas.
+    `last_modified` is ignored. DBR re-qualifies locations through Hadoop (`file:///p` becomes
+    `file:/p`), so raw string comparison never matched a real client.
+- **Path-based `latest {max_staleness_ms}`** (SPEC v7): the server remembers, per table, the last
+  confirmed latest instance and when its listing started.
+  - Confirmed within `max_staleness_ms` → `CACHE_HIT`, 0 ops.
+  - Otherwise one re-listing via `Snapshot::builder_from(confirmed instance)`. No new commit →
+    renew, `CACHE_HIT` with `ops_issued = 1`, same SnapshotInfo and plan cache. New commits →
+    `INCREMENTAL`. No confirmed instance (or it was evicted) → `FULL_BUILD`.
+  - Concurrent latest requests for a table share one re-listing (`COALESCED`).
+  - Tainted results do not renew or replace the confirmation.
 - **Hit / coalescing (`catalog_latest`)**: keyed on `max_catalog_version` plus the canonical log
   tail (`(version, location, size)` sorted by version). A tail containing staged commits is never
   served from cache, never coalesced, and its result is never cached.
