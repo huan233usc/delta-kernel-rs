@@ -265,16 +265,20 @@ impl OpChannel {
             .get_or_insert_with(|| err.clone());
     }
 
-    /// Hint for listings of the `_delta_log` directory itself. Subdirectories such as
-    /// `_delta_log/_sidecars/` hold non-versioned names and get no hint.
     fn listing_hint(&self, url: &Url) -> Option<proto::ListingHint> {
-        let path = url.path();
-        let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
-        dir.ends_with("/_delta_log").then_some(proto::ListingHint {
-            end_version: self.target_version,
-            stop_at_first_non_versioned: true,
-        })
+        listing_hint_for(url, self.target_version)
     }
+}
+
+/// Hint for listings of the `_delta_log` directory itself. Subdirectories such as
+/// `_delta_log/_sidecars/` hold non-versioned names and get no hint.
+pub fn listing_hint_for(url: &Url, target_version: Option<i64>) -> Option<proto::ListingHint> {
+    let path = url.path();
+    let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    dir.ends_with("/_delta_log").then_some(proto::ListingHint {
+        end_version: target_version,
+        stop_at_first_non_versioned: true,
+    })
 }
 
 /// Expected result shape of an op, captured before the op is moved into proto bytes.
@@ -430,5 +434,27 @@ impl PlanExecutor for RemotePlanExecutor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use url::Url;
+
+    use super::listing_hint_for;
+
+    #[test]
+    fn listing_hint_only_for_delta_log_root() {
+        let hint = |u: &str| listing_hint_for(&Url::parse(u).unwrap(), Some(7));
+        let root = hint("file:///t/_delta_log/00000000000000000003").unwrap();
+        assert_eq!(root.end_version, Some(7));
+        assert!(root.stop_at_first_non_versioned);
+        assert!(hint("file:///t/_delta_log/").is_some());
+        assert!(hint("file:/t%20x/_delta_log/00000000000000000000").is_some());
+        assert!(hint("file:///t/_delta_log/_sidecars/").is_none());
+        assert!(hint("file:///t/_delta_log/_sidecars/00000000000000000006.checkpoint").is_none());
+        assert!(hint("file:///t/_delta_log/_staged_commits/").is_none());
+        assert!(hint("file:///t/part-0.parquet").is_none());
+        assert!(hint("file:///t/x_delta_log/0001").is_none());
     }
 }

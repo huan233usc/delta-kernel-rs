@@ -69,9 +69,12 @@ level (default `info`). Max gRPC message size is 256 MiB in both directions.
   `get_all_domain_metadata`): active user domains only, no `delta.*` system domains. A hit
   returns the stored copy. Clustering, ICT timestamp, domain metadata, and row-tracking getters do
   IO and kernel does not cache them, so they cannot be recomputed on a hit.
-- **Hit (exact version)**: same version, and `expected_log_segment` is present and names the same
-  files as the cached segment. A request without `expected_log_segment` is always a miss
-  (SPEC v6). A hit issues 0 ops when every requested plan is cached.
+- **Hit (exact version)**: same version, and either
+  - `expected_log_segment` is present and names the same files as the cached segment (a mismatch
+    is a miss), or
+  - `expected_log_segment` is absent and some instance of that version is cached: the most
+    recently built/confirmed one is returned (SPEC v8). Its `log_segment` is in the response.
+  A hit issues 0 ops when every requested plan is cached.
   - Segments are compared by canonical identity: version, checkpoint version, and the sorted
     `(parsed URL, size)` of checkpoint parts plus `(parsed URL, size, staged)` of deltas.
     `last_modified` is ignored. DBR re-qualifies locations through Hadoop (`file:///p` becomes

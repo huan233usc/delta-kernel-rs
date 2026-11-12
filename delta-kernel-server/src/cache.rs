@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use delta_kernel::engine::plans::PlanBasedEngine;
+use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::{LogPath, Snapshot, SnapshotRef};
 use tokio::sync::watch;
 
@@ -84,23 +85,30 @@ struct LatestEntry {
     confirmed_at: Instant,
 }
 
-/// Canonicalizes a request's catalog log tail (SPEC v6 §7).
-pub fn tail_id(log_tail: &[proto::FileStatus]) -> TailId {
+/// Canonicalizes a request's catalog log tail (SPEC v6 §7): `(version, location, size)` sorted by
+/// version, with the version taken from kernel's own log-path parsing and the location in parsed
+/// URL form.
+pub fn tail_id(log_tail: &[LogPath]) -> TailId {
     let mut id: TailId = log_tail
         .iter()
-        .map(|f| {
-            let version = f
-                .location
-                .rsplit('/')
-                .next()
-                .and_then(|name| name.get(..20))
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(-1);
-            (version, f.location.clone(), f.size)
+        .map(|p| {
+            let parsed = ParsedLogPath::from(p.clone());
+            (
+                parsed.version as i64,
+                parsed.location.location.to_string(),
+                parsed.location.size as i64,
+            )
         })
         .collect();
     id.sort();
     id
+}
+
+/// Whether a catalog log tail contains a staged (unpublished) commit, per kernel's parsing.
+fn tail_has_staged(log_tail: &[LogPath]) -> bool {
+    log_tail
+        .iter()
+        .any(|p| ParsedLogPath::from(p.clone()).file_type == LogPathFileType::StagedCommit)
 }
 
 /// A cached snapshot instance.
@@ -109,6 +117,9 @@ pub struct Instance {
     pub info: proto::SnapshotInfo,
     plans: Mutex<HashMap<Vec<u8>, PlanSlot>>,
     last_used: AtomicU64,
+    /// Tick of the last build or confirmation that produced this instance; picks the instance an
+    /// exact-version request without `expected_log_segment` gets (SPEC v8).
+    confirmed: AtomicU64,
     /// Canonical log tail of a `catalog_latest` build; `None` for exact-version builds.
     catalog_tail: Option<TailId>,
     /// Canonical identity of `info.log_segment`, compared against `expected_log_segment`.
@@ -137,6 +148,7 @@ impl Instance {
             info,
             plans: Mutex::default(),
             last_used: AtomicU64::new(tick),
+            confirmed: AtomicU64::new(tick),
             catalog_tail,
             segment_id,
         }
@@ -341,14 +353,8 @@ impl Core {
         let key: TableKey = (table_id, location.clone());
         let target = match req.at.as_ref().and_then(|a| a.spec.as_ref()) {
             Some(version_spec::Spec::Version(v)) => Target::Version(*v),
-            Some(version_spec::Spec::CatalogLatest(c)) => Target::CatalogLatest {
-                max_catalog_version: c.max_catalog_version,
-                tail_id: tail_id(&c.log_tail),
-                tail_has_staged: c
-                    .log_tail
-                    .iter()
-                    .any(|f| f.location.contains("/_staged_commits/")),
-                log_tail: c
+            Some(version_spec::Spec::CatalogLatest(c)) => {
+                let log_tail: Vec<LogPath> = c
                     .log_tail
                     .iter()
                     .map(|f| {
@@ -356,8 +362,14 @@ impl Core {
                             .and_then(LogPath::try_new)
                             .map_err(|e| ServerError::internal(format!("bad log_tail entry: {e}")))
                     })
-                    .collect::<Result<_, _>>()?,
-            },
+                    .collect::<Result<_, _>>()?;
+                Target::CatalogLatest {
+                    max_catalog_version: c.max_catalog_version,
+                    tail_id: tail_id(&log_tail),
+                    tail_has_staged: tail_has_staged(&log_tail),
+                    log_tail,
+                }
+            }
             Some(version_spec::Spec::Latest(l)) => Target::Latest {
                 max_staleness: Duration::from_millis(l.max_staleness_ms.max(0) as u64),
             },
@@ -444,13 +456,17 @@ impl Core {
 
         if let Some(bk) = &build_key {
             let hit = match (&bk.1, target) {
+                // With `expected_log_segment`: strict canonical match. Without it (SPEC v8): the
+                // most recently built/confirmed instance at that version.
                 (BuildTarget::Version(v), _) => st.tables.get(key).and_then(|insts| {
-                    insts
-                        .iter()
-                        .find(|i| {
-                            i.version() == *v && expected.is_some_and(|e| i.matches_segment(e))
-                        })
-                        .cloned()
+                    let at_version = insts.iter().filter(|i| i.version() == *v);
+                    match expected {
+                        Some(e) => at_version.into_iter().find(|i| i.matches_segment(e)),
+                        None => at_version
+                            .into_iter()
+                            .max_by_key(|i| i.confirmed.load(Ordering::Relaxed)),
+                    }
+                    .cloned()
                 }),
                 (BuildTarget::Catalog(v, t), _) => st.tables.get(key).and_then(|insts| {
                     insts
@@ -661,6 +677,8 @@ impl Core {
                     && i.segment_id == instance.segment_id
                     && i.catalog_tail == instance.catalog_tail
             }) {
+                // A fresh build of the same files re-confirms the cached instance.
+                existing.confirmed.store(self.tick(), Ordering::Relaxed);
                 existing.clone()
             } else {
                 insts.push(instance.clone());
@@ -689,6 +707,7 @@ impl Core {
             .get(key)
             .is_some_and(|e| e.confirmed_at > at && e.instance.version() >= instance.version());
         if !newer {
+            instance.confirmed.store(self.tick(), Ordering::Relaxed);
             st.latest.insert(
                 key.clone(),
                 LatestEntry {

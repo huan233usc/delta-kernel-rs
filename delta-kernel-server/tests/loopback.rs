@@ -251,15 +251,17 @@ async fn resolve_sequence_full_hit_incremental_checkpoint() {
     assert_eq!(resolved(&r1), ResolveKind::FullBuild);
     let rows_v0 = assert_parity(&fx, &r1, &specs);
 
-    // Same version without an expected log segment is a miss (SPEC v6), never a hit.
-    let (r2_absent, _) = run(
+    // SPEC v8: same version without an expected log segment hits the cached instance.
+    let (r2_absent, absent_ops) = run(
         &mut client,
         request(&fx, v0, specs.clone()),
         Behavior::default(),
     )
     .await
     .ok();
-    assert_ne!(resolved(&r2_absent), ResolveKind::CacheHit);
+    assert_eq!(resolved(&r2_absent), ResolveKind::CacheHit);
+    assert!(absent_ops.is_empty());
+    assert_eq!(segment(&r2_absent), segment(&r1));
 
     let (r2, ops2) = run(
         &mut client,
@@ -1014,7 +1016,8 @@ async fn handoff_resends_same_listing_op_with_same_hint() {
     assert_parity(&fx, &resp, &specs);
 }
 
-/// B2: an exact-version hit needs `expected_log_segment` present and equal.
+/// B2 (as amended by SPEC v8): with `expected_log_segment` the hit needs a canonical match;
+/// without it the cached instance is returned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exact_version_hit_requires_matching_expected_segment() {
     let fx = fixture("table-with-dv-small");
@@ -1027,15 +1030,18 @@ async fn exact_version_hit_requires_matching_expected_segment() {
         .ok();
     assert_eq!(resolved(&r1), ResolveKind::FullBuild);
 
-    let (absent, _) = run(&mut c, request(&fx, v, specs.clone()), Behavior::default())
+    // SPEC v8: absent segment -> the cached instance, 0 ops, its segment in the response.
+    let (absent, absent_ops) = run(&mut c, request(&fx, v, specs.clone()), Behavior::default())
         .await
         .ok();
-    assert_ne!(
+    assert_eq!(
         resolved(&absent),
         ResolveKind::CacheHit,
-        "absent segment is a miss"
+        "absent segment hits"
     );
-    assert!(ops_issued(&absent) > 0);
+    assert_eq!(ops_issued(&absent), 0);
+    assert!(absent_ops.is_empty());
+    assert_eq!(segment(&absent), segment(&r1));
 
     let mut wrong = segment(&r1).clone();
     wrong.deltas[0].size += 1;
@@ -1270,12 +1276,20 @@ async fn listing_hint_is_sent_and_honored() {
     )
     .await
     .ok();
-    for l in ops.iter().filter(|o| o.kind == "FileListing") {
-        if l.urls.iter().any(|u| u.contains("/_sidecars/")) {
-            assert!(l.listing_hint.is_none());
-        } else {
-            assert!(l.listing_hint.is_some());
-        }
+    // Kernel reads sidecars by path from the checkpoint manifest and never lists
+    // `_delta_log/_sidecars/`; the hint rule for such a listing is unit-tested in
+    // `executor::tests::listing_hint_only_for_delta_log_root`. Here: the sidecars were actually
+    // read, and every listing that did happen is a `_delta_log/` listing carrying a hint.
+    assert!(
+        ops.iter()
+            .any(|o| o.urls.iter().any(|u| u.contains("/_delta_log/_sidecars/"))),
+        "the v2 checkpoint's sidecars must be read"
+    );
+    let listings: Vec<&OpLog> = ops.iter().filter(|o| o.kind == "FileListing").collect();
+    assert!(!listings.is_empty());
+    for l in listings {
+        assert!(l.urls.iter().all(|u| !u.contains("/_sidecars/")));
+        assert!(l.listing_hint.is_some(), "{:?}", l.urls);
     }
 }
 
@@ -1766,6 +1780,17 @@ async fn latest_after_eviction_is_full_build() {
     .await
     .ok();
     assert_eq!((resolved(&r1), r1.version), (ResolveKind::FullBuild, 3));
+    // Before eviction the confirmed latest instance is served with 0 ops.
+    let (warm, warm_ops) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&warm), ResolveKind::CacheHit);
+    assert_eq!(ops_issued(&warm), 0);
+    assert!(warm_ops.is_empty());
     // An exact-version build of v1 evicts the latest instance (one instance per table).
     run(&mut c, request(&fx, 1, specs.clone()), Behavior::default())
         .await
@@ -1794,4 +1819,122 @@ async fn latest_after_eviction_is_full_build() {
     .await
     .ok();
     assert_eq!(resolved(&r3), ResolveKind::FullBuild);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Round-4: SPEC v8 absent-segment rule, latest follow-ups
+// ------------------------------------------------------------------------------------------------
+
+/// SPEC v8: two cached instances of one version (before/after a checkpoint at a lower version
+/// appears). A request without `expected_log_segment` deterministically gets the most recently
+/// built/confirmed one; a cache hit on the older one does not change that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn absent_segment_returns_most_recent_instance() {
+    let fx = fixture("basic_partitioned");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let specs = default_specs();
+    let v = latest_version(&fx);
+    assert!(v >= 1);
+
+    let (old, _) = run(&mut c, request(&fx, v, specs.clone()), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(resolved(&old), ResolveKind::FullBuild);
+    assert_eq!(segment(&old).checkpoint_version, None);
+
+    // A checkpoint at v-1 now exists, so a fresh build of v reads a different segment.
+    write_checkpoint(&fx, v - 1);
+    let local = local_snapshot(&fx, Some(v));
+    let new_seg = delta_kernel_server::info::log_segment_info(local.log_segment());
+    assert_eq!(new_seg.checkpoint_version, Some(v - 1));
+    let mut req = request(&fx, v, specs.clone());
+    req.expected_log_segment = Some(new_seg.clone());
+    let (new, _) = run(&mut c, req, Behavior::default()).await.ok();
+    assert_eq!(
+        resolved(&new),
+        ResolveKind::FullBuild,
+        "mismatched segment builds"
+    );
+    assert_eq!(segment(&new).checkpoint_version, Some(v - 1));
+    assert_parity(&fx, &new, &specs);
+    assert_eq!(
+        server.core.cached_instances_per_table().get(&fx.table_id),
+        Some(&2),
+        "both segments of version {v} are cached"
+    );
+
+    for _ in 0..3 {
+        let (r, ops) = run(&mut c, request(&fx, v, specs.clone()), Behavior::default())
+            .await
+            .ok();
+        assert_eq!(resolved(&r), ResolveKind::CacheHit);
+        assert!(ops.is_empty());
+        assert_eq!(segment(&r), segment(&new), "most recent instance wins");
+    }
+
+    // Hitting the older instance explicitly still works and does not make it "most recent".
+    let (old_hit, _) = run(
+        &mut c,
+        request_with_segment(&fx, v, specs.clone(), &old),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&old_hit), ResolveKind::CacheHit);
+    assert_eq!(segment(&old_hit), segment(&old));
+    let (r, _) = run(&mut c, request(&fx, v, specs.clone()), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(segment(&r), segment(&new));
+}
+
+/// SPEC v7/v8: a tainted latest result is returned but neither cached nor confirmed; the next
+/// latest request inside the staleness window builds again, and only a clean build confirms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn latest_tainted_result_does_not_confirm() {
+    let fx = fixture("crc-full");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let specs = default_specs();
+
+    let (tainted, ops) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs.clone()),
+        Behavior {
+            fail_read_suffix: Some((".crc".into(), codes::IO)),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok();
+    assert!(ops.iter().any(|o| o.item_error_codes.contains(&codes::IO)));
+    assert_eq!(resolved(&tainted), ResolveKind::FullBuild);
+    assert!(info(&tainted).crc.is_none());
+    assert!(server.core.cached_instances_per_table().is_empty());
+
+    let (clean, _) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(
+        resolved(&clean),
+        ResolveKind::FullBuild,
+        "a tainted result must not confirm latest"
+    );
+    assert!(info(&clean).crc.is_some());
+    assert_parity(&fx, &clean, &specs);
+
+    let (warm, warm_ops) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&warm), ResolveKind::CacheHit);
+    assert!(warm_ops.is_empty());
 }

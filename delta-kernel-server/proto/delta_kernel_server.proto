@@ -42,7 +42,7 @@ message CatalogLatest { int64 max_catalog_version = 1; repeated FileStatus log_t
 message Latest { int64 max_staleness_ms = 1; }
 
 message FileStatus {
-  string location = 1;          // full URL, same scheme/authority form as the request URL
+  string location = 1;          // full URL; server compares after URL parsing (file:/p == file:///p)
   int64 size = 2;
   int64 last_modified = 3;
 }
