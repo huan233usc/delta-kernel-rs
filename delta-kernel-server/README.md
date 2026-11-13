@@ -66,19 +66,39 @@ delta-kernel-server \
 | `--io-mode` | `local` | `local`: simple IO ops run on the server; `forward`: every op goes to the client |
 | `--local-io-threads` | `8` | worker threads and in-flight cap for server-side IO; when all are busy, requests fail with `UNAVAILABLE` |
 | `--uc-endpoint-override` | none | UC base URL instead of `https://{auth.workspace_host}` (tests, proxies, HiFi) |
-| `--storage-option KEY=VALUE` | none, repeatable | object_store option for every cloud store the server builds, e.g. `aws_endpoint`, `aws_allow_http`, `aws_region`, `aws_virtual_hosted_style_request`; unknown keys fail at startup |
+| `--storage-option KEY=VALUE` | none, repeatable | allowlisted object_store transport/addressing option for every cloud store (list below); any other key, including every auth or credential-source key, fails at startup |
 | `--s3-endpoint URL` | none | same as `--storage-option aws_endpoint=URL`; requests are path-style (`{endpoint}/{bucket}/{key}`) unless `aws_virtual_hosted_style_request=true` |
 | `--s3-allow-http` | off | same as `--storage-option aws_allow_http=true` |
 | `--s3-region REGION` | none | same as `--storage-option aws_region=REGION` |
 | `--test-uc-credentials-for-file` | off, hidden | test only, needs `--enable-test-hooks`: run the UC credential check for `file://` tables too |
 
-Storage options are merged per store in this order, later wins: default `timeout=60s`, the
-`--s3-*` flags, `--storage-option`, then the UC-vended credential (`aws_access_key_id`,
-`aws_secret_access_key`, `aws_session_token`, `azure_storage_sas_token`, `google_bearer_token`). A
-server flag therefore cannot replace the caller's credential. Keys are compared after object_store
-canonicalization (`endpoint` = `aws_endpoint`), and a key only reaches the stores that take it (an
-`aws_*` key never reaches an Azure store). UC responses carry no endpoint or region, so without
-these flags an `s3://` table goes to real AWS.
+Operator storage options are an **allowlist**. They can only say where and how to connect, never
+how to authenticate; the store always authenticates with the UC-vended credential.
+
+| store | allowed keys (canonical; object_store aliases such as `endpoint`, `region` work) |
+|---|---|
+| S3 | `aws_endpoint`, `aws_region`, `aws_virtual_hosted_style_request` |
+| Azure | `azure_storage_endpoint` |
+| GCS | `google_base_url` |
+| any store | `allow_http`, `timeout`, `connect_timeout`, `read_timeout`, `pool_idle_timeout`, `pool_max_idle_per_host`, `http1_only`, `http2_only`, `proxy_url`, `proxy_ca_certificate`, `proxy_excludes` |
+
+- **Rejected at startup** with an error that lists the allowlist: everything else. That includes
+  keys, secrets and tokens; `aws_skip_signature`, IMDS / metadata endpoint, web identity, role and
+  container-credential keys; `azure_credential_type`, account key, client secret, MSI, Azure CLI,
+  emulator and Fabric keys; GCS service account, application credentials and bearer token; and
+  `allow_invalid_certificates`. A key that two stores read differently must be allowed for both
+  (`token` is rejected).
+- **Merge order** per store, later wins: default `timeout=60s`, the `--s3-*` flags,
+  `--storage-option`, the UC-vended credential, then forced auth settings. Keys are compared after
+  object_store canonicalization, and a key only reaches stores that take it.
+- **Forced auth**: S3 `aws_skip_signature=false`. Azure `azure_credential_type=sas_token`,
+  `azure_skip_signature=false`, `azure_storage_use_emulator=false`, `azure_use_azure_cli=false`.
+  GCS `google_skip_signature=false`.
+- **Vended credential must be complete**, or the store is not built: S3 key id, secret and
+  session token; Azure SAS; GCS OAuth token. Stores are built with `Builder::new()`, never
+  `from_env()`, so server environment credentials are not read either.
+- UC responses carry no endpoint or region, so without these flags an `s3://` table goes to real
+  AWS.
 
 TLS roots: the binary bundles Mozilla's root CAs (`webpki-root-certs`) and trusts them in addition
 to the system store, for UC and for every object store. It runs in an image without
@@ -242,9 +262,13 @@ cargo +nightly fmt -- --check   # the repo's rustfmt.toml uses nightly-only opti
 FileNotFound / taint / ListingHint, a forward-mode smoke run, and the UC credential provider
 against a mock UC HTTP server (endpoint choice, caching and expiry, 401/403/5xx, authz on cache
 hit, token absent from trace logs of the real binary), the binary running with `SSL_CERT_FILE` /
-`SSL_CERT_DIR` pointed at nothing (no system roots), and storage-option flag validation. Unit
-tests in `src/creds.rs` cover the option merge (vended credentials win) and an S3 store built
-with an endpoint sending a path-style, vended-key-signed request to a local mock.
+`SSL_CERT_DIR` pointed at nothing (no system roots; this covers startup and HTTPS client
+construction, not a TLS handshake against a bundled root), and startup rejection of unknown and
+auth storage options for each cloud. Unit
+tests in `src/creds.rs` cover the allowlist (every auth key of each cloud rejected), the merge and
+forced auth, and S3 / Azure / GCS stores sending a request to a local mock that carries only the
+vended credential (SigV4 with the vended key; SAS in the query and no Authorization header;
+`Bearer` with the vended token).
 
 `tests/loopback.rs` (L0a) starts the server in-process on `127.0.0.1:0` (default `local` IO mode;
 forward-specific mechanics such as handoff of a listing op run in `forward` mode). Its test client decodes

@@ -217,22 +217,121 @@ impl CloudScheme {
     }
 }
 
+/// Client (transport) options an operator may set for every cloud store.
+pub const CLIENT_OPTION_ALLOWLIST: &[&str] = &[
+    "allow_http",
+    "timeout",
+    "connect_timeout",
+    "read_timeout",
+    "pool_idle_timeout",
+    "pool_max_idle_per_host",
+    "http1_only",
+    "http2_only",
+    "proxy_url",
+    "proxy_ca_certificate",
+    "proxy_excludes",
+];
+
+impl CloudScheme {
+    fn name(self) -> &'static str {
+        match self {
+            Self::S3 => "S3",
+            Self::Azure => "Azure",
+            Self::Gcs => "GCS",
+        }
+    }
+
+    /// Store-specific addressing keys an operator may set (canonical names). Nothing that selects
+    /// or supplies a credential: the store must authenticate with the UC-vended credential only.
+    fn addressing_allowlist(self) -> &'static [&'static str] {
+        match self {
+            Self::S3 => &[
+                "aws_endpoint",
+                "aws_region",
+                "aws_virtual_hosted_style_request",
+            ],
+            Self::Azure => &["azure_storage_endpoint"],
+            Self::Gcs => &["google_base_url"],
+        }
+    }
+
+    fn allows(self, canonical: &str) -> bool {
+        self.addressing_allowlist().contains(&canonical)
+            || CLIENT_OPTION_ALLOWLIST.contains(&canonical)
+    }
+
+    /// Auth settings applied after the vended credential, overriding everything: the store
+    /// authenticates with the vended credential and never falls back to an unsigned or
+    /// server-side identity.
+    fn forced_auth(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::S3 => &[("aws_skip_signature", "false")],
+            Self::Azure => &[
+                ("azure_credential_type", "sas_token"),
+                ("azure_skip_signature", "false"),
+                ("azure_storage_use_emulator", "false"),
+                ("azure_use_azure_cli", "false"),
+            ],
+            Self::Gcs => &[("google_skip_signature", "false")],
+        }
+    }
+
+    /// Vended keys a store must have (canonical names, as produced by [`storage_options`]).
+    fn required_vended(self) -> &'static [&'static str] {
+        match self {
+            Self::S3 => &[
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+            ],
+            Self::Azure => &["azure_storage_sas_key"],
+            Self::Gcs => &["google_bearer_token"],
+        }
+    }
+}
+
+/// The final operator allowlist, per cloud (README, startup errors).
+pub fn storage_option_allowlist() -> String {
+    let per_cloud: Vec<String> = CloudScheme::ALL
+        .iter()
+        .map(|s| format!("{}: {}", s.name(), s.addressing_allowlist().join(", ")))
+        .collect();
+    format!(
+        "{}; any store: {}",
+        per_cloud.join("; "),
+        CLIENT_OPTION_ALLOWLIST.join(", ")
+    )
+}
+
 /// Server-side object_store options (`--storage-option`, `--s3-*`), applied to every cloud store
-/// the server builds, under the UC-vended credential options.
+/// the server builds, under the UC-vended credential options. Only allowlisted transport and
+/// addressing keys are accepted (see [`storage_option_allowlist`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StorageOverrides(Vec<(String, String)>);
 
 impl StorageOverrides {
-    /// Validates every key: it must be an object_store config key of S3, Azure or GCS. A key
-    /// applies only to the stores that take it (an `aws_*` key does not reach an Azure store).
+    /// Validates every key against the allowlist. A key must be an object_store key of at least
+    /// one store, and allowlisted for every store that takes it (`token` is an S3 session token
+    /// and an Azure bearer token: rejected). A key applies only to the stores that take it.
     pub fn new(options: Vec<(String, String)>) -> Result<Self, String> {
         for (k, _) in &options {
-            if !CloudScheme::ALL
+            let parsed: Vec<(CloudScheme, String)> = CloudScheme::ALL
                 .iter()
-                .any(|s| s.canonical_key(k).is_some())
-            {
+                .filter_map(|s| s.canonical_key(k).map(|c| (*s, c)))
+                .collect();
+            if parsed.is_empty() {
                 return Err(format!(
-                    "unknown object_store option {k:?} (expected an S3, Azure or GCS config key)"
+                    "unknown object_store option {k:?}; allowed: {}",
+                    storage_option_allowlist()
+                ));
+            }
+            if let Some((scheme, canonical)) = parsed.iter().find(|(s, c)| !s.allows(c)) {
+                return Err(format!(
+                    "--storage-option {k:?} ({} key {canonical}) is not allowed: operator options \
+                     may only set transport/addressing, never authentication or credential \
+                     sources (the store must use the UC-vended credential); allowed: {}",
+                    scheme.name(),
+                    storage_option_allowlist()
                 ));
             }
         }
@@ -258,8 +357,9 @@ impl StorageOverrides {
 }
 
 /// The options a cloud store is built with, by canonical key, in precedence order: the default
-/// [`LOCAL_IO_TIMEOUT`], then the server's overrides, then the UC-vended options. Vended options
-/// win, so a server flag can never replace the caller's credential.
+/// [`LOCAL_IO_TIMEOUT`], the allowlisted server overrides, the UC-vended options, then the
+/// forced auth settings of the store. The vended credential must be complete; it is then the
+/// only credential the store can use.
 pub fn merge_store_options(
     location: &Url,
     overrides: &StorageOverrides,
@@ -267,13 +367,37 @@ pub fn merge_store_options(
 ) -> Result<Vec<(String, String)>, String> {
     let scheme = CloudScheme::of(location)?;
     let mut merged: Vec<(String, String)> = Vec::new();
-    let defaults = [("timeout".to_string(), LOCAL_IO_TIMEOUT.to_string())];
-    for (k, v) in defaults.iter().chain(&overrides.0).chain(vended) {
-        let Some(key) = scheme.canonical_key(k) else {
-            continue;
-        };
+    let mut put = |key: String, value: &str| {
         merged.retain(|(existing, _)| *existing != key);
-        merged.push((key, v.clone()));
+        merged.push((key, value.to_string()));
+    };
+    put("timeout".to_string(), LOCAL_IO_TIMEOUT);
+    for (k, v) in &overrides.0 {
+        // `new` validated the keys; re-check so no construction path can pass an auth key.
+        if let Some(key) = scheme.canonical_key(k).filter(|c| scheme.allows(c)) {
+            put(key, v);
+        }
+    }
+    let mut vended_keys = Vec::new();
+    for (k, v) in vended {
+        let key = scheme
+            .canonical_key(k)
+            .ok_or_else(|| format!("vended option {k} is not a {} key", scheme.name()))?;
+        vended_keys.push(key.clone());
+        put(key, v);
+    }
+    for (k, v) in scheme.forced_auth() {
+        put((*k).to_string(), v);
+    }
+    if let Some(missing) = scheme
+        .required_vended()
+        .iter()
+        .find(|k| !vended_keys.iter().any(|v| v == *k))
+    {
+        return Err(format!(
+            "UC-vended credential for a {} table is missing {missing}",
+            scheme.name()
+        ));
     }
     Ok(merged)
 }
@@ -677,27 +801,27 @@ mod tests {
         assert_ne!(token_hash("abc"), "abc");
     }
 
+    fn s3_vended() -> Vec<(String, String)> {
+        pairs(&[
+            ("aws_access_key_id", "AK"),
+            ("aws_secret_access_key", "SK"),
+            ("aws_session_token", "ST"),
+        ])
+    }
+
     #[test]
     fn server_options_merge_under_vended_credentials() {
         let overrides = StorageOverrides::new(pairs(&[
             ("aws_endpoint", "http://localstack:4566"),
             ("AWS_ALLOW_HTTP", "true"),
             ("region", "us-east-1"),
-            // A server flag must not replace the caller's credential.
-            ("aws_access_key_id", "SERVER-KEY"),
-            ("aws_session_token", "SERVER-TOKEN"),
             ("timeout", "5s"),
             // Azure-only: does not reach an S3 store.
-            ("azure_storage_account_name", "acct"),
+            ("azure_storage_endpoint", "http://azurite:10000"),
         ]))
         .unwrap();
-        let vended = pairs(&[
-            ("aws_access_key_id", "AK"),
-            ("aws_secret_access_key", "SK"),
-            ("aws_session_token", "ST"),
-        ]);
         let s3 = Url::parse("s3://test/t/").unwrap();
-        let merged = merge_store_options(&s3, &overrides, &vended).unwrap();
+        let merged = merge_store_options(&s3, &overrides, &s3_vended()).unwrap();
         let m = opts(merged.clone());
         assert_eq!(
             m.len(),
@@ -714,24 +838,162 @@ mod tests {
             m["timeout"], "5s",
             "a server option replaces the default timeout"
         );
-        assert!(!m.contains_key("azure_storage_account_name"));
+        assert_eq!(m["aws_skip_signature"], "false", "forced");
+        assert!(!m.contains_key("azure_storage_endpoint"));
 
-        // No overrides: just the vended credential plus the default timeout.
-        let m = opts(merge_store_options(&s3, &none(), &vended).unwrap());
-        assert_eq!(m.len(), 4);
+        // No overrides: the vended credential, the default timeout, the forced auth.
+        let m = opts(merge_store_options(&s3, &none(), &s3_vended()).unwrap());
+        assert_eq!(m.len(), 5, "{m:?}");
         assert_eq!(m["timeout"], LOCAL_IO_TIMEOUT);
 
-        // The Azure store keeps its own keys and the generic client keys only.
+        // The Azure store keeps its own keys and the generic client keys only, and is forced to
+        // authenticate with the vended SAS.
         let az = Url::parse("abfss://c@acct.dfs.core.windows.net/t/").unwrap();
-        let m = opts(merge_store_options(&az, &overrides, &[]).unwrap());
-        assert_eq!(m["azure_storage_account_name"], "acct");
+        let sas = pairs(&[("azure_storage_sas_token", "sv=1&sig=x")]);
+        let m = opts(merge_store_options(&az, &overrides, &sas).unwrap());
+        assert_eq!(m["azure_storage_endpoint"], "http://azurite:10000");
+        assert_eq!(m["azure_storage_sas_key"], "sv=1&sig=x");
+        assert_eq!(m["azure_credential_type"], "sas_token");
+        assert_eq!(m["azure_skip_signature"], "false");
+        assert_eq!(m["azure_storage_use_emulator"], "false");
+        assert_eq!(m["azure_use_azure_cli"], "false");
         assert!(!m.keys().any(|k| k.starts_with("aws_")), "{m:?}");
+
+        let gs = Url::parse("gs://bucket/t/").unwrap();
+        let tok = pairs(&[("google_bearer_token", "ya29.vended")]);
+        let m = opts(merge_store_options(&gs, &none(), &tok).unwrap());
+        assert_eq!(m["google_bearer_token"], "ya29.vended");
+        assert_eq!(m["google_skip_signature"], "false");
+    }
+
+    /// Defense in depth: even an override list that bypassed `StorageOverrides::new` cannot put
+    /// an auth key into a store, and forced auth wins over everything.
+    #[test]
+    fn merge_drops_unvalidated_auth_keys_and_forces_vended_auth() {
+        let raw = StorageOverrides(pairs(&[
+            ("aws_access_key_id", "SERVER-KEY"),
+            ("aws_skip_signature", "true"),
+            ("aws_web_identity_token_file", "/var/run/token"),
+            ("azure_credential_type", "managed_identity"),
+            ("azure_storage_account_key", "SERVER-ACCOUNT-KEY"),
+            ("azure_use_azure_cli", "true"),
+            ("google_service_account", "/sa.json"),
+            ("google_skip_signature", "true"),
+        ]));
+        let s3 = Url::parse("s3://test/t/").unwrap();
+        let m = opts(merge_store_options(&s3, &raw, &s3_vended()).unwrap());
+        assert_eq!(m["aws_access_key_id"], "AK");
+        assert_eq!(m["aws_skip_signature"], "false");
+        assert!(!m.contains_key("aws_web_identity_token_file"), "{m:?}");
+        let az = Url::parse("abfss://c@acct.dfs.core.windows.net/t/").unwrap();
+        let m = opts(
+            merge_store_options(&az, &raw, &pairs(&[("azure_storage_sas_token", "sig=v")]))
+                .unwrap(),
+        );
+        assert_eq!(m["azure_credential_type"], "sas_token");
+        assert_eq!(m["azure_use_azure_cli"], "false");
+        assert!(!m.contains_key("azure_storage_account_key"), "{m:?}");
+        let gs = Url::parse("gs://bucket/t/").unwrap();
+        let m =
+            opts(merge_store_options(&gs, &raw, &pairs(&[("google_bearer_token", "v")])).unwrap());
+        assert_eq!(m["google_skip_signature"], "false");
+        assert!(!m.contains_key("google_service_account"), "{m:?}");
+
+        // A store is never built without the full vended credential.
+        assert!(merge_store_options(&s3, &none(), &[]).is_err());
+        assert!(merge_store_options(&s3, &none(), &pairs(&[("aws_access_key_id", "AK")])).is_err());
+        assert!(merge_store_options(&az, &none(), &[]).is_err());
+        assert!(merge_store_options(&gs, &none(), &[]).is_err());
+    }
+
+    /// Every auth / credential-source key of each cloud is rejected at startup.
+    #[test]
+    fn operator_auth_options_are_rejected_per_cloud() {
+        let s3 = [
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+            "token",
+            "aws_skip_signature",
+            "aws_imdsv1_fallback",
+            "aws_metadata_endpoint",
+            "aws_web_identity_token_file",
+            "aws_role_arn",
+            "aws_role_session_name",
+            "aws_endpoint_url_sts",
+            "aws_container_credentials_relative_uri",
+            "aws_container_credentials_full_uri",
+            "aws_container_authorization_token_file",
+            "aws_unsigned_payload",
+            "aws_s3_express",
+            "aws_request_payer",
+            "aws_server_side_encryption",
+        ];
+        let azure = [
+            "azure_credential_type",
+            "azure_storage_account_key",
+            "access_key",
+            "azure_storage_client_id",
+            "azure_storage_client_secret",
+            "azure_storage_tenant_id",
+            "azure_storage_authority_host",
+            "azure_storage_sas_token",
+            "azure_storage_token",
+            "bearer_token",
+            "azure_storage_use_emulator",
+            "azure_msi_endpoint",
+            "azure_object_id",
+            "azure_msi_resource_id",
+            "azure_federated_token_file",
+            "azure_use_azure_cli",
+            "azure_skip_signature",
+            "azure_use_fabric_endpoint",
+            "azure_fabric_token_service_url",
+            "azure_fabric_session_token",
+            "azure_storage_account_name",
+        ];
+        let gcs = [
+            "google_service_account",
+            "google_service_account_key",
+            "google_application_credentials",
+            "google_bearer_token",
+            "google_skip_signature",
+        ];
+        let client = [
+            "allow_invalid_certificates",
+            "disable_system_certificates",
+            "user_agent",
+            "default_content_type",
+        ];
+        for key in s3.iter().chain(&azure).chain(&gcs).chain(&client) {
+            let err = StorageOverrides::new(pairs(&[(key, "x")]))
+                .expect_err(&format!("{key} must be rejected"));
+            assert!(
+                err.contains("not allowed") && err.contains("allowed: S3: aws_endpoint"),
+                "{key}: {err}"
+            );
+        }
+        for key in [
+            "aws_endpoint",
+            "endpoint",
+            "aws_region",
+            "aws_virtual_hosted_style_request",
+            "aws_allow_http",
+            "azure_storage_endpoint",
+            "google_base_url",
+            "timeout",
+            "connect_timeout",
+            "proxy_url",
+        ] {
+            StorageOverrides::new(pairs(&[(key, "x")]))
+                .unwrap_or_else(|e| panic!("{key} must be allowed: {e}"));
+        }
     }
 
     #[test]
     fn unknown_or_malformed_storage_options_are_rejected() {
-        assert!(StorageOverrides::new(pairs(&[("aws_endpointt", "x")])).is_err());
-        assert!(StorageOverrides::new(pairs(&[("google_bearer_token", "x")])).is_ok());
+        let err = StorageOverrides::new(pairs(&[("aws_endpointt", "x")])).unwrap_err();
+        assert!(err.contains("unknown object_store option"), "{err}");
         assert_eq!(
             StorageOverrides::parse_pair("aws_endpoint=http://h:1/?a=b").unwrap(),
             ("aws_endpoint".to_string(), "http://h:1/?a=b".to_string())
@@ -740,11 +1002,8 @@ mod tests {
         assert!(StorageOverrides::parse_pair("=v").is_err());
     }
 
-    /// The S3 store built for a UC-vended credential sends requests to `--s3-endpoint`, path-style
-    /// (`/{bucket}/{key}`), over plain HTTP, signed with the vended key, not to AWS.
-    #[tokio::test]
-    async fn s3_store_uses_endpoint_path_style() {
-        use object_store::ObjectStoreExt;
+    /// One HTTP/1.1 request on a fresh port: answers 404 and returns the raw request head.
+    async fn capture_one_request() -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -760,6 +1019,84 @@ mod tests {
                 .unwrap();
             String::from_utf8_lossy(&buf[..n]).to_string()
         });
+        (endpoint, server)
+    }
+
+    async fn get_not_found(store: &DynObjectStore, path: &str) {
+        use object_store::ObjectStoreExt;
+        let err = store
+            .get(&object_store::path::Path::from(path))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, object_store::Error::NotFound { .. }), "{err}");
+    }
+
+    /// The Azure store authenticates with the vended SAS only: the SAS is in the query string and
+    /// no Authorization header (shared key / bearer) is sent.
+    #[tokio::test]
+    async fn azure_store_uses_only_vended_sas() {
+        let (endpoint, server) = capture_one_request().await;
+        let overrides = StorageOverrides::new(pairs(&[
+            ("azure_storage_endpoint", &endpoint),
+            ("allow_http", "true"),
+        ]))
+        .unwrap();
+        let store = build_store(
+            &Url::parse("abfss://c@acct.dfs.core.windows.net/t/").unwrap(),
+            &overrides,
+            &pairs(&[("azure_storage_sas_token", "sv=2024-01-01&sig=VENDEDSIG")]),
+        )
+        .unwrap();
+        get_not_found(store.as_ref(), "t/_delta_log/_last_checkpoint").await;
+        let request = server.await.unwrap();
+        let first = request.lines().next().unwrap();
+        assert!(first.starts_with("GET /"), "{request}");
+        assert!(first.contains("t/_delta_log/_last_checkpoint"), "{request}");
+        assert!(first.contains("sig=VENDEDSIG"), "{request}");
+        assert!(
+            !request.to_ascii_lowercase().contains("\r\nauthorization:"),
+            "{request}"
+        );
+    }
+
+    /// The GCS store authenticates with the vended OAuth token only.
+    #[tokio::test]
+    async fn gcs_store_uses_only_vended_bearer_token() {
+        let (endpoint, server) = capture_one_request().await;
+        let overrides = StorageOverrides::new(pairs(&[
+            ("google_base_url", &endpoint),
+            ("allow_http", "true"),
+        ]))
+        .unwrap();
+        let store = build_store(
+            &Url::parse("gs://bucket/t/").unwrap(),
+            &overrides,
+            &pairs(&[("google_bearer_token", "ya29.VENDED")]),
+        )
+        .unwrap();
+        get_not_found(store.as_ref(), "t/_delta_log/_last_checkpoint").await;
+        let request = server.await.unwrap();
+        assert!(
+            request
+                .lines()
+                .next()
+                .unwrap()
+                .starts_with("GET /bucket/t%2F%5Fdelta%5Flog%2F%5Flast%5Fcheckpoint "),
+            "{request}"
+        );
+        let auth: Vec<&str> = request
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+            .collect();
+        assert_eq!(auth.len(), 1, "{request}");
+        assert!(auth[0].ends_with("Bearer ya29.VENDED"), "{request}");
+    }
+
+    /// The S3 store built for a UC-vended credential sends requests to `--s3-endpoint`, path-style
+    /// (`/{bucket}/{key}`), over plain HTTP, signed with the vended key, not to AWS.
+    #[tokio::test]
+    async fn s3_store_uses_endpoint_path_style() {
+        let (endpoint, server) = capture_one_request().await;
         let overrides = StorageOverrides::new(pairs(&[
             ("aws_endpoint", &endpoint),
             ("aws_allow_http", "true"),
@@ -777,13 +1114,7 @@ mod tests {
             &vended,
         )
         .unwrap();
-        let err = store
-            .get(&object_store::path::Path::from(
-                "warehouse/t/_delta_log/_last_checkpoint",
-            ))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, object_store::Error::NotFound { .. }), "{err}");
+        get_not_found(store.as_ref(), "warehouse/t/_delta_log/_last_checkpoint").await;
         let request = server.await.unwrap();
         let first = request.lines().next().unwrap();
         assert_eq!(

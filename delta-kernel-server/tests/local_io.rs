@@ -840,6 +840,10 @@ fn local_and_forward_parquet_footer_schemas_match() {
 /// UC client. With `SSL_CERT_FILE` / `SSL_CERT_DIR` pointing at nothing (rustls-native-certs then
 /// loads no system roots), the binary still starts, answers Ping, and completes a UC credential
 /// exchange plus a build; storage-option flags are accepted and logged by key only.
+///
+/// Scope: this covers startup and HTTPS client construction without system roots, not a TLS
+/// handshake. The mock UC is plain HTTP, and a handshake that validates against a bundled root
+/// would need a server certificate issued by a public CA (no such private key in a test).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_runs_without_system_ca_certificates() {
     let uc = MockUc::start();
@@ -872,7 +876,7 @@ async fn binary_runs_without_system_ca_certificates() {
             "--storage-option",
             "aws_virtual_hosted_style_request=false",
             "--storage-option",
-            "aws_secret_access_key=SERVER-SIDE-SECRET",
+            "proxy_excludes=SERVER-SIDE-VALUE",
         ])
         .arg("--uc-endpoint-override")
         .arg(&uc.base_url)
@@ -921,22 +925,30 @@ async fn binary_runs_without_system_ca_certificates() {
         logs.contains("aws_endpoint") && logs.contains("aws_allow_http"),
         "{logs}"
     );
-    assert!(!logs.contains("SERVER-SIDE-SECRET"), "{logs}");
-
-    // An unknown option key is a startup error, not a silently ignored flag.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_delta-kernel-server"))
-        .args([
-            "--listen",
-            "127.0.0.1:0",
-            "--storage-option",
-            "aws_endpont=x",
-        ])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("unknown object_store option"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        !logs.contains("SERVER-SIDE-VALUE"),
+        "option values are not logged: {logs}"
     );
+
+    // Unknown keys and every auth / credential-source key fail at startup (allowlist), per cloud.
+    for (option, expect) in [
+        ("aws_endpont=x", "unknown object_store option"),
+        ("aws_access_key_id=SERVER", "not allowed"),
+        ("aws_skip_signature=true", "not allowed"),
+        ("aws_web_identity_token_file=/t", "not allowed"),
+        ("azure_credential_type=managed_identity", "not allowed"),
+        ("azure_storage_account_key=SERVER", "not allowed"),
+        ("azure_use_azure_cli=true", "not allowed"),
+        ("google_service_account=/sa.json", "not allowed"),
+        ("google_application_credentials=/adc.json", "not allowed"),
+        ("google_skip_signature=true", "not allowed"),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_delta-kernel-server"))
+            .args(["--listen", "127.0.0.1:0", "--storage-option", option])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{option} accepted");
+        assert!(stderr.contains(expect), "{option}: {stderr}");
+    }
 }
