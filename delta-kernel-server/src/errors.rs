@@ -147,6 +147,29 @@ pub fn kernel_code_name(code: i32) -> &'static str {
 /// state (kernel `MaxCatalogVersion`).
 pub const CATALOG_STATE_REQUIRED_PREFIX: &str = "CATALOG_STATE_REQUIRED: ";
 
+/// The kernel condition behind [`CATALOG_STATE_REQUIRED_PREFIX`]: loading the latest snapshot of a
+/// catalog-managed table without a max catalog version. Other `MaxCatalogVersion` errors (a tail
+/// inconsistent with its bound, a version above the bound) are request bugs and stay `INTERNAL`.
+const CATALOG_STATE_REQUIRED_KERNEL_TEXT: &str =
+    "required when loading the latest catalog-managed snapshot";
+
+/// `UNSUPPORTED` with [`CATALOG_STATE_REQUIRED_PREFIX`] when a build that had no catalog state
+/// (path-based latest; the caller decides) failed only because the table is catalog-managed.
+pub fn catalog_state_required(e: &delta_kernel::Error) -> Option<ServerError> {
+    let delta_kernel::Error::Kernel(k) = e else {
+        return None;
+    };
+    match root_kernel_error(k) {
+        KernelError::MaxCatalogVersion(m) if m.contains(CATALOG_STATE_REQUIRED_KERNEL_TEXT) => {
+            Some(ServerError::new(
+                proto::error::Code::Unsupported,
+                format!("{CATALOG_STATE_REQUIRED_PREFIX}{e}"),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Message prefix of an `OP_FAILED` error (client-reported op failure).
 pub const OP_FAILED_PREFIX: &str = "OP_FAILED: client op failed";
 /// Message prefix of the `UNAVAILABLE` error for a failed server-side op (SPEC v9.1).
@@ -316,12 +339,6 @@ pub fn classify_kernel_error(
     }
     match root {
         KernelError::Unsupported(_) => ServerError::new(Code::Unsupported, e.to_string()),
-        // A catalog-managed table resolved without catalog state (no `catalog_latest`): the
-        // request cannot be answered by the server; the client must use its catalog path.
-        KernelError::MaxCatalogVersion(_) => ServerError::new(
-            Code::Unsupported,
-            format!("{CATALOG_STATE_REQUIRED_PREFIX}{e}"),
-        ),
         KernelError::InvalidProtocol(_) => {
             ServerError::new(Code::ProtocolUnsupported, e.to_string())
         }
@@ -338,6 +355,42 @@ pub fn classify_kernel_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only kernel's "latest of a catalog-managed table without a bound" condition maps to
+    /// CATALOG_STATE_REQUIRED; every other MaxCatalogVersion stays INTERNAL without the prefix.
+    #[test]
+    fn only_the_missing_catalog_bound_is_catalog_state_required() {
+        let mcv = |m: &str| delta_kernel::Error::Kernel(KernelError::MaxCatalogVersion(m.into()));
+        let required = mcv(
+            "Max catalog version is required when loading the latest catalog-managed snapshot. \
+             Use with_max_catalog_version().",
+        );
+        let e = catalog_state_required(&required).expect("maps");
+        assert_eq!(e.code, proto::error::Code::Unsupported);
+        assert!(e.message.starts_with(CATALOG_STATE_REQUIRED_PREFIX));
+        for other in [
+            "Requested version 5 exceeds max catalog version 3",
+            "Latest commit version 2 does not match max catalog version 3",
+            "Latest commit version 1 is less than requested version 2 for max catalog version 3",
+            "Max catalog version is required when providing staged commits. Use \
+             with_max_catalog_version().",
+        ] {
+            assert!(catalog_state_required(&mcv(other)).is_none(), "{other}");
+            let delta_kernel::Error::Kernel(k) = mcv(other) else {
+                unreachable!()
+            };
+            let c = classify_kernel_error(&k, None, None);
+            assert_eq!(c.code, proto::error::Code::Internal, "{other}");
+            assert!(
+                !c.message.contains(CATALOG_STATE_REQUIRED_PREFIX),
+                "{other}"
+            );
+        }
+        assert!(
+            catalog_state_required(&delta_kernel::Error::Kernel(KernelError::generic("x")))
+                .is_none()
+        );
+    }
 
     #[test]
     fn op_failure_text_names_the_kernel_error_not_a_number() {

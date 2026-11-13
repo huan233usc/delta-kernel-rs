@@ -734,6 +734,96 @@ async fn resolve_time_travel_catalog_managed_without_catalog_latest_is_refused()
     assert!(server.core.cached_instances_per_table().is_empty());
 }
 
+/// GetSnapshot (path-based latest) on a catalog-managed table without catalog_latest: UNSUPPORTED
+/// with the CATALOG_STATE_REQUIRED prefix (the client uses its catalog path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_snapshot_catalog_managed_without_catalog_latest() {
+    let fx = cm_fixture();
+    cm_publish(&fx, 1);
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    for staleness in [0, 60_000] {
+        let err = run(
+            &mut c,
+            latest_request(&fx, staleness, vec![]),
+            Behavior::default(),
+        )
+        .await
+        .err();
+        assert_eq!(err.code, Code::Unsupported as i32, "{err:?}");
+        assert!(
+            err.message.starts_with("CATALOG_STATE_REQUIRED: "),
+            "{err:?}"
+        );
+        assert!(!err.retryable);
+    }
+}
+
+/// Other kernel MaxCatalogVersion failures are request bugs: they keep a non-fallback code and no
+/// CATALOG_STATE_REQUIRED prefix. (A requested version above max_catalog_version cannot be sent
+/// through the API, which never combines both; `errors.rs` unit-tests that classification.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn other_max_catalog_version_errors_are_not_catalog_state_required() {
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let assert_no_fallback = |what: &str, err: proto::Error| {
+        assert_ne!(err.code, Code::Unsupported as i32, "{what}: {err:?}");
+        assert!(
+            !err.message.contains("CATALOG_STATE_REQUIRED"),
+            "{what}: {err:?}"
+        );
+        assert!(!err.message.contains("LOG_HISTORY"), "{what}: {err:?}");
+    };
+
+    // Malformed catalog_latest: the tail ends at v1 but max_catalog_version is 2.
+    let fx = cm_fixture();
+    let v1 = cm_stage(&fx, 1);
+    let err = run(
+        &mut c,
+        cm_request(&fx, 2, std::slice::from_ref(&v1)),
+        Behavior::default(),
+    )
+    .await
+    .err();
+    assert!(err.message.contains("Max catalog version"), "{err:?}");
+    assert_eq!(err.code, Code::Internal as i32, "{err:?}");
+    assert_no_fallback("tail below its bound", err);
+    // The same tail through ResolveTimeTravel is not refused as catalog-state-missing either.
+    let mut req = tt_request(
+        &fx,
+        proto::resolve_time_travel_request::Target::CheckVersion(1),
+        false,
+        false,
+        false,
+    );
+    let Some(proto::version_spec::Spec::CatalogLatest(cl)) =
+        cm_request(&fx, 2, &[v1]).at.and_then(|a| a.spec)
+    else {
+        unreachable!()
+    };
+    req.catalog_latest = Some(cl);
+    let err = run_time_travel(&mut c, req, Behavior::default())
+        .await
+        .err();
+    assert_no_fallback("time travel with a malformed tail", err);
+
+    // max_catalog_version on a non-catalog-managed table: whatever kernel decides, it is not a
+    // missing-catalog-state fallback.
+    let fx = fixture("table-with-dv-small");
+    for (mcv, tail) in [(5i64, vec![]), (5, vec![format!("{:020}.json", 1)])] {
+        let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+        let out = run(
+            &mut c,
+            catalog_request(&fx, mcv, &tail, vec![]),
+            Behavior::default(),
+        )
+        .await;
+        if let Err(Ended::Error(err)) = out.result {
+            assert_no_fallback(&format!("non-CM mcv={mcv} tail={tail:?}"), err);
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------------------
 // Snapshot hints: round trip, plan parity on rebuilt snapshots, measured sizes
 // ------------------------------------------------------------------------------------------------

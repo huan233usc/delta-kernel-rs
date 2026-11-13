@@ -32,7 +32,7 @@ use crate::creds::{
 };
 use crate::errors::{
     CATALOG_STATE_REQUIRED_PREFIX, LOCAL_IO_FAILED_PREFIX, OP_FAILED_PREFIX, ServerError,
-    classify_build_error, classify_kernel_error,
+    catalog_state_required, classify_build_error, classify_kernel_error,
 };
 use crate::executor::{LocalCtx, OpChannel, RemotePlanExecutor, StreamPort};
 use crate::info::{
@@ -885,7 +885,7 @@ fn parse_target(at: Option<&proto::VersionSpec>) -> Result<Target, ServerError> 
 }
 
 /// ResolveTimeTravel on a catalog-managed table without `catalog_latest` (v10 review B2).
-fn catalog_state_required() -> ServerError {
+fn time_travel_needs_catalog_latest() -> ServerError {
     ServerError::new(
         Code::Unsupported,
         format!(
@@ -1256,7 +1256,7 @@ impl Core {
             Ok((instance, _))
                 if path_based && instance.snapshot.table_configuration().is_catalog_managed() =>
             {
-                return Err(catalog_state_required());
+                return Err(time_travel_needs_catalog_latest());
             }
             Ok((instance, _)) => instance,
             Err(e)
@@ -1264,7 +1264,7 @@ impl Core {
                     && e.code == Code::Unsupported
                     && e.message.starts_with(CATALOG_STATE_REQUIRED_PREFIX) =>
             {
-                return Err(catalog_state_required());
+                return Err(time_travel_needs_catalog_latest());
             }
             Err(e) => return Err(e),
         };
@@ -1957,6 +1957,15 @@ impl Core {
                     );
                     Ok((BuildOutcome { instance, kind }, L2Write::None))
                 }
+            }
+            // Path-based latest of a catalog-managed table: the request had no catalog state.
+            Err(BuildFailure::Build(e))
+                if is_latest
+                    && channel.first_op_failure().is_none()
+                    && channel.cancel_reason().is_none()
+                    && catalog_state_required(&e).is_some() =>
+            {
+                Err(catalog_state_required(&e).expect("checked"))
             }
             Err(BuildFailure::Build(e)) => Err(local_unavailable(
                 channel,
