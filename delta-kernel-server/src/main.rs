@@ -2,11 +2,16 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
-use delta_kernel_server::cache::{CacheConfig, Core, DEFAULT_LOCAL_IO_THREADS, IoMode, KERNEL_REV};
+use delta_kernel_server::cache::{
+    CacheConfig, Core, DEFAULT_L2_BUILD_DEADLINE, DEFAULT_LOCAL_IO_THREADS, IoMode, KERNEL_REV,
+};
 use delta_kernel_server::creds::StorageOverrides;
 use delta_kernel_server::service::{KernelService, bind, serve, write_endpoint_file};
+use delta_kernel_server::store::{DEFAULT_L2_TTL, L2, RedisStore};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -62,6 +67,17 @@ struct Args {
     /// S3 region (`aws_region`).
     #[arg(long, value_name = "REGION")]
     s3_region: Option<String>,
+    /// Redis URL of the shared L2 snapshot store (SPEC v10.3), e.g. `redis://10.0.0.5:6379/0`.
+    /// Off by default. L2 failures never fail a request; an unreachable URL fails startup.
+    #[arg(long, value_name = "URL")]
+    l2_redis_url: Option<String>,
+    /// TTL of L2 snapshot, version-index and plan keys.
+    #[arg(long, default_value_t = DEFAULT_L2_TTL.as_secs())]
+    l2_ttl_secs: u64,
+    /// How long a replica holds the L2 build lock, and how long other replicas wait for its
+    /// result before building themselves.
+    #[arg(long, default_value_t = DEFAULT_L2_BUILD_DEADLINE.as_millis() as u64)]
+    l2_build_deadline_ms: u64,
     /// Test only (requires --enable-test-hooks): require UC credentials for file:// tables too.
     #[arg(
         long,
@@ -106,7 +122,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default();
         format!("dks-{}-{nanos}", std::process::id())
     });
-    let core = Core::new(
+    let l2: Option<Arc<L2>> = match &args.l2_redis_url {
+        Some(url) => {
+            let store = RedisStore::connect(url, KERNEL_REV, Duration::from_secs(args.l2_ttl_secs))
+                .await
+                .map_err(|e| format!("--l2-redis-url: {e}"))?;
+            // The URL may carry a password: log the host part only.
+            let host = url.rsplit('@').next().unwrap_or_default();
+            tracing::info!(l2 = %host, "L2 snapshot store connected");
+            Some(Arc::new(store))
+        }
+        None => None,
+    };
+    let core = Core::with_l2(
         instance_id.clone(),
         CacheConfig {
             max_instances_per_table: args.max_instances_per_table,
@@ -116,7 +144,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             credentials_for_file: args.test_uc_credentials_for_file,
             local_io_threads: args.local_io_threads as usize,
             storage_options,
+            l2_ttl: Duration::from_secs(args.l2_ttl_secs),
+            l2_build_deadline: Duration::from_millis(args.l2_build_deadline_ms.max(1)),
         },
+        l2,
     );
     let (listener, addr) = bind(args.listen).await?;
     if let Some(path) = &args.endpoint_file {
@@ -128,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kernel_rev = KERNEL_REV,
         test_hooks = args.enable_test_hooks,
         io_mode = ?args.io_mode,
+        l2 = args.l2_redis_url.is_some(),
         "delta-kernel-server listening"
     );
     let shutdown = async {

@@ -36,16 +36,28 @@ use url::Url;
 
 use crate::errors::{CancelReason, codes, kernel_error_from_code, to_wire_kernel_error};
 use crate::local_io::{LocalIo, LocalIoPool, PoolRun, apply_listing_hint};
-use crate::proto::{self, op_result, server_msg};
+use crate::proto::{self, op_result};
 use crate::stats::{Faults, ServerCounters};
 
-/// Outbound half of a GetSnapshot stream.
-pub type OutboundTx = mpsc::Sender<Result<proto::ServerMsg, Status>>;
+/// A message on the server half of a stream, independent of the RPC (SPEC v10: GetSnapshot,
+/// GetScanPlan and ResolveTimeTravel share the op sub-protocol). The service maps it to the RPC's
+/// own message type.
+#[derive(Debug)]
+pub enum Outbound {
+    Op(proto::OpRequest),
+    Snapshot(Box<proto::GetSnapshotResponse>),
+    ScanPlan(Box<proto::GetScanPlanResponse>),
+    TimeTravel(Box<proto::ResolveTimeTravelResponse>),
+    Error(proto::Error),
+}
+
+/// Outbound half of a client stream.
+pub type OutboundTx = mpsc::Sender<Result<Outbound, Status>>;
 
 static NEXT_OP_ID: AtomicI64 = AtomicI64::new(1);
 static NEXT_PORT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Server-side endpoint of one client GetSnapshot stream that can carry ops.
+/// Server-side endpoint of one client stream (any of the three RPCs) that can carry ops.
 pub struct StreamPort {
     id: u64,
     out: Mutex<Option<OutboundTx>>,
@@ -135,10 +147,10 @@ impl StreamPort {
     }
 
     /// Sends a terminal message (response or error) and closes the stream.
-    pub async fn finish(&self, msg: server_msg::Msg) {
+    pub async fn finish(&self, msg: Outbound) {
         let out = self.out.lock().unwrap().clone();
         if let Some(out) = out {
-            let _ = out.send(Ok(proto::ServerMsg { msg: Some(msg) })).await;
+            let _ = out.send(Ok(msg)).await;
         }
         self.close();
     }
@@ -169,13 +181,11 @@ impl StreamPort {
             self.kill("fail_after_n_ops");
             return Err(CallError::StreamGone);
         }
-        let msg = proto::ServerMsg {
-            msg: Some(server_msg::Msg::Op(proto::OpRequest {
-                op_id,
-                operation: operation.to_vec(),
-                listing_hint,
-            })),
-        };
+        let msg = Outbound::Op(proto::OpRequest {
+            op_id,
+            operation: operation.to_vec(),
+            listing_hint,
+        });
         if out.blocking_send(Ok(msg)).is_err() {
             self.close();
             return Err(CallError::StreamGone);

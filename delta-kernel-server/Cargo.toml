@@ -31,6 +31,11 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
 async-trait = "0.1"
+# v10 L2 (Redis) snapshot store; plans are zstd-compressed there.
+redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+futures = "0.3"
+zstd = "0.13"
+serde = { version = "1", features = ["derive"] }
 bytes = "1.10"
 # v9 hybrid IO: FileListing / ReadBytes / HeadFile / ParquetFooter run on the server through the
 # default engine's object_store handlers.
@@ -69,4 +74,3 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
 tar = "0.4"
 tokio = { version = "1.47", features = ["io-util"] }
 tempfile = "3"
-zstd = "0.13"

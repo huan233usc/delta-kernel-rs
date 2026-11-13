@@ -2,7 +2,18 @@
 
 A long-running gRPC service that runs the driver-side delta_kernel work of the DBR DSv2 read
 path: snapshot build (full or incremental), `SnapshotInfo`, and
-`Scan::declarative_metadata_scan_plan`. It caches all three across queries.
+`Scan::declarative_metadata_scan_plan`. It caches all three across queries, in process (L1) and
+optionally in a Redis shared by replicas (L2, SPEC v10).
+
+SPEC v10 splits snapshot and plan:
+
+- **`GetSnapshot`** returns the snapshot, its `SnapshotInfo` and a stateless `SnapshotRef`. Plans
+  for `prefetch_plans` come back in `prefetched_plans`.
+- **`GetScanPlan(ref, spec)`** returns one plan for the snapshot a ref names.
+- **`ResolveTimeTravel`** answers `getActiveCommitAtTime` / `checkVersionExists` on the latest
+  snapshot.
+
+All three RPCs carry the same op sub-protocol.
 
 IO is hybrid (SPEC v9):
 
@@ -15,7 +26,7 @@ IO is hybrid (SPEC v9):
 - `--io-mode forward` restores the pre-v9 behavior (every op forwarded) for A/B runs.
 
 - Wire contract: [`proto/delta_kernel_server.proto`](proto/delta_kernel_server.proto) (SPEC v9 §5
-  plus the additive fields of the v6-v9 revisions).
+  plus the additive fields of the v6-v9 revisions, and SPEC v10 §10.1).
 - Kernel: the in-tree `kernel` crate at `4633926ff40ff39e5ba8bc690a965b4fb793c073`.
 
 ## Build
@@ -70,6 +81,9 @@ delta-kernel-server \
 | `--s3-endpoint URL` | none | same as `--storage-option aws_endpoint=URL`; requests are path-style (`{endpoint}/{bucket}/{key}`) unless `aws_virtual_hosted_style_request=true` |
 | `--s3-allow-http` | off | same as `--storage-option aws_allow_http=true` |
 | `--s3-region REGION` | none | same as `--storage-option aws_region=REGION` |
+| `--l2-redis-url URL` | off | shared L2 snapshot store (SPEC v10.3), e.g. `redis://10.0.0.5:6379/0`; unreachable at startup → exit; L2 errors later never fail a request |
+| `--l2-ttl-secs` | `21600` (6 h) | TTL of L2 `snap` / `ver` / `plan` keys |
+| `--l2-build-deadline-ms` | `120000` | TTL of the cross-replica build lock, and how long a replica that lost it waits for the holder's result before building itself |
 | `--test-uc-credentials-for-file` | off, hidden | test only, needs `--enable-test-hooks`: run the UC credential check for `file://` tables too |
 
 Operator storage options are an **allowlist**. They can only say where and how to connect, never
@@ -177,6 +191,144 @@ docker run --rm --name dks --network dks -p 50051:50051 \
 4. **Point the client** at the published port (`127.0.0.1:50051`). The client forwards its UC
    token in `GetSnapshotRequest.auth`; the server exchanges it at the overridden UC endpoint for
    the LocalStack credential.
+
+## v10: GetScanPlan, ResolveTimeTravel, two-tier cache
+
+### SnapshotRef and GetScanPlan
+
+`GetSnapshotResponse.ref` names the snapshot without server state:
+
+- `table`, `version`, `log_segment`;
+- `segment_id` = hex SHA-256 of the canonical segment identity. The identity is the one cache hits
+  compare, serialized as JSON `[version, checkpoint_version, [[location, size]…], [[location,
+  size, staged]…]]` with both lists sorted. The same id is the L2 `seg_id`.
+- `instance_id`.
+
+`GetScanPlan(ref, spec)` runs in this order:
+
+1. **Authz first** (SPEC v9.1 rules). Cloud tables are checked on cache hits too.
+2. **Resolve the ref** as an exact version with `expected_log_segment = ref.log_segment`: L1, then
+   L2, then an exact rebuild at `ref.version`.
+3. **Check the segment.** The resolved segment must equal the ref's, otherwise `STALE_REF = 10`
+   (non-retryable). For example, a checkpoint written at that version since the ref was taken
+   changes the segment. The client calls GetSnapshot again and retries once.
+   - A `segment_id` that does not match its own `log_segment` is also `STALE_REF`.
+4. **Staged refs.** Staged-tail instances are never cached. A ref whose segment has staged deltas
+   is rebuilt as `catalog_latest(max_catalog_version = ref.version, log_tail = the staged deltas)`
+   on every call; neither the instance nor its plans are cached or written to L2.
+5. **Plan.** Plans cache on `(instance, spec hash)` and coalesce exactly as prefetched plans do.
+   Prefetch is literally one GetScanPlan per spec on the GetSnapshot stream.
+
+`ServerStats` splits time into `resolve_us` (authz + snapshot resolution) and `plan_us`.
+
+### ResolveTimeTravel
+
+The snapshot it runs on:
+- **Path-based tables**: a fresh latest (`max_staleness = 0`, so at most one incremental
+  re-listing of the cached latest).
+- **Catalog-managed tables**: the request's `catalog_latest`.
+
+Results are not cached; only the latest instance is.
+
+| target | semantics (mirrors) | response |
+|---|---|---|
+| `timestamp_ms` | `JnrHistory.getActiveCommitAtTimestamp` (below) | `version`, `commit_timestamp_ms`; `earliest_recreatable_version = -1` |
+| `check_version` | `PathBasedSnapshotManager` / `UCManagedTableSnapshotManager.checkVersionExists`: `get_earliest_commit(Recreatable \| Published)`; for catalog-managed tables bounded by the earliest catalog-tail version | `version` = input, `earliest_recreatable_version` = the earliest version for the requested commit type, `latest_version`; `commit_timestamp_ms = -1`. The client applies `version < earliest \|\| (version > latest && !allowOutOfRange)` |
+
+`getActiveCommitAtTimestamp` order:
+1. **After the snapshot's own timestamp**: returns the latest version if `can_return_last_commit`,
+   else fails.
+2. **Otherwise** `latest_version_as_of`.
+3. **On a log-history error** with `can_return_earliest_commit`: `first_version_after`, accepted
+   only if strictly after the timestamp.
+4. **Commit type**: `Recreatable` iff `must_be_recreatable`.
+
+Failures:
+- **No answer** (timestamp out of range, no recreatable commit, timestamp after latest without
+  `can_return_last_commit`): `UNSUPPORTED`, message `LOG_HISTORY: <kernel or JNR text>`. The
+  client falls back to JNR, which raises the user-facing exception.
+- **Op failures** classify as for builds.
+
+### Two-tier cache (SPEC v10.3)
+
+- **L1** (`cache::L1Cache`): instances, the latest map and the in-flight table. It implements the
+  `store::SnapshotStore` trait, but `Core` uses its synchronous API so lookup-or-join stays
+  atomic.
+- **L2** (`store::RedisStore`, or `store::MemoryStore` with identical semantics in process):
+  optional, shared across replicas.
+
+Resolution on an L1 miss:
+1. **Read L2.**
+2. **On a hit**, rebuild the native snapshot from the stored kernel hint with **zero ops**. The
+   rebuild engine fails every op. The rebuilt segment id must equal the entry's. Then serve
+   `SnapshotInfo` from L2.
+3. **On a miss**, take `lock:{table_key}:{target}` (`SET NX PX build-deadline`) and build. Write
+   L2 *before* releasing the lock.
+4. **A replica that loses the lock** polls L2 every 50 ms until the deadline, then builds itself.
+5. **Path-based latest**: a stale L2 `latest` still serves as the base of one incremental
+   re-listing.
+6. **Plans**: an L1 miss reads `plan:{seg_id}:{spec_hash}` before generating, and writes it after.
+
+Authz on an in-process credential miss:
+1. Check `authz:{sha256(token)}:{table_key}`. If present, UC is not called. A job that then needs
+   server-side IO fetches the credential lazily.
+2. Otherwise call UC, and on success write `authz` until credential expiry − 60 s.
+
+Keys are prefixed `dks:{kernel_rev}:`. `table_key` is the UC table id when it is a UUID, else
+sha256(canonical location).
+
+| key | type | value | TTL |
+|---|---|---|---|
+| `snap:{table_key}:{seg_id}` | hash | `info` (SnapshotInfo), `seg` (LogSegmentInfo), `hint`, `version`, `built_at`, `confirmed_at` | `--l2-ttl-secs` |
+| `ver:{table_key}` | zset | member `seg_id`, score `version`; without an expected segment the entry with the greatest `confirmed_at` wins (v8 rule) | same |
+| `latest:{table_key}` | hash | `seg_id`, `version`, `confirmed_at_ms`, `tail_id` (empty for path-based; hex digest of the canonical tail for `catalog_latest`); never moves back | 2 × staleness, ≥ 60 s |
+| `plan:{seg_id}:{spec_hash}` | string | zstd(plan bytes) \| `EMPTY` \| `UNSUPPORTED:<reason>` | `--l2-ttl-secs` |
+| `lock:{table_key}:{target}` | string | `{instance_id}:{job}`; target `v{version}` \| `latest` \| `c{mcv}:{tail digest}`; released only by its owner | `--l2-build-deadline-ms` |
+| `authz:{sha256(token)}:{table_key}` | string | authorized-until (ms) | until − now |
+
+Never written to L2:
+- staged-tail results and their plans;
+- tainted builds or plans;
+- UC credentials and token plaintext;
+- plans whose zstd form exceeds 4 MiB.
+
+`ResetCache` clears L1 only.
+
+**SnapshotHint finding (kernel `4633926`)**: `SnapshotHint` is `internal_api` and has no serde.
+- **Every component is reachable and rebuildable** under `internal-api`:
+  - version, freshness, publication watermark;
+  - the retained `LogSegmentFiles`, re-grouped by `SnapshotHint::try_new`;
+  - `Protocol`, `Metadata`, `LastCheckpointHint` (serde);
+  - the at-version `Crc`, via its getters and `Crc::try_from_parts`. Its inline `allFiles` adds
+    have crate-private fields and no `Serialize`, so they go through the public `From<Add> for
+    Scalar` and back through `Add`'s `Deserialize`.
+- **`with_snapshot_hint` does no engine IO.**
+- **Encoding is verified:** `hint::encode` decodes its own output and compares every component
+  (`PartialEq`). A hint that does not round-trip is not stored; the entry then holds info and
+  plans only, and an L2 hit falls back to a build.
+- **Result:** all fixtures below round-trip, and the rebuilt snapshots give equal `SnapshotInfo`,
+  CRC state and normalized plans (`tests/v10.rs`), including `crc-full`'s inline `allFiles` and
+  a log-compaction table.
+
+`DebugStats` (test hooks):
+- `l1_entries`, `l1_bytes` (estimated: snapshot heap + `SnapshotInfo` + plans);
+- `l2_hits` / `l2_misses` (L2 snapshot lookups after an L1 miss);
+- `entry_bytes` (`seg_id` → bytes).
+
+Measured on the kernel fixtures (`snapshot_hints_round_trip_and_sizes`, `--nocapture`). Plans
+are `[JSON_ONLY, ALL_STRUCT]`:
+
+| fixture | version | SnapshotInfo | hint (zstd) | plans (zstd) | snapshot heap |
+|---|---|---|---|---|---|
+| table-with-dv-small | 1 | 485 B | 468 B | 813 / 964 B | 1118 B |
+| basic_partitioned | 1 | 542 B | 453 B | 893 / 1020 B | 1245 B |
+| crc-full (inline allFiles) | 0 | 1823 B | 2281 B | 1280 / 1432 B | 1109 B |
+| v2-checkpoints-parquet-with-sidecars | 6 | 633 B | 1617 B | 707 / 882 B | 1514 B |
+| v1-multi-part-struct-stats-only | 5 | 1549 B | 2568 B | 1095 / 1248 B | 2289 B |
+| type-widening | 2 | 2598 B | 782 B | 822 / 1185 B | 3189 B |
+| compacted-log-files-table | 25 | 3076 B | 741 B | 1085 / 1266 B | 8924 B |
+
+SF1 / HiFi sizes are not measured here: they need the P1-b client runs.
 
 ## Server semantics (SPEC §7)
 
@@ -298,6 +450,30 @@ vended credential (SigV4 with the vended key; SAS in the query and no Authorizat
 `Bearer` with the vended token). `tests/no_ambient_credentials.rs` (own binary) points every AWS /
 Azure / GCE metadata and credential env var at a trap listener, then reads and presigns through
 each store: the trap is never contacted, and only vended credentials appear on the wire.
+
+`tests/v10.rs` covers SPEC v10:
+- **GetScanPlan**: hit by ref (then a plan cache hit with 0 ops); rebuild after eviction and after
+  reset; `STALE_REF` (tampered id, and a checkpoint written at the ref's version); staged refs
+  rebuilt every call and never cached; authz first.
+- **Prefetch vs GetScanPlan**: semantic plan parity on four fixtures.
+- **ResolveTimeTravel vs the in-process kernel + JNR logic**: ICT and non-ICT tables; timestamps
+  before the first and after the last commit under every flag combination; `check_version`; log
+  cleanup behind a checkpoint; a catalog-managed staged commit's ICT.
+- **Snapshot hints**: round trip on 15 fixtures, with the size table above.
+- **L2 (`MemoryStore`)**:
+  - restart / another replica hits with zero ops;
+  - latest hit, and a stale latest as re-list base;
+  - two replicas, one build;
+  - never stores staged or tainted results;
+  - the `SnapshotStore` contract on L1 and memory;
+  - `authz` shared across replicas.
+
+`tests/l2_redis.rs` runs against `docker run redis:7` on a random port and skips with a message if
+docker is unavailable:
+- the contract and the 4 MiB cap;
+- the exact key schema and TTLs written by a build;
+- two server processes sharing L2 with one build;
+- a restarted process serving from L2 with zero ops.
 
 `tests/loopback.rs` (L0a) starts the server in-process on `127.0.0.1:0` (default `local` IO mode;
 forward-specific mechanics such as handoff of a listing op run in `forward` mode). Its test client decodes

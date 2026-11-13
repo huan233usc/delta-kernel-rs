@@ -589,6 +589,17 @@ fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+/// Outcome of [`CredentialProvider::check_cached`].
+pub enum CredCheck {
+    /// The table needs no credential (`file://`).
+    NotNeeded,
+    Cached(Arc<StorageCredential>),
+    /// Not cached in process; `token_hash` keys the L2 `authz` entry.
+    Miss {
+        token_hash: String,
+    },
+}
+
 pub struct CredentialProvider {
     /// `Err` if no TLS root could be loaded: UC calls then fail with UNAVAILABLE instead of the
     /// server refusing to start.
@@ -626,6 +637,33 @@ impl CredentialProvider {
 
     pub fn clear(&self) {
         self.cache.lock().unwrap().clear();
+    }
+
+    /// The caller's credential if it is already cached in process, without calling UC.
+    pub fn check_cached(
+        &self,
+        auth: Option<&proto::Auth>,
+        table_id: &str,
+        location: &Url,
+    ) -> Result<CredCheck, ServerError> {
+        if location.scheme() == "file" && !self.credentials_for_file {
+            return Ok(CredCheck::NotNeeded);
+        }
+        let Some(auth) = auth.filter(|a| !a.bearer_token.is_empty()) else {
+            return Err(ServerError::new(
+                Code::PermissionDenied,
+                "auth is required for cloud storage tables",
+            ));
+        };
+        let req = CredentialRequest::for_table(table_id, location);
+        let token = token_hash(&auth.bearer_token);
+        let key = (token.clone(), req.cache_key().to_string());
+        if let Some(c) = self.cache.lock().unwrap().get(&key)
+            && c.usable_until_ms > now_ms()
+        {
+            return Ok(CredCheck::Cached(c.clone()));
+        }
+        Ok(CredCheck::Miss { token_hash: token })
     }
 
     /// Returns the IO for `location` after checking (or fetching) the caller's credential.

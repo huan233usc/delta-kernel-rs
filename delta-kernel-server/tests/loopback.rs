@@ -101,7 +101,7 @@ async fn parity_v2_checkpoint_with_sidecars() {
     assert_eq!(info(&resp).metadata, info(&local).metadata);
     assert_eq!(info(&resp).crc, info(&local).crc);
     let plans_mention_sidecars = resp
-        .plans
+        .prefetched_plans
         .iter()
         .any(|p| String::from_utf8_lossy(plan_bytes(p).unwrap_or_default()).contains("_sidecars/"));
     let ops_mention_sidecars = read_urls(&ops).iter().any(|u| u.contains("_sidecars/"));
@@ -235,7 +235,7 @@ async fn timestamp_partition_with_timezone_is_unsupported() {
     )
     .await
     .ok();
-    match resp.plans[0].result.as_ref().unwrap() {
+    match resp.prefetched_plans[0].result.as_ref().unwrap() {
         scan_plan_result::Result::Unsupported(e) => {
             assert_eq!(e.code, Code::Unsupported as i32);
             assert!(e.message.contains("TIMESTAMP"), "{}", e.message);
@@ -258,7 +258,7 @@ async fn timestamp_partition_with_timezone_is_unsupported() {
         (0, 0),
         "cache hit: nothing forwarded, nothing local"
     );
-    assert!(again.plans[0].cache_hit);
+    assert!(again.prefetched_plans[0].cache_hit);
 }
 
 fn resp_with_plans(
@@ -266,7 +266,7 @@ fn resp_with_plans(
     range: std::ops::Range<usize>,
 ) -> proto::GetSnapshotResponse {
     let mut r = resp.clone();
-    r.plans = resp.plans[range].to_vec();
+    r.prefetched_plans = resp.prefetched_plans[range].to_vec();
     r
 }
 
@@ -318,7 +318,7 @@ async fn resolve_sequence_full_hit_incremental_checkpoint() {
         "cache hit: nothing forwarded, nothing local"
     );
     assert!(ops2.is_empty());
-    assert!(r2.plans.iter().all(|p| p.cache_hit));
+    assert!(r2.prefetched_plans.iter().all(|p| p.cache_hit));
     assert_eq!(
         r2.info, r1.info,
         "a hit serves the SnapshotInfo computed at build time"
@@ -451,7 +451,7 @@ async fn coalesce_case(mode: IoMode) {
         local_ops += ops_local(&r) as i64;
         assert_eq!(r.info, driver_resp.info);
         let norm = |r: &proto::GetSnapshotResponse| -> Vec<Vec<u8>> {
-            r.plans
+            r.prefetched_plans
                 .iter()
                 .map(|p| normalize_plan_bytes(plan_bytes(p).unwrap()).unwrap())
                 .collect()
@@ -1448,7 +1448,7 @@ fn cm_request(
 
 /// Live add paths of the JSON-stats plan of a response.
 fn live_paths(resp: &proto::GetSnapshotResponse) -> Vec<String> {
-    let bytes = plan_bytes(&resp.plans[0]).expect("non-empty plan");
+    let bytes = plan_bytes(&resp.prefetched_plans[0]).expect("non-empty plan");
     rows_sorted_by_path(&execute_plan(
         delta_kernel_server::decode::decode_plan(bytes).unwrap(),
     ))
@@ -2009,7 +2009,7 @@ async fn latest_within_staleness_hits_with_zero_ops() {
     );
     assert!(ops.is_empty());
     assert_eq!(r2.version, r1.version);
-    assert!(r2.plans.iter().all(|p| p.cache_hit));
+    assert!(r2.prefetched_plans.iter().all(|p| p.cache_hit));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2040,7 +2040,7 @@ async fn latest_stale_unchanged_renews_with_one_listing() {
     assert_eq!(r2.version, r1.version);
     assert_eq!(r2.info, r1.info, "renewal serves the stored SnapshotInfo");
     assert!(
-        r2.plans.iter().all(|p| p.cache_hit),
+        r2.prefetched_plans.iter().all(|p| p.cache_hit),
         "renewal keeps the plan cache"
     );
     // The renewal re-confirmed the instance: a staleness window now hits with 0 ops.

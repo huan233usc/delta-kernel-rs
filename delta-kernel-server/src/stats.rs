@@ -27,6 +27,25 @@ pub struct ServerCounters {
     pub local_not_found_items: AtomicI64,
     /// In-process only: listing entries the server dropped while applying a `ListingHint`.
     pub listing_items_dropped: AtomicI64,
+    /// v10 L2 snapshot lookups of builds that L1 missed (on the wire as `l2_hits` / `l2_misses`).
+    /// A hit rebuilt the native snapshot from the stored hint with zero ops.
+    pub l2_hits: AtomicI64,
+    pub l2_misses: AtomicI64,
+    /// In-process only: L2 plan lookups of plans L1 missed.
+    pub l2_plan_hits: AtomicI64,
+    pub l2_plan_misses: AtomicI64,
+    /// In-process only: plans not written to L2 because their compressed form exceeds 4 MiB.
+    pub l2_plans_too_large: AtomicI64,
+    /// In-process only: builds whose snapshot hint did not round-trip (L2 holds info only).
+    pub l2_hint_unencodable: AtomicI64,
+    /// In-process only: builds that found the L2 lock held by another replica and waited.
+    pub l2_lock_waits: AtomicI64,
+    /// In-process only: requests authorized by an L2 `authz` entry instead of a UC call.
+    pub l2_authz_hits: AtomicI64,
+    /// In-process only: failed L2 calls (each treated as a miss).
+    pub l2_errors: AtomicI64,
+    /// In-process only: GetScanPlan refs naming this server instance.
+    pub ref_same_instance: AtomicI64,
 }
 
 /// One-shot faults armed through `InjectFault`. Each fault fires at most once and is then cleared.

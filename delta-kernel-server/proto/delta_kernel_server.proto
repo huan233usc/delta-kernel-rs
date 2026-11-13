@@ -1,4 +1,4 @@
-// Wire contract for delta-kernel-server (POC). Authoritative source: SPEC v5 §5.
+// Wire contract for delta-kernel-server (POC). Authoritative source: SPEC v5 §5, v10 §10.1.
 //
 // The server owns kernel state (snapshots, SnapshotInfo, metadata scan plans); the client owns all
 // storage IO. During a GetSnapshot call the server sends kernel `Operation`s (proto bytes from
@@ -11,7 +11,11 @@ syntax = "proto3";
 package delta.kernel.server.v1;
 
 service DeltaKernelService {
-  rpc GetSnapshot(stream ClientMsg) returns (stream ServerMsg);
+  rpc GetSnapshot(stream SnapshotClientMsg) returns (stream SnapshotServerMsg);
+  // v10: plan for a snapshot named by a stateless SnapshotRef.
+  rpc GetScanPlan(stream ScanPlanClientMsg) returns (stream ScanPlanServerMsg);
+  // v10: timestamp / version-existence resolution on the latest (or catalog_latest) snapshot.
+  rpc ResolveTimeTravel(stream TimeTravelClientMsg) returns (stream TimeTravelServerMsg);
   // Test hooks: only available when the server is started with --enable-test-hooks.
   rpc Ping(PingRequest) returns (PingResponse);
   rpc GetDebugStats(DebugStatsRequest) returns (DebugStats);
@@ -19,8 +23,23 @@ service DeltaKernelService {
   rpc InjectFault(FaultSpec) returns (InjectFaultResponse);
 }
 
-message ClientMsg { oneof msg { GetSnapshotRequest request = 1; OpResult op_result = 2; } }
-message ServerMsg { oneof msg { OpRequest op = 1; GetSnapshotResponse response = 2; Error error = 3; } }
+// All three RPCs are bidi streams sharing the OpRequest / OpResult sub-protocol: plan generation
+// (checkpoint shape probes) and time resolution may need forwarded QueryPlan ops.
+message SnapshotClientMsg { oneof msg { GetSnapshotRequest request = 1; OpResult op_result = 2; } }
+message SnapshotServerMsg { oneof msg { OpRequest op = 1; GetSnapshotResponse response = 2; Error error = 3; } }
+message ScanPlanClientMsg { oneof msg { GetScanPlanRequest request = 1; OpResult op_result = 2; } }
+message ScanPlanServerMsg { oneof msg { OpRequest op = 1; GetScanPlanResponse response = 2; Error error = 3; } }
+message TimeTravelClientMsg { oneof msg { ResolveTimeTravelRequest request = 1; OpResult op_result = 2; } }
+message TimeTravelServerMsg { oneof msg { OpRequest op = 1; ResolveTimeTravelResponse response = 2; Error error = 3; } }
+
+// v10: stateless, rebuildable address of a snapshot. instance_id only enables the fast path.
+message SnapshotRef {
+  TableRef table = 1;
+  int64 version = 2;
+  LogSegmentInfo log_segment = 3;   // canonical identity = the one cache hits compare
+  string segment_id = 4;            // sha256(canonical segment identity), also the L2 key
+  string instance_id = 5;           // server process id, as returned by Ping
+}
 
 // ---------- request ----------
 message TableRef {
@@ -66,7 +85,9 @@ message ScanPlanSpec {
 message GetSnapshotRequest {
   TableRef table = 1;
   VersionSpec at = 2;
-  repeated ScanPlanSpec plans = 3;
+  // v10: renamed from `plans` (same field number, wire compatible); may be empty. Same semantics
+  // as one GetScanPlan per spec on this stream.
+  repeated ScanPlanSpec prefetch_plans = 3;
   ClientInfo client = 4;
   // Log segment the client already has; on a cache hit the server compares it with the cached
   // instance and treats a mismatch as a miss.
@@ -77,6 +98,39 @@ message GetSnapshotRequest {
   // 10-19 reserved for query-dependent plan parameters (predicate, read_schema).
 }
 message Auth { string workspace_host = 1; string bearer_token = 2; }
+
+message GetScanPlanRequest {
+  SnapshotRef ref = 1;
+  ScanPlanSpec spec = 2;
+  ClientInfo client = 3;
+  Auth auth = 4;
+  // 10-19 reserved for predicate / read_schema / limit (query-dependent).
+}
+message GetScanPlanResponse {
+  ScanPlanResult plan = 1;
+  ServerStats stats = 2;
+}
+
+message ResolveTimeTravelRequest {
+  TableRef table = 1;
+  oneof target {
+    int64 timestamp_ms = 2;      // getActiveCommitAtTime
+    int64 check_version = 3;     // checkVersionExists
+  }
+  bool can_return_last_commit = 4;
+  bool must_be_recreatable = 5;
+  bool can_return_earliest_commit = 6;
+  optional CatalogLatest catalog_latest = 7;   // required for catalog-managed tables
+  ClientInfo client = 8;
+  Auth auth = 9;
+}
+message ResolveTimeTravelResponse {
+  int64 version = 1;               // resolved version; equals the input for check_version
+  int64 commit_timestamp_ms = 2;
+  int64 earliest_recreatable_version = 3;
+  int64 latest_version = 4;
+  ServerStats stats = 5;
+}
 message ClientInfo {
   string dbr_version = 1;
   string kernel_rev = 2;
@@ -125,10 +179,11 @@ message KernelError {
 message GetSnapshotResponse {
   int64 version = 1;
   SnapshotInfo info = 2;
-  repeated ScanPlanResult plans = 3;
+  repeated ScanPlanResult prefetched_plans = 3;  // v10: renamed from `plans`; one per prefetch_plans
   ResolveKind resolved_by = 4;
   string kernel_rev = 5;
   ServerStats stats = 6;
+  SnapshotRef ref = 7;                           // v10
 }
 
 message SnapshotInfo {
@@ -177,11 +232,14 @@ message ServerStats {
   int32 ops_issued = 1; int64 server_time_us = 2; int64 client_op_time_us = 3;
   string instance_id = 4;
   int32 ops_local = 5;          // v9: ops this request's jobs executed on the server
+  int64 resolve_us = 6;         // v10: snapshot resolution time
+  int64 plan_us = 7;            // v10: plan generation time
 }
 message Error {
   enum Code { INTERNAL = 0; UNSUPPORTED = 1; TABLE_NOT_FOUND = 2; PROTOCOL_UNSUPPORTED = 3;
               VERSION_MISMATCH = 4; OP_FAILED = 5; CANCELLED = 6; DEADLINE = 7;
-              PERMISSION_DENIED = 8; UNAVAILABLE = 9; }
+              PERMISSION_DENIED = 8; UNAVAILABLE = 9;
+              STALE_REF = 10; }       // v10: SnapshotRef no longer resolves to its log segment
   Code code = 1; string message = 2; bool retryable = 3;
 }
 
@@ -193,6 +251,8 @@ message DebugStats {
   map<string, int32> cached_instances_per_table = 4;
   int64 ops_local_total = 5;    // v9
   int64 latest_renewals = 6;    // latest re-listings that resolved CACHE_HIT (not in builds_started)
+  int64 l1_entries = 7; int64 l1_bytes = 8; int64 l2_hits = 9; int64 l2_misses = 10;  // v10
+  map<string, int64> entry_bytes = 11;   // v10: seg_id -> estimated bytes (test hooks only)
 }
 message ResetCacheRequest {} message ResetCacheResponse {}
 message FaultSpec {

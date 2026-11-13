@@ -11,12 +11,15 @@ pub mod creds;
 pub mod decode;
 pub mod errors;
 pub mod executor;
+pub mod hint;
 pub mod info;
 pub mod local_io;
 pub mod normalize;
 pub mod plan;
 pub mod service;
 pub mod stats;
+pub mod store;
+pub mod timetravel;
 
 /// Generated messages and gRPC stubs for `delta.kernel.server.v1`.
 #[allow(clippy::all, missing_docs)]

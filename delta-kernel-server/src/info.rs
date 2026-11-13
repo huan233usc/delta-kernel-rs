@@ -12,6 +12,7 @@ use delta_kernel::crc::{Crc, DomainMetadataState, SetTransactionState};
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::{Engine, KernelError, KernelResult, Snapshot};
+use sha2::Digest as _;
 
 use crate::errors::root_kernel_error;
 use crate::proto;
@@ -138,6 +139,26 @@ pub struct SegmentId {
 /// Canonical form of a location: the parsed URL, or the raw string if it does not parse.
 pub fn canonical_location(location: &str) -> String {
     url::Url::parse(location).map_or_else(|_| location.to_string(), |u| u.to_string())
+}
+
+impl SegmentId {
+    /// `SnapshotRef.segment_id` and the L2 `seg_id` (SPEC v10.1): hex SHA-256 of the canonical
+    /// identity, serialized as JSON `[version, checkpoint_version, [[location, size]...],
+    /// [[location, size, staged]...]]` with both lists sorted.
+    pub fn digest(&self) -> String {
+        let bytes = serde_json::to_vec(&(
+            self.version,
+            self.checkpoint_version,
+            &self.checkpoint_parts,
+            &self.deltas,
+        ))
+        .expect("tuples of strings and integers always serialize");
+        hex::encode(sha2::Sha256::digest(&bytes))
+    }
+
+    pub fn version(&self) -> i64 {
+        self.version
+    }
 }
 
 pub fn segment_id(seg: &proto::LogSegmentInfo) -> SegmentId {

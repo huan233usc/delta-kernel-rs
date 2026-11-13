@@ -22,7 +22,8 @@ use delta_kernel_server::errors::{codes, to_wire_kernel_error};
 use delta_kernel_server::normalize::normalize_plan_bytes;
 use delta_kernel_server::proto::delta_kernel_service_client::DeltaKernelServiceClient;
 use delta_kernel_server::proto::{
-    self, client_msg, item, op_result, scan_plan_result, server_msg, stats_options,
+    self, item, op_result, scan_plan_result, snapshot_client_msg, snapshot_server_msg,
+    stats_options,
 };
 use delta_kernel_server::service::{KernelService, MAX_MESSAGE_BYTES, bind, serve};
 use prost::Message as _;
@@ -90,7 +91,21 @@ impl TestServer {
     }
 
     pub async fn start_with(config: CacheConfig, test_hooks: bool) -> Self {
-        let core = Core::new("loopback-test".into(), config);
+        Self::start_full("loopback-test", config, None, test_hooks).await
+    }
+
+    /// A server with an L2 tier; `instance_id` distinguishes replicas sharing it.
+    pub async fn start_l2(instance_id: &str, l2: Arc<delta_kernel_server::store::L2>) -> Self {
+        Self::start_full(instance_id, CacheConfig::default(), Some(l2), true).await
+    }
+
+    pub async fn start_full(
+        instance_id: &str,
+        config: CacheConfig,
+        l2: Option<Arc<delta_kernel_server::store::L2>>,
+        test_hooks: bool,
+    ) -> Self {
+        let core = Core::with_l2(instance_id.into(), config, l2);
         let (listener, addr) = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let (tx, rx) = oneshot::channel::<()>();
         let svc = KernelService::new(core.clone(), test_hooks);
@@ -358,7 +373,7 @@ pub fn request(
         at: Some(proto::VersionSpec {
             spec: Some(proto::version_spec::Spec::Version(version)),
         }),
-        plans,
+        prefetch_plans: plans,
         client: Some(client_info()),
         expected_log_segment: None,
         auth: None,
@@ -434,49 +449,35 @@ impl Outcome {
     }
 }
 
-/// Runs one GetSnapshot stream to completion, answering ops per `behavior`.
-pub async fn run(
-    client: &mut Client,
-    req: proto::GetSnapshotRequest,
+/// A server message of any of the three op-carrying RPCs.
+pub enum ServerFrame<R> {
+    Op(proto::OpRequest),
+    Response(R),
+    Error(proto::Error),
+}
+
+/// Answers ops on an open stream per `behavior` until the terminal message.
+async fn drive_ops<CM: Send + 'static, SM: Send + 'static, R>(
+    tx: mpsc::Sender<CM>,
+    mut inbound: tonic::Streaming<SM>,
+    split: impl Fn(SM) -> Option<ServerFrame<R>>,
+    wrap: impl Fn(proto::OpResult) -> CM,
     behavior: Behavior,
-) -> Outcome {
-    let (tx, rx) = mpsc::channel::<proto::ClientMsg>(16);
-    tx.send(proto::ClientMsg {
-        msg: Some(client_msg::Msg::Request(req)),
-    })
-    .await
-    .unwrap();
-    let mut inbound = match client.get_snapshot(ReceiverStream::new(rx)).await {
-        Ok(r) => r.into_inner(),
-        Err(status) => {
-            return Outcome {
-                result: Err(Ended::Status(status)),
-                ops: vec![],
-            };
-        }
-    };
+) -> (Result<R, Ended>, Vec<OpLog>) {
     let mut ops = Vec::new();
     let mut seen = 0usize;
     let behavior = Arc::new(behavior);
     loop {
         let msg = match inbound.message().await {
-            Ok(Some(proto::ServerMsg { msg: Some(m) })) => m,
-            Ok(Some(_)) => continue,
-            Ok(None) => {
-                return Outcome {
-                    result: Err(Ended::EndOfStream),
-                    ops,
-                };
-            }
-            Err(status) => {
-                return Outcome {
-                    result: Err(Ended::Status(status)),
-                    ops,
-                };
-            }
+            Ok(Some(m)) => match split(m) {
+                Some(f) => f,
+                None => continue,
+            },
+            Ok(None) => return (Err(Ended::EndOfStream), ops),
+            Err(status) => return (Err(Ended::Status(status)), ops),
         };
         match msg {
-            server_msg::Msg::Op(op) => {
+            ServerFrame::Op(op) => {
                 seen += 1;
                 if seen == 1
                     && let Some(n) = &behavior.first_op
@@ -489,10 +490,7 @@ pub async fn run(
                 if kill_on_kind || behavior.kill_after_ops.is_some_and(|k| seen > k) {
                     drop(tx);
                     drop(inbound);
-                    return Outcome {
-                        result: Err(Ended::Killed(Box::new(op))),
-                        ops,
-                    };
+                    return (Err(Ended::Killed(Box::new(op))), ops);
                 }
                 if behavior.never_answer {
                     continue;
@@ -505,27 +503,171 @@ pub async fn run(
                     .await
                     .unwrap();
                 ops.push(log);
-                if tx
-                    .send(proto::ClientMsg {
-                        msg: Some(client_msg::Msg::OpResult(result)),
-                    })
-                    .await
-                    .is_err()
-                {
-                    return Outcome {
-                        result: Err(Ended::EndOfStream),
-                        ops,
-                    };
+                if tx.send(wrap(result)).await.is_err() {
+                    return (Err(Ended::EndOfStream), ops);
                 }
             }
-            server_msg::Msg::Response(r) => return Outcome { result: Ok(r), ops },
-            server_msg::Msg::Error(e) => {
-                return Outcome {
-                    result: Err(Ended::Error(e)),
-                    ops,
-                };
-            }
+            ServerFrame::Response(r) => return (Ok(r), ops),
+            ServerFrame::Error(e) => return (Err(Ended::Error(e)), ops),
         }
+    }
+}
+
+/// Runs one GetSnapshot stream to completion, answering ops per `behavior`.
+pub async fn run(
+    client: &mut Client,
+    req: proto::GetSnapshotRequest,
+    behavior: Behavior,
+) -> Outcome {
+    let (tx, rx) = mpsc::channel::<proto::SnapshotClientMsg>(16);
+    tx.send(proto::SnapshotClientMsg {
+        msg: Some(snapshot_client_msg::Msg::Request(req)),
+    })
+    .await
+    .unwrap();
+    let inbound = match client.get_snapshot(ReceiverStream::new(rx)).await {
+        Ok(r) => r.into_inner(),
+        Err(status) => {
+            return Outcome {
+                result: Err(Ended::Status(status)),
+                ops: vec![],
+            };
+        }
+    };
+    let (result, ops) = drive_ops(
+        tx,
+        inbound,
+        |m: proto::SnapshotServerMsg| {
+            m.msg.map(|m| match m {
+                snapshot_server_msg::Msg::Op(op) => ServerFrame::Op(op),
+                snapshot_server_msg::Msg::Response(r) => ServerFrame::Response(r),
+                snapshot_server_msg::Msg::Error(e) => ServerFrame::Error(e),
+            })
+        },
+        |r| proto::SnapshotClientMsg {
+            msg: Some(snapshot_client_msg::Msg::OpResult(r)),
+        },
+        behavior,
+    )
+    .await;
+    Outcome { result, ops }
+}
+
+/// Result of a GetScanPlan or ResolveTimeTravel stream.
+pub struct RpcOutcome<R> {
+    pub result: Result<R, Ended>,
+    pub ops: Vec<OpLog>,
+}
+
+impl<R> RpcOutcome<R> {
+    pub fn ok(self) -> (R, Vec<OpLog>) {
+        match self.result {
+            Ok(r) => (r, self.ops),
+            Err(e) => panic!("expected a response, got {e:?}"),
+        }
+    }
+
+    pub fn err(self) -> proto::Error {
+        match self.result {
+            Err(Ended::Error(e)) => e,
+            Ok(_) => panic!("expected an error, got a response"),
+            Err(other) => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+}
+
+/// Runs one GetScanPlan stream to completion.
+pub async fn run_scan_plan(
+    client: &mut Client,
+    req: proto::GetScanPlanRequest,
+    behavior: Behavior,
+) -> RpcOutcome<proto::GetScanPlanResponse> {
+    use proto::{scan_plan_client_msg as c, scan_plan_server_msg as s};
+    let (tx, rx) = mpsc::channel::<proto::ScanPlanClientMsg>(16);
+    tx.send(proto::ScanPlanClientMsg {
+        msg: Some(c::Msg::Request(req)),
+    })
+    .await
+    .unwrap();
+    let inbound = match client.get_scan_plan(ReceiverStream::new(rx)).await {
+        Ok(r) => r.into_inner(),
+        Err(status) => {
+            return RpcOutcome {
+                result: Err(Ended::Status(status)),
+                ops: vec![],
+            };
+        }
+    };
+    let (result, ops) = drive_ops(
+        tx,
+        inbound,
+        |m: proto::ScanPlanServerMsg| {
+            m.msg.map(|m| match m {
+                s::Msg::Op(op) => ServerFrame::Op(op),
+                s::Msg::Response(r) => ServerFrame::Response(r),
+                s::Msg::Error(e) => ServerFrame::Error(e),
+            })
+        },
+        |r| proto::ScanPlanClientMsg {
+            msg: Some(c::Msg::OpResult(r)),
+        },
+        behavior,
+    )
+    .await;
+    RpcOutcome { result, ops }
+}
+
+/// Runs one ResolveTimeTravel stream to completion.
+pub async fn run_time_travel(
+    client: &mut Client,
+    req: proto::ResolveTimeTravelRequest,
+    behavior: Behavior,
+) -> RpcOutcome<proto::ResolveTimeTravelResponse> {
+    use proto::{time_travel_client_msg as c, time_travel_server_msg as s};
+    let (tx, rx) = mpsc::channel::<proto::TimeTravelClientMsg>(16);
+    tx.send(proto::TimeTravelClientMsg {
+        msg: Some(c::Msg::Request(req)),
+    })
+    .await
+    .unwrap();
+    let inbound = match client.resolve_time_travel(ReceiverStream::new(rx)).await {
+        Ok(r) => r.into_inner(),
+        Err(status) => {
+            return RpcOutcome {
+                result: Err(Ended::Status(status)),
+                ops: vec![],
+            };
+        }
+    };
+    let (result, ops) = drive_ops(
+        tx,
+        inbound,
+        |m: proto::TimeTravelServerMsg| {
+            m.msg.map(|m| match m {
+                s::Msg::Op(op) => ServerFrame::Op(op),
+                s::Msg::Response(r) => ServerFrame::Response(r),
+                s::Msg::Error(e) => ServerFrame::Error(e),
+            })
+        },
+        |r| proto::TimeTravelClientMsg {
+            msg: Some(c::Msg::OpResult(r)),
+        },
+        behavior,
+    )
+    .await;
+    RpcOutcome { result, ops }
+}
+
+/// A GetScanPlan request for `spec` on the snapshot a GetSnapshot response names.
+pub fn plan_request(
+    resp: &proto::GetSnapshotResponse,
+    spec: proto::ScanPlanSpec,
+) -> proto::GetScanPlanRequest {
+    proto::GetScanPlanRequest {
+        r#ref: resp.r#ref.clone(),
+        spec: Some(spec),
+        client: Some(client_info()),
+        auth: None,
     }
 }
 
@@ -933,9 +1075,9 @@ pub fn assert_parity_with(
         &local_info,
         "SnapshotInfo differs from in-process computation"
     );
-    assert_eq!(resp.plans.len(), specs.len());
+    assert_eq!(resp.prefetched_plans.len(), specs.len());
     let mut total_rows = 0;
-    for (spec, remote) in specs.iter().zip(&resp.plans) {
+    for (spec, remote) in specs.iter().zip(&resp.prefetched_plans) {
         let local_plan = local_plan(&local, spec).unwrap();
         match (plan_bytes(remote), local_plan) {
             (None, None) => {}
@@ -1201,4 +1343,161 @@ pub fn with_auth(mut req: proto::GetSnapshotRequest, token: &str) -> proto::GetS
         bearer_token: token.into(),
     });
     req
+}
+
+/// The [`SnapshotStore`] contract every tier implements (L1, MemoryStore, Redis).
+pub async fn store_contract<S: delta_kernel_server::store::SnapshotStore>(
+    store: &S,
+    info: &proto::SnapshotInfo,
+    payload: S::Payload,
+) {
+    use delta_kernel_server::store::{LatestRecord, PlanPut, StoredSnapshot, now_ms};
+    let table = delta_kernel_server::cache::l2_table_key("", &info.table_root);
+    let seg = delta_kernel_server::info::segment_id(info.log_segment.as_ref().unwrap()).digest();
+    let tier = store.tier();
+    assert!(
+        store.get_snapshot(&table, &seg).await.unwrap().is_none(),
+        "{tier}"
+    );
+    let snap = StoredSnapshot {
+        seg_id: seg.clone(),
+        version: 1,
+        info: info.clone(),
+        payload: Some(payload),
+        built_at_ms: now_ms(),
+        confirmed_at_ms: now_ms(),
+    };
+    store.put_snapshot(&table, &snap).await.unwrap();
+    let got = store.get_snapshot(&table, &seg).await.unwrap().expect(tier);
+    assert_eq!(
+        (got.version, &got.info, &got.seg_id),
+        (1, info, &seg),
+        "{tier}"
+    );
+    assert!(got.payload.is_some(), "{tier}");
+    let at = store
+        .snapshot_at_version(&table, 1)
+        .await
+        .unwrap()
+        .expect(tier);
+    assert_eq!(at.seg_id, seg, "{tier}");
+    assert!(
+        store
+            .snapshot_at_version(&table, 2)
+            .await
+            .unwrap()
+            .is_none(),
+        "{tier}"
+    );
+    store
+        .confirm_snapshot(&table, &seg, now_ms() + 5)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_snapshot(&table, &seg)
+            .await
+            .unwrap()
+            .unwrap()
+            .confirmed_at_ms
+            >= got.confirmed_at_ms,
+        "{tier}"
+    );
+
+    let rec = LatestRecord {
+        seg_id: seg.clone(),
+        version: 1,
+        confirmed_at_ms: now_ms(),
+        tail_id: String::new(),
+    };
+    store
+        .put_latest(&table, &rec, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let latest = store.get_latest(&table).await.unwrap().expect(tier);
+    assert_eq!((latest.seg_id, latest.version), (seg.clone(), 1), "{tier}");
+
+    let plan = proto::ScanPlanResult {
+        result: Some(proto::scan_plan_result::Result::Plan(vec![7u8; 1000])),
+        cache_hit: false,
+    };
+    assert_eq!(
+        store.put_plan(&seg, "spec-a", &plan).await.unwrap(),
+        PlanPut::Stored,
+        "{tier}"
+    );
+    assert_eq!(
+        store
+            .get_plan(&seg, "spec-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .result,
+        plan.result,
+        "{tier}"
+    );
+    assert!(
+        store.get_plan(&seg, "spec-b").await.unwrap().is_none(),
+        "{tier}"
+    );
+    let empty = proto::ScanPlanResult {
+        result: Some(proto::scan_plan_result::Result::Empty(
+            proto::StaticallyEmpty {},
+        )),
+        cache_hit: false,
+    };
+    store.put_plan(&seg, "spec-e", &empty).await.unwrap();
+    assert_eq!(
+        store
+            .get_plan(&seg, "spec-e")
+            .await
+            .unwrap()
+            .unwrap()
+            .result,
+        empty.result,
+        "{tier}"
+    );
+
+    let ttl = Duration::from_secs(30);
+    assert!(
+        store.try_lock(&table, "v1", "me:1", ttl).await.unwrap(),
+        "{tier}"
+    );
+    assert!(
+        !store.try_lock(&table, "v1", "other:2", ttl).await.unwrap(),
+        "{tier}"
+    );
+    store.unlock(&table, "v1", "other:2").await.unwrap();
+    assert!(
+        !store.try_lock(&table, "v1", "other:2", ttl).await.unwrap(),
+        "{tier}: not owner"
+    );
+    store.unlock(&table, "v1", "me:1").await.unwrap();
+    assert!(
+        store.try_lock(&table, "v1", "other:2", ttl).await.unwrap(),
+        "{tier}"
+    );
+    store.unlock(&table, "v1", "other:2").await.unwrap();
+
+    let th = delta_kernel_server::creds::token_hash("tok");
+    assert!(
+        store.get_authz(&th, &table).await.unwrap().is_none(),
+        "{tier}"
+    );
+    store
+        .put_authz(&th, &table, now_ms() + 60_000)
+        .await
+        .unwrap();
+    assert!(
+        store.get_authz(&th, &table).await.unwrap().is_some(),
+        "{tier}"
+    );
+    store
+        .put_authz(&th, "other-table", now_ms() - 1)
+        .await
+        .unwrap();
+    assert!(
+        store.get_authz(&th, "other-table").await.unwrap().is_none(),
+        "{tier}: expired"
+    );
 }
