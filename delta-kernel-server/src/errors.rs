@@ -143,6 +143,10 @@ pub fn kernel_code_name(code: i32) -> &'static str {
     }
 }
 
+/// Message prefix of the `UNSUPPORTED` error for a catalog-managed table resolved without catalog
+/// state (kernel `MaxCatalogVersion`).
+pub const CATALOG_STATE_REQUIRED_PREFIX: &str = "CATALOG_STATE_REQUIRED: ";
+
 /// Message prefix of an `OP_FAILED` error (client-reported op failure).
 pub const OP_FAILED_PREFIX: &str = "OP_FAILED: client op failed";
 /// Message prefix of the `UNAVAILABLE` error for a failed server-side op (SPEC v9.1).
@@ -312,6 +316,12 @@ pub fn classify_kernel_error(
     }
     match root {
         KernelError::Unsupported(_) => ServerError::new(Code::Unsupported, e.to_string()),
+        // A catalog-managed table resolved without catalog state (no `catalog_latest`): the
+        // request cannot be answered by the server; the client must use its catalog path.
+        KernelError::MaxCatalogVersion(_) => ServerError::new(
+            Code::Unsupported,
+            format!("{CATALOG_STATE_REQUIRED_PREFIX}{e}"),
+        ),
         KernelError::InvalidProtocol(_) => {
             ServerError::new(Code::ProtocolUnsupported, e.to_string())
         }

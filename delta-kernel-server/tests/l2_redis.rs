@@ -1,5 +1,7 @@
 //! SPEC v10.3 L2 against a real Redis: `docker run redis:7` on a random port. Every test skips
-//! with a message when docker (or the image) is unavailable.
+//! with a message when docker (or the image) is unavailable, unless `DKS_REQUIRE_REDIS_TESTS=1`,
+//! which turns the skip into a failure (gates run with it set, so these tests cannot pass
+//! vacuously).
 
 mod common;
 
@@ -22,6 +24,15 @@ struct Redis {
     url: String,
 }
 
+/// Skips (returns `None`) or, with `DKS_REQUIRE_REDIS_TESTS=1`, fails.
+fn skip<T>(why: String) -> Option<T> {
+    if std::env::var("DKS_REQUIRE_REDIS_TESTS").is_ok_and(|v| v == "1") {
+        panic!("DKS_REQUIRE_REDIS_TESTS=1 but {why}");
+    }
+    eprintln!("SKIP: {why}");
+    None
+}
+
 impl Redis {
     fn start() -> Option<Self> {
         let docker_ok = Command::new("docker")
@@ -29,19 +40,20 @@ impl Redis {
             .output()
             .is_ok_and(|o| o.status.success());
         if !docker_ok {
-            eprintln!("SKIP: docker is unavailable; L2 Redis tests need `docker run redis:7`");
-            return None;
+            return skip("docker is unavailable; L2 Redis tests need `docker run redis:7`".into());
         }
-        let out = Command::new("docker")
+        let out = match Command::new("docker")
             .args(["run", "-d", "--rm", "-p", "127.0.0.1::6379", "redis:7"])
             .output()
-            .ok()?;
+        {
+            Ok(o) => o,
+            Err(e) => return skip(format!("cannot run docker: {e}")),
+        };
         if !out.status.success() {
-            eprintln!(
-                "SKIP: cannot start redis:7 ({}); L2 Redis tests need the image",
+            return skip(format!(
+                "cannot start redis:7 ({}); L2 Redis tests need the image",
                 String::from_utf8_lossy(&out.stderr).trim()
-            );
-            return None;
+            ));
         }
         let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let port = Command::new("docker")
@@ -111,6 +123,10 @@ async fn redis_store_contract_and_plan_size_cap() {
     let info =
         delta_kernel_server::info::compute_snapshot_info(&snapshot, &local_engine()).unwrap();
     store_contract(&store, &info, b"hint-bytes".to_vec()).await;
+    // Concurrent writers on separate connections, as replicas would be.
+    let w1 = redis.store().await;
+    let w2 = redis.store().await;
+    latest_contract(&store, &[&store, &w1, &w2]).await;
     // > 4 MiB after compression (random bytes do not compress): not written.
     let mut big = vec![0u8; MAX_L2_PLAN_BYTES + 1024];
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;

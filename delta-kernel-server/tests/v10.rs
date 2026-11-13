@@ -208,12 +208,26 @@ async fn scan_plan_stale_ref() {
         .ok();
     assert!(seg(&snap).checkpoint_version.is_none());
 
-    let mut tampered = plan_request(&snap, spec_json());
-    tampered.r#ref.as_mut().unwrap().segment_id = "0".repeat(64);
-    let err = run_scan_plan(&mut c, tampered, Behavior::default())
-        .await
-        .err();
-    assert_eq!(err.code, Code::StaleRef as i32, "{err:?}");
+    let good = snap.r#ref.as_ref().unwrap().segment_id.clone();
+    for bad in [
+        String::new(),
+        "0".repeat(64),
+        good[..63].to_string(),
+        format!("{good}0"),
+        good.to_ascii_uppercase(),
+        format!("{}g", &good[..63]),
+    ] {
+        let mut tampered = plan_request(&snap, spec_json());
+        tampered.r#ref.as_mut().unwrap().segment_id = bad.clone();
+        let err = run_scan_plan(&mut c, tampered, Behavior::default())
+            .await
+            .err();
+        assert_eq!(
+            err.code,
+            Code::StaleRef as i32,
+            "segment_id {bad:?}: {err:?}"
+        );
+    }
 
     // A checkpoint at v1 changes what v1 resolves to; the cached instance is dropped.
     write_checkpoint(&fx, 1);
@@ -688,6 +702,38 @@ async fn resolve_time_travel_catalog_managed_staged() {
     );
 }
 
+/// v10 review B2: without catalog_latest, a catalog-managed table must not be answered from the
+/// published filesystem latest (here v1, while the catalog's latest is the staged v2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolve_time_travel_catalog_managed_without_catalog_latest_is_refused() {
+    use proto::resolve_time_travel_request::Target;
+    let fx = cm_fixture();
+    cm_publish(&fx, 1);
+    cm_stage(&fx, 2);
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    for target in [
+        Target::TimestampMs(CM_TS0 + 2000),
+        Target::TimestampMs(CM_TS0 + 1000),
+        Target::CheckVersion(1),
+    ] {
+        let err = run_time_travel(
+            &mut c,
+            tt_request(&fx, target, true, false, true),
+            Behavior::default(),
+        )
+        .await
+        .err();
+        assert_eq!(err.code, Code::Unsupported as i32, "{target:?}: {err:?}");
+        assert!(
+            err.message.starts_with("LOG_HISTORY: "),
+            "{target:?}: {err:?}"
+        );
+        assert!(err.message.contains("catalog_latest"), "{err:?}");
+    }
+    assert!(server.core.cached_instances_per_table().is_empty());
+}
+
 // ------------------------------------------------------------------------------------------------
 // Snapshot hints: round trip, plan parity on rebuilt snapshots, measured sizes
 // ------------------------------------------------------------------------------------------------
@@ -1012,6 +1058,7 @@ async fn snapshot_store_contract_l1_and_memory() {
         delta_kernel_server::info::compute_snapshot_info(&snapshot, &local_engine()).unwrap();
     let mem = MemoryStore::new(DEFAULT_L2_TTL);
     store_contract(&mem, &info, b"hint-bytes".to_vec()).await;
+    latest_contract(&mem, &[&mem]).await;
     let server = TestServer::start().await;
     store_contract(&server.core.l1, &info, snapshot.clone()).await;
 }

@@ -1414,7 +1414,7 @@ pub async fn store_contract<S: delta_kernel_server::store::SnapshotStore>(
         .put_latest(&table, &rec, Duration::from_secs(1))
         .await
         .unwrap();
-    let latest = store.get_latest(&table).await.unwrap().expect(tier);
+    let latest = store.get_latest(&table, "").await.unwrap().expect(tier);
     assert_eq!((latest.seg_id, latest.version), (seg.clone(), 1), "{tier}");
 
     let plan = proto::ScanPlanResult {
@@ -1499,5 +1499,104 @@ pub async fn store_contract<S: delta_kernel_server::store::SnapshotStore>(
     assert!(
         store.get_authz(&th, "other-table").await.unwrap().is_none(),
         "{tier}: expired"
+    );
+}
+
+/// L2 `latest` pointer contract (BLOCKING-1 of the v10 review): monotonic per target, path and
+/// catalog-tail pointers independent, and concurrent writers converge on the highest version.
+pub async fn latest_contract(
+    store: &delta_kernel_server::store::L2,
+    writers: &[&delta_kernel_server::store::L2],
+) {
+    use delta_kernel_server::store::{LatestRecord, now_ms};
+    let tier = store.tier();
+    let table = format!("latest-contract-{}", now_ms());
+    let rec = |seg: &str, version: i64, at: i64, tail: &str| LatestRecord {
+        seg_id: seg.into(),
+        version,
+        confirmed_at_ms: at,
+        tail_id: tail.into(),
+    };
+    let ttl = Duration::from_secs(60);
+    let t0 = now_ms();
+    let get = |tail: &'static str| {
+        let table = table.clone();
+        async move { store.get_latest(&table, tail).await.unwrap() }
+    };
+    store
+        .put_latest(&table, &rec("s2", 2, t0, ""), ttl)
+        .await
+        .unwrap();
+    // An older version confirmed later (a slow replica's listing) must not win.
+    store
+        .put_latest(&table, &rec("s1", 1, t0 + 1000, ""), ttl)
+        .await
+        .unwrap();
+    assert_eq!(
+        get("").await.unwrap(),
+        rec("s2", 2, t0, ""),
+        "{tier}: never backwards"
+    );
+    // Same version: only a later confirmation replaces.
+    store
+        .put_latest(&table, &rec("s2", 2, t0 - 5, ""), ttl)
+        .await
+        .unwrap();
+    assert_eq!(
+        get("").await.unwrap().confirmed_at_ms,
+        t0,
+        "{tier}: older confirmation"
+    );
+    store
+        .put_latest(&table, &rec("s2b", 2, t0 + 7, ""), ttl)
+        .await
+        .unwrap();
+    assert_eq!(
+        get("").await.unwrap(),
+        rec("s2b", 2, t0 + 7, ""),
+        "{tier}: renewal"
+    );
+    store
+        .put_latest(&table, &rec("s3", 3, t0 - 100, ""), ttl)
+        .await
+        .unwrap();
+    assert_eq!(get("").await.unwrap().version, 3, "{tier}: higher version");
+    // A catalog tail has its own pointer: it neither replaces nor is replaced by path latest.
+    store
+        .put_latest(&table, &rec("c1", 1, t0 + 9999, "tailA"), ttl)
+        .await
+        .unwrap();
+    assert_eq!(
+        get("").await.unwrap().version,
+        3,
+        "{tier}: path pointer untouched"
+    );
+    assert_eq!(get("tailA").await.unwrap().seg_id, "c1", "{tier}");
+    assert!(get("tailB").await.is_none(), "{tier}");
+
+    // Concurrent writers in random order: the highest version (latest confirmation) wins.
+    let table2 = format!("{table}-concurrent");
+    let mut order: Vec<i64> = (0..40).collect();
+    let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+    for i in (1..order.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        order.swap(i, (x as usize) % (i + 1));
+    }
+    let writes = order.iter().enumerate().map(|(n, &i)| {
+        let table2 = table2.clone();
+        // Versions 0..9, four confirmations each; confirmations increase with i. Writers take
+        // turns, so on Redis the writes come from separate connections.
+        let r = rec(&format!("s{i}"), i / 4, t0 + i, "");
+        let w = writers[n % writers.len()];
+        async move { w.put_latest(&table2, &r, ttl).await.unwrap() }
+    });
+    futures::future::join_all(writes).await;
+    let got = store.get_latest(&table2, "").await.unwrap().unwrap();
+    assert_eq!(
+        (got.version, got.confirmed_at_ms),
+        (9, t0 + 39),
+        "{tier}: {got:?}"
     );
 }

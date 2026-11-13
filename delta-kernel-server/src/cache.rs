@@ -31,8 +31,8 @@ use crate::creds::{
     CredCheck, CredentialProvider, StorageCredential, StorageOverrides, is_uc_uuid,
 };
 use crate::errors::{
-    LOCAL_IO_FAILED_PREFIX, OP_FAILED_PREFIX, ServerError, classify_build_error,
-    classify_kernel_error,
+    CATALOG_STATE_REQUIRED_PREFIX, LOCAL_IO_FAILED_PREFIX, OP_FAILED_PREFIX, ServerError,
+    classify_build_error, classify_kernel_error,
 };
 use crate::executor::{LocalCtx, OpChannel, RemotePlanExecutor, StreamPort};
 use crate::info::{
@@ -540,14 +540,15 @@ impl L1Cache {
         inserted
     }
 
-    /// Records `instance` as the table's confirmed latest as of `at`, unless a newer
-    /// confirmation already exists.
+    /// Records `instance` as the table's confirmed latest as of `at`. Monotonic like the L2
+    /// pointer ([`crate::store::latest_replaces`]): never a lower version, and at the same version
+    /// only a later confirmation.
     fn confirm_latest(&self, key: &TableKey, instance: Arc<Instance>, at: Instant) {
         let mut st = self.state.lock().unwrap();
-        let newer = st
-            .latest
-            .get(key)
-            .is_some_and(|e| e.confirmed_at > at && e.instance.version() >= instance.version());
+        let newer = st.latest.get(key).is_some_and(|e| {
+            e.instance.version() > instance.version()
+                || (e.instance.version() == instance.version() && e.confirmed_at > at)
+        });
         if !newer {
             instance.confirmed.store(self.tick(), Ordering::Relaxed);
             st.latest.insert(
@@ -683,12 +684,20 @@ impl SnapshotStore for L1Cache {
         Ok(())
     }
 
-    async fn get_latest(&self, table: &str) -> StoreResult<Option<LatestRecord>> {
+    async fn get_latest(&self, table: &str, tail_id: &str) -> StoreResult<Option<LatestRecord>> {
         let mut st = self.state.lock().unwrap();
         let key = st
             .latest
             .iter()
-            .find(|(_, e)| e.instance.l2_table == table)
+            .find(|(_, e)| {
+                e.instance.l2_table == table
+                    && e.instance
+                        .catalog_tail
+                        .as_ref()
+                        .map(tail_digest)
+                        .unwrap_or_default()
+                        == tail_id
+            })
             .map(|(k, _)| k.clone());
         Ok(key.and_then(|k| {
             st.live_latest(&k).map(|e| LatestRecord {
@@ -873,6 +882,18 @@ fn parse_target(at: Option<&proto::VersionSpec>) -> Result<Target, ServerError> 
             max_staleness: Duration::ZERO,
         },
     })
+}
+
+/// ResolveTimeTravel on a catalog-managed table without `catalog_latest` (v10 review B2).
+fn catalog_state_required() -> ServerError {
+    ServerError::new(
+        Code::Unsupported,
+        format!(
+            "{}catalog-managed table: ResolveTimeTravel needs catalog_latest; the published \
+             filesystem latest is not the table's latest",
+            timetravel::LOG_HISTORY_PREFIX
+        ),
+    )
 }
 
 fn stale_ref(message: impl Into<String>) -> ServerError {
@@ -1134,7 +1155,16 @@ impl Core {
             .as_ref()
             .ok_or_else(|| ServerError::internal("SnapshotRef.log_segment is required"))?;
         let wanted = segment_id(seg);
-        if !r.segment_id.is_empty() && r.segment_id != wanted.digest() {
+        let well_formed = r.segment_id.len() == 64
+            && r.segment_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !well_formed {
+            return Err(stale_ref(
+                "SnapshotRef.segment_id must be 64 lowercase hex digits (sha256)",
+            ));
+        }
+        if r.segment_id != wanted.digest() {
             return Err(stale_ref(
                 "SnapshotRef.segment_id does not match its log_segment",
             ));
@@ -1215,9 +1245,29 @@ impl Core {
                 None,
             ),
         };
-        let (instance, _) = self
+        let path_based = req.catalog_latest.is_none();
+        let resolved = self
             .resolve_instance(&key, &location, &target, None, port, &io)
-            .await?;
+            .await;
+        // Without catalog_latest the server can only see the published filesystem latest. For a
+        // catalog-managed table that is not the table's latest: refuse (the client falls back to
+        // its catalog path) whether kernel rejected the build or a cached instance exists.
+        let instance = match resolved {
+            Ok((instance, _))
+                if path_based && instance.snapshot.table_configuration().is_catalog_managed() =>
+            {
+                return Err(catalog_state_required());
+            }
+            Ok((instance, _)) => instance,
+            Err(e)
+                if path_based
+                    && e.code == Code::Unsupported
+                    && e.message.starts_with(CATALOG_STATE_REQUIRED_PREFIX) =>
+            {
+                return Err(catalog_state_required());
+            }
+            Err(e) => return Err(e),
+        };
         let resolve_us = started.elapsed().as_micros() as i64;
 
         let io = io.get().await?;
@@ -1445,7 +1495,7 @@ impl Core {
                     });
                 }
                 Target::Latest { max_staleness } => {
-                    let Some(rec) = l2.get_latest(table).await? else {
+                    let Some(rec) = l2.get_latest(table, "").await? else {
                         return Ok(());
                     };
                     out.latest_seen = Some(rec.clone());
@@ -1475,7 +1525,7 @@ impl Core {
                     tail_has_staged: false,
                     ..
                 } => {
-                    let Some(rec) = l2.get_latest(table).await? else {
+                    let Some(rec) = l2.get_latest(table, &tail_digest(tail_id)).await? else {
                         return Ok(());
                     };
                     out.latest_seen = Some(rec.clone());

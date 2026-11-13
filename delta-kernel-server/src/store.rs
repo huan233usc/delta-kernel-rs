@@ -15,7 +15,7 @@
 //! |---|---|---|---|
 //! | `snap:{table_key}:{seg_id}` | hash | `info`, `seg`, `hint`, `version`, `built_at`, `confirmed_at` | `ttl` (6h) |
 //! | `ver:{table_key}` | zset | member `seg_id`, score `version` | `ttl` |
-//! | `latest:{table_key}` | hash | `seg_id`, `version`, `confirmed_at_ms`, `tail_id` | 2 × staleness, ≥ 60s |
+//! | `latest:{table_key}` (path-based) / `latest:{table_key}:{tail_id}` (`catalog_latest`) | hash | `seg_id`, `version`, `confirmed_at_ms`, `tail_id`; monotonic ([`latest_replaces`]) | 2 × staleness, ≥ 60s |
 //! | `plan:{seg_id}:{spec_hash}` | string | zstd(plan bytes) \| `EMPTY` \| `UNSUPPORTED:<reason>` | `ttl` |
 //! | `lock:{table_key}:{target}` | string (`SET NX PX`) | `{replica}:{job}` | build deadline |
 //! | `authz:{sha256(token)}:{table_key}` | string | authorized-until (ms) | until − now |
@@ -79,6 +79,16 @@ pub enum PlanPut {
     TooLarge(usize),
 }
 
+/// Whether `new` may replace `cur` as a table's latest pointer of one target (path-based, or one
+/// catalog tail): a higher version, or the same version and tail confirmed later. A slower writer
+/// holding an older listing never moves the pointer back.
+pub fn latest_replaces(cur: &LatestRecord, new: &LatestRecord) -> bool {
+    new.version > cur.version
+        || (new.version == cur.version
+            && new.tail_id == cur.tail_id
+            && new.confirmed_at_ms > cur.confirmed_at_ms)
+}
+
 /// `latest` TTL for a staleness bound: 2 × staleness, at least [`MIN_LATEST_TTL`].
 pub fn latest_ttl(staleness: Duration) -> Duration {
     (staleness * 2).max(MIN_LATEST_TTL)
@@ -109,7 +119,9 @@ pub trait SnapshotStore: Send + Sync {
     ) -> StoreResult<()>;
     /// Re-confirms an existing entry (a fresh build of the same files).
     async fn confirm_snapshot(&self, table: &str, seg_id: &str, at_ms: i64) -> StoreResult<()>;
-    async fn get_latest(&self, table: &str) -> StoreResult<Option<LatestRecord>>;
+    /// The latest pointer of one target: path-based (`tail_id` empty) or one catalog tail.
+    async fn get_latest(&self, table: &str, tail_id: &str) -> StoreResult<Option<LatestRecord>>;
+    /// Monotonic per target: replaces the stored pointer only if [`latest_replaces`].
     async fn put_latest(
         &self,
         table: &str,
@@ -200,7 +212,7 @@ impl<T> Expiring<T> {
 #[derive(Default)]
 struct MemoryState {
     snaps: HashMap<(String, String), Expiring<StoredSnapshot<Vec<u8>>>>,
-    latest: HashMap<String, Expiring<LatestRecord>>,
+    latest: HashMap<(String, String), Expiring<LatestRecord>>,
     plans: HashMap<(String, String), Expiring<Vec<u8>>>,
     locks: HashMap<(String, String), Expiring<String>>,
     authz: HashMap<(String, String), Expiring<i64>>,
@@ -284,11 +296,11 @@ impl SnapshotStore for MemoryStore {
         Ok(())
     }
 
-    async fn get_latest(&self, table: &str) -> StoreResult<Option<LatestRecord>> {
+    async fn get_latest(&self, table: &str, tail_id: &str) -> StoreResult<Option<LatestRecord>> {
         let st = self.state.lock().unwrap();
         Ok(st
             .latest
-            .get(table)
+            .get(&(table.to_string(), tail_id.to_string()))
             .filter(|e| e.live())
             .map(|e| e.value.clone()))
     }
@@ -299,13 +311,21 @@ impl SnapshotStore for MemoryStore {
         rec: &LatestRecord,
         staleness: Duration,
     ) -> StoreResult<()> {
-        self.state.lock().unwrap().latest.insert(
-            table.to_string(),
-            Expiring {
-                value: rec.clone(),
-                expires: Instant::now() + latest_ttl(staleness),
-            },
-        );
+        let mut st = self.state.lock().unwrap();
+        let key = (table.to_string(), rec.tail_id.clone());
+        let replace = match st.latest.get(&key).filter(|e| e.live()) {
+            Some(cur) => latest_replaces(&cur.value, rec),
+            None => true,
+        };
+        if replace {
+            st.latest.insert(
+                key,
+                Expiring {
+                    value: rec.clone(),
+                    expires: Instant::now() + latest_ttl(staleness),
+                },
+            );
+        }
         Ok(())
     }
 
@@ -429,6 +449,15 @@ impl RedisStore {
 
     pub fn key(&self, parts: &[&str]) -> String {
         format!("{}{}", self.prefix, parts.join(":"))
+    }
+
+    /// `latest:{table}` for path-based latest, `latest:{table}:{tail_id}` per catalog tail.
+    fn latest_key(&self, table: &str, tail_id: &str) -> String {
+        if tail_id.is_empty() {
+            self.key(&["latest", table])
+        } else {
+            self.key(&["latest", table, tail_id])
+        }
     }
 
     fn ttl_ms(&self) -> i64 {
@@ -565,10 +594,10 @@ impl SnapshotStore for RedisStore {
             .map_err(rerr)
     }
 
-    async fn get_latest(&self, table: &str) -> StoreResult<Option<LatestRecord>> {
+    async fn get_latest(&self, table: &str, tail_id: &str) -> StoreResult<Option<LatestRecord>> {
         let mut conn = self.conn.clone();
         let fields: HashMap<String, String> = conn
-            .hgetall(self.key(&["latest", table]))
+            .hgetall(self.latest_key(table, tail_id))
             .await
             .map_err(rerr)?;
         if fields.is_empty() {
@@ -593,20 +622,29 @@ impl SnapshotStore for RedisStore {
         rec: &LatestRecord,
         staleness: Duration,
     ) -> StoreResult<()> {
-        let key = self.key(&["latest", table]);
-        // Never move a newer confirmation backwards (two replicas racing).
+        // Compare-and-set in one script (atomic in Redis), with the rule of `latest_replaces`.
         let script = redis::Script::new(
-            r"local cur = tonumber(redis.call('HGET', KEYS[1], 'confirmed_at_ms') or '-1')
-              if tonumber(ARGV[3]) >= cur then
+            r"local v = redis.call('HGET', KEYS[1], 'version')
+              local replace = true
+              if v then
+                local cur_v = tonumber(v)
+                local new_v = tonumber(ARGV[2])
+                local cur_c = tonumber(redis.call('HGET', KEYS[1], 'confirmed_at_ms') or '-1')
+                local cur_t = redis.call('HGET', KEYS[1], 'tail_id') or ''
+                replace = new_v > cur_v
+                  or (new_v == cur_v and ARGV[4] == cur_t and tonumber(ARGV[3]) > cur_c)
+              end
+              if replace then
                 redis.call('HSET', KEYS[1], 'seg_id', ARGV[1], 'version', ARGV[2],
                            'confirmed_at_ms', ARGV[3], 'tail_id', ARGV[4])
                 redis.call('PEXPIRE', KEYS[1], ARGV[5])
+                return 1
               end
-              return 1",
+              return 0",
         );
         let mut conn = self.conn.clone();
         script
-            .key(key)
+            .key(self.latest_key(table, &rec.tail_id))
             .arg(&rec.seg_id)
             .arg(rec.version)
             .arg(rec.confirmed_at_ms)

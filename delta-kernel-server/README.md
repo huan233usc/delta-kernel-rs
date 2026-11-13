@@ -212,7 +212,8 @@ docker run --rm --name dks --network dks -p 50051:50051 \
 3. **Check the segment.** The resolved segment must equal the ref's, otherwise `STALE_REF = 10`
    (non-retryable). For example, a checkpoint written at that version since the ref was taken
    changes the segment. The client calls GetSnapshot again and retries once.
-   - A `segment_id` that does not match its own `log_segment` is also `STALE_REF`.
+   - A `segment_id` that is not 64 lowercase hex digits (including empty), or that does not match
+     its own `log_segment`, is also `STALE_REF`.
 4. **Staged refs.** Staged-tail instances are never cached. A ref whose segment has staged deltas
    is rebuilt as `catalog_latest(max_catalog_version = ref.version, log_tail = the staged deltas)`
    on every call; neither the instance nor its plans are cached or written to L2.
@@ -247,6 +248,11 @@ Failures:
 - **No answer** (timestamp out of range, no recreatable commit, timestamp after latest without
   `can_return_last_commit`): `UNSUPPORTED`, message `LOG_HISTORY: <kernel or JNR text>`. The
   client falls back to JNR, which raises the user-facing exception.
+- **Catalog-managed table without `catalog_latest`**: `UNSUPPORTED`, `LOG_HISTORY: ` prefix. The
+  published filesystem latest is not the table's latest, so the server never answers from it.
+  Kernel rejects that build (`MaxCatalogVersion`, reported as `UNSUPPORTED` with prefix
+  `CATALOG_STATE_REQUIRED: ` on every RPC). A catalog-managed instance resolved without catalog
+  state is refused as well.
 - **Op failures** classify as for builds.
 
 ### Two-tier cache (SPEC v10.3)
@@ -281,7 +287,7 @@ sha256(canonical location).
 |---|---|---|---|
 | `snap:{table_key}:{seg_id}` | hash | `info` (SnapshotInfo), `seg` (LogSegmentInfo), `hint`, `version`, `built_at`, `confirmed_at` | `--l2-ttl-secs` |
 | `ver:{table_key}` | zset | member `seg_id`, score `version`; without an expected segment the entry with the greatest `confirmed_at` wins (v8 rule) | same |
-| `latest:{table_key}` | hash | `seg_id`, `version`, `confirmed_at_ms`, `tail_id` (empty for path-based; hex digest of the canonical tail for `catalog_latest`); never moves back | 2 × staleness, ≥ 60 s |
+| `latest:{table_key}` (path-based) / `latest:{table_key}:{tail_id}` (`catalog_latest`, `tail_id` = hex digest of the canonical tail) | hash | `seg_id`, `version`, `confirmed_at_ms`, `tail_id`. Monotonic per key (compare-and-set script): replaced only by a higher version, or the same version and tail with a later confirmation | 2 × staleness, ≥ 60 s |
 | `plan:{seg_id}:{spec_hash}` | string | zstd(plan bytes) \| `EMPTY` \| `UNSUPPORTED:<reason>` | `--l2-ttl-secs` |
 | `lock:{table_key}:{target}` | string | `{instance_id}:{job}`; target `v{version}` \| `latest` \| `c{mcv}:{tail digest}`; released only by its owner | `--l2-build-deadline-ms` |
 | `authz:{sha256(token)}:{table_key}` | string | authorized-until (ms) | until − now |
@@ -432,7 +438,7 @@ SF1 / HiFi sizes are not measured here: they need the P1-b client runs.
 
 ```bash
 export CARGO_TARGET_DIR=/ephemeral/cargo-out/dks-server
-cargo +1.95.0 test -p delta-kernel-server
+DKS_REQUIRE_REDIS_TESTS=1 cargo +1.95.0 test -p delta-kernel-server   # needs docker
 cargo +1.95.0 clippy -p delta-kernel-server --all-targets -- -D warnings
 cargo +nightly fmt -- --check   # the repo's rustfmt.toml uses nightly-only options
 ```
@@ -468,8 +474,9 @@ each store: the trap is never contacted, and only vended credentials appear on t
   - the `SnapshotStore` contract on L1 and memory;
   - `authz` shared across replicas.
 
-`tests/l2_redis.rs` runs against `docker run redis:7` on a random port and skips with a message if
-docker is unavailable:
+`tests/l2_redis.rs` runs against `docker run redis:7` on a random port. It skips with a message if
+docker is unavailable, unless `DKS_REQUIRE_REDIS_TESTS=1`, which turns the skip into a failure. The
+gates run with it set:
 - the contract and the 4 MiB cap;
 - the exact key schema and TTLs written by a build;
 - two server processes sharing L2 with one build;
