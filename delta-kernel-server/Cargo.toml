@@ -1,0 +1,76 @@
+[package]
+name = "delta-kernel-server"
+description = "POC: long-running gRPC service that builds delta_kernel snapshots and metadata scan plans while the client performs all storage IO."
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+version.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "delta_kernel_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "delta-kernel-server"
+path = "src/main.rs"
+
+[dependencies]
+# Kernel feature set matches the DBR `delta_kernel_ffi` build (see README "Kernel features").
+# `delta-kernel-unity-catalog` is an ffi-crate feature whose only effect on kernel is
+# `internal-api`; it is reported in `kernel_features` but adds no dependency here.
+delta_kernel = { path = "../kernel", default-features = false, features = [
+  "arrow-60",
+  "declarative-plans",
+  "default-engine-base",
+  "adaptive-metadata-in-dev",
+  "geo-type-in-dev",
+  "internal-api",
+] }
+async-trait = "0.1"
+# v10 L2 (Redis) snapshot store; plans are zstd-compressed there.
+redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+futures = "0.3"
+zstd = "0.13"
+serde = { version = "1", features = ["derive"] }
+bytes = "1.10"
+# v9 hybrid IO: FileListing / ReadBytes / HeadFile / ParquetFooter run on the server through the
+# default engine's object_store handlers.
+delta_kernel_default_engine = { path = "../default-engine", default-features = false, features = ["arrow-60", "rustls"] }
+hex = "0.4"
+# UC temporary-credential calls.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+sha2 = "0.10"
+# Bundled root CAs for UC and object-store TLS: the server must run without a system trust store.
+webpki-root-certs = "1"
+clap = { version = "4.5", features = ["derive"] }
+prost = "0.13"
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+serde_json = "1"
+tonic = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+url = "2"
+
+[build-dependencies]
+prost-build = "0.13"
+tonic-build = "0.12"
+
+[dev-dependencies]
+# `test-utils` exposes the in-process `SyncPlanExecutor` the loopback test client runs ops with.
+delta_kernel = { path = "../kernel", default-features = false, features = [
+  "arrow-60",
+  "declarative-plans",
+  "default-engine-base",
+  "adaptive-metadata-in-dev",
+  "geo-type-in-dev",
+  "internal-api",
+  "test-utils",
+] }
+tar = "0.4"
+tokio = { version = "1.47", features = ["io-util"] }
+tempfile = "3"

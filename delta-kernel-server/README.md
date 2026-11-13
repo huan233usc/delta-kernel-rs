@@ -1,0 +1,521 @@
+# delta-kernel-server (POC, do not merge)
+
+A long-running gRPC service that runs the driver-side delta_kernel work of the DBR DSv2 read
+path: snapshot build (full or incremental), `SnapshotInfo`, and
+`Scan::declarative_metadata_scan_plan`. It caches all three across queries, in process (L1) and
+optionally in a Redis shared by replicas (L2, SPEC v10).
+
+SPEC v10 splits snapshot and plan:
+
+- **`GetSnapshot`** returns the snapshot, its `SnapshotInfo` and a stateless `SnapshotRef`. Plans
+  for `prefetch_plans` come back in `prefetched_plans`.
+- **`GetScanPlan(ref, spec)`** returns one plan for the snapshot a ref names.
+- **`ResolveTimeTravel`** answers `getActiveCommitAtTime` / `checkVersionExists` on the latest
+  snapshot.
+
+All three RPCs carry the same op sub-protocol.
+
+IO is hybrid (SPEC v9):
+
+- **On the server**: `FileListing`, `ReadBytes`, `HeadFile`, `ParquetFooter`, through the default
+  engine's object_store handlers on one shared multi-thread tokio runtime. Cloud tables use
+  storage credentials the server gets from UC with the caller's forwarded token.
+- **On the client**: `QueryPlan` ops (P&M replay, sidecar / checkpoint scans) are sent to the
+  requesting client as an `OpRequest` on the same bidi stream. The client executes them (in DBR,
+  with the existing `DeltaV2KernelPlanExecutor`) and sends back an `OpResult`.
+- `--io-mode forward` restores the pre-v9 behavior (every op forwarded) for A/B runs.
+
+- Wire contract: [`proto/delta_kernel_server.proto`](proto/delta_kernel_server.proto) (SPEC v9 §5
+  plus the additive fields of the v6-v9 revisions, and SPEC v10 §10.1).
+- Kernel: the in-tree `kernel` crate at `4633926ff40ff39e5ba8bc690a965b4fb793c073`.
+
+## Build
+
+Requires `protoc` on `PATH`, or set `PROTOC`. Kernel's `declarative-plans` and this crate both
+generate code from protos. Keep cargo output off `/home`:
+
+```bash
+export CARGO_TARGET_DIR=/ephemeral/cargo-out/dks-server
+cargo +1.95.0 build -p delta-kernel-server --release
+# binary: $CARGO_TARGET_DIR/release/delta-kernel-server
+```
+
+### Kernel features
+
+The server builds kernel with the same feature set as DBR's `delta_kernel_ffi` build:
+`declarative-plans`, `default-engine-base`, `adaptive-metadata-in-dev`, `geo-type-in-dev`,
+`internal-api` (plus `arrow-60`).
+
+`delta-kernel-unity-catalog` is an ffi-crate feature, not a kernel feature. Its only effect on
+kernel is `internal-api`, so the server adds no dependency for it. It still appears in the
+advertised `kernel_features` list so the client's list compares equal.
+
+`ClientInfo.kernel_rev` must equal `4633926ff40ff39e5ba8bc690a965b4fb793c073`, and
+`ClientInfo.kernel_features` must equal the list above (order-insensitive). Otherwise the request
+fails with `VERSION_MISMATCH` before any op is issued. To change the expected rev, set
+`DELTA_KERNEL_SERVER_KERNEL_REV` at build time.
+
+## Run
+
+```bash
+delta-kernel-server \
+  --listen 127.0.0.1:0 \
+  --endpoint-file /tmp/dks.endpoint \
+  --instance-id my-run-1 \
+  --enable-test-hooks \
+  --max-instances-per-table 2
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--listen` | `127.0.0.1:50051` | bind address; port `0` picks a free port |
+| `--endpoint-file` | none | after bind, write `host:port\n` here atomically (temp file + rename) |
+| `--instance-id` | `dks-<pid>-<nanos>` | returned by `Ping` and in every `ServerStats` |
+| `--enable-test-hooks` | off | enables `Ping`, `GetDebugStats`, `ResetCache`, `InjectFault`; without it they return `PERMISSION_DENIED` |
+| `--max-instances-per-table` | `2` | cached snapshot instances kept per `(table_id, location)` |
+| `--max-cache-bytes` | `4 GiB` | global LRU bound over estimated memory (snapshot heap + plan bytes) |
+| `--io-mode` | `local` | `local`: simple IO ops run on the server; `forward`: every op goes to the client |
+| `--local-io-threads` | `8` | worker threads and in-flight cap for server-side IO; when all are busy, requests fail with `UNAVAILABLE` |
+| `--uc-endpoint-override` | none | UC base URL instead of `https://{auth.workspace_host}` (tests, proxies, HiFi) |
+| `--storage-option KEY=VALUE` | none, repeatable | allowlisted object_store transport/addressing option for every cloud store (list below); any other key, including every auth or credential-source key, fails at startup |
+| `--s3-endpoint URL` | none | same as `--storage-option aws_endpoint=URL`; requests are path-style (`{endpoint}/{bucket}/{key}`) unless `aws_virtual_hosted_style_request=true` |
+| `--s3-allow-http` | off | same as `--storage-option aws_allow_http=true` |
+| `--s3-region REGION` | none | same as `--storage-option aws_region=REGION` |
+| `--l2-redis-url URL` | off | shared L2 snapshot store (SPEC v10.3), e.g. `redis://10.0.0.5:6379/0`; unreachable at startup → exit; L2 errors later never fail a request |
+| `--l2-ttl-secs` | `21600` (6 h) | TTL of L2 `snap` / `ver` / `plan` keys |
+| `--l2-build-deadline-ms` | `120000` | TTL of the cross-replica build lock, and how long a replica that lost it waits for the holder's result before building itself |
+| `--test-uc-credentials-for-file` | off, hidden | test only, needs `--enable-test-hooks`: run the UC credential check for `file://` tables too |
+
+Operator storage options are an **allowlist**. They can only say where and how to connect, never
+how to authenticate; the store always authenticates with the UC-vended credential.
+
+| store | allowed keys (canonical; object_store aliases such as `endpoint`, `region` work) |
+|---|---|
+| S3 | `aws_endpoint`, `aws_region`, `aws_virtual_hosted_style_request` |
+| Azure | `azure_storage_endpoint` |
+| GCS | `google_base_url` |
+| any store | `allow_http`, `timeout`, `connect_timeout`, `read_timeout`, `pool_idle_timeout`, `pool_max_idle_per_host`, `http1_only`, `http2_only`, `proxy_url`, `proxy_ca_certificate`, `proxy_excludes` |
+
+- **Rejected at startup** with an error that lists the allowlist: everything else. That includes
+  keys, secrets and tokens; `aws_skip_signature`, IMDS / metadata endpoint, web identity, role and
+  container-credential keys; `azure_credential_type`, account key, client secret, MSI, Azure CLI,
+  emulator and Fabric keys; GCS service account, application credentials and bearer token; and
+  `allow_invalid_certificates`. A key that two stores read differently must be allowed for both
+  (`token` is rejected).
+- **Merge order** per store, later wins: default `timeout=60s`, the `--s3-*` flags,
+  `--storage-option`, the UC-vended credential, then forced auth settings. Keys are compared after
+  object_store canonicalization, and a key only reaches stores that take it.
+- **Trusted-operator transport knobs**: `allow_http` (and `--s3-allow-http`), `proxy_url` and
+  `proxy_ca_certificate` do not change how a store authenticates, but they can expose the vended
+  credential on the wire. Plain HTTP sends the session token / SAS / OAuth token unencrypted; a
+  proxy (with its own CA, able to intercept TLS) sees every request. Use them only for trusted
+  private endpoints and proxies (LocalStack, Azurite, a corporate egress proxy you control).
+- **Forced auth**: S3 `aws_skip_signature=false`. Azure `azure_credential_type=sas_token`,
+  `azure_skip_signature=false`, `azure_storage_use_emulator=false`, `azure_use_azure_cli=false`.
+  GCS `google_skip_signature=false`.
+- **Vended credential must be complete**, or the store is not built: S3 key id, secret and
+  session token; Azure SAS; GCS OAuth token. Stores are built with `Builder::new()`, never
+  `from_env()`, so server environment credentials are not read either.
+- **Every credential provider is pinned** to the vended credential (object_store 0.14.2), so no
+  ambient source is reachable on any path, including presigning:
+  - S3: `with_credentials(static key/secret/token)`, which object_store uses before any web
+    identity, ECS/EKS container or IMDS provider; `with_s3_express(false)` (no session
+    provider). Presigned URLs are signed locally with the vended key.
+  - Azure: `with_credentials(static SAS)`, emulator off. Presigning with a SAS credential fails
+    locally (no user-delegation-key request).
+  - GCS: `with_credentials(static bearer)`, so application-default credentials are never read,
+    and `with_signing_credentials(NoGcsSigning)`, which always errors. Without it object_store
+    signs through the GCE metadata server. P1-a needs no signed URLs.
+- UC responses carry no endpoint or region, so without these flags an `s3://` table goes to real
+  AWS.
+
+TLS roots: the binary bundles Mozilla's root CAs (`webpki-root-certs`) and trusts them in addition
+to the system store, for UC and for every object store. It runs in an image without
+`/etc/ssl/certs` or `ca-certificates`. If no HTTPS client can be built at all, the server still
+starts and UC calls fail with `UNAVAILABLE`.
+
+SIGTERM or Ctrl-C shuts the server down gracefully. Logs go to stderr; `RUST_LOG` controls the
+level (default `info`). Max gRPC message size is 256 MiB in both directions.
+
+## Running in a separate container
+
+The release binary links glibc dynamically, so use a glibc base image of the same or newer
+generation as the build host (e.g. `debian:bookworm-slim`). No `ca-certificates` package is
+needed.
+
+```bash
+mkdir -p /tmp/dks && cp $CARGO_TARGET_DIR/release/delta-kernel-server /tmp/dks/
+docker network create dks || true     # or reuse the network LocalStack runs on
+
+docker run --rm --name dks --network dks -p 50051:50051 \
+  -v /tmp/dks:/dks \
+  debian:bookworm-slim \
+  /dks/delta-kernel-server \
+    --listen 0.0.0.0:50051 \
+    --endpoint-file /dks/endpoint \
+    --instance-id hifi-1 \
+    --enable-test-hooks \
+    --uc-endpoint-override http://<uc-host>:<uc-port> \
+    --s3-endpoint http://<s3-host>:<s3-port> --s3-allow-http --s3-region us-east-1
+```
+
+- **Listen on `0.0.0.0`** inside the container. `127.0.0.1` is the container's own loopback.
+- **The endpoint file holds the bind address** (`0.0.0.0:50051`). A client on the host connects to
+  `127.0.0.1:50051` through `-p`, so do not hand the file to it verbatim.
+- **Addresses as seen from the container**: `<uc-host>` and `<s3-host>` are how the container
+  reaches UC and S3. A service on the host is at the bridge gateway (`docker network inspect dks
+  -f '{{(index .IPAM.Config 0).Gateway}}'`), or `host.docker.internal` with `--add-host
+  host.docker.internal:host-gateway`. A container on the same network is reachable by its name.
+  A host service bound to `127.0.0.1` only cannot be reached from a container; bind it to
+  `0.0.0.0` or use `--network host` (then drop `-p` and the client uses the server's port
+  directly).
+- **`file://` tables** need the table directory mounted at the same path in the container
+  (`-v /path:/path`), because table locations come from the client.
+
+### HiFi run (UC control plane + LocalStack)
+
+1. **Control plane**: in a universe worktree, run
+   `bazel run //managed-catalog/src/test/hifi:control-plane-server`, with LocalStack running as
+   the HiFi setup provides it.
+2. **Read the dynamic endpoints from the test JVM**. Both ports change every run:
+   - UC API URL: `CredentialManager.getApiUrlOpt` → `--uc-endpoint-override`;
+   - LocalStack: Hadoop conf `fs.s3a.endpoint` → `--s3-endpoint`.
+   Tables live in bucket `test` in `us-east-1` and need path-style requests, which is the default
+   once `--s3-endpoint` is set. Rewrite `localhost` to the address the container reaches (see
+   above).
+3. **Start the server** as in the recipe above, with `--uc-endpoint-override http://<gw>:<uc-port>
+   --s3-endpoint http://<gw>:<localstack-port> --s3-allow-http --s3-region us-east-1`. Without
+   `--s3-endpoint`, the server's `_last_checkpoint` read goes to
+   `https://s3.us-east-1.amazonaws.com/test/...` and fails (`Received redirect without
+   LOCATION`).
+4. **Point the client** at the published port (`127.0.0.1:50051`). The client forwards its UC
+   token in `GetSnapshotRequest.auth`; the server exchanges it at the overridden UC endpoint for
+   the LocalStack credential.
+
+## v10: GetScanPlan, ResolveTimeTravel, two-tier cache
+
+### SnapshotRef and GetScanPlan
+
+`GetSnapshotResponse.ref` names the snapshot without server state:
+
+- `table`, `version`, `log_segment`;
+- `segment_id` = hex SHA-256 of the canonical segment identity. The identity is the one cache hits
+  compare, serialized as JSON `[version, checkpoint_version, [[location, size]…], [[location,
+  size, staged]…]]` with both lists sorted. The same id is the L2 `seg_id`.
+- `instance_id`.
+
+`GetScanPlan(ref, spec)` runs in this order:
+
+1. **Authz first** (SPEC v9.1 rules). Cloud tables are checked on cache hits too.
+2. **Resolve the ref** as an exact version with `expected_log_segment = ref.log_segment`: L1, then
+   L2, then an exact rebuild at `ref.version`.
+3. **Check the segment.** The resolved segment must equal the ref's, otherwise `STALE_REF = 10`
+   (non-retryable). For example, a checkpoint written at that version since the ref was taken
+   changes the segment. The client calls GetSnapshot again and retries once.
+   - A `segment_id` that is not 64 lowercase hex digits (including empty), or that does not match
+     its own `log_segment`, is also `STALE_REF`.
+4. **Staged refs.** Staged-tail instances are never cached. A ref whose segment has staged deltas
+   is rebuilt as `catalog_latest(max_catalog_version = ref.version, log_tail = the staged deltas)`
+   on every call; neither the instance nor its plans are cached or written to L2.
+5. **Plan.** Plans cache on `(instance, spec hash)` and coalesce exactly as prefetched plans do.
+   Prefetch is literally one GetScanPlan per spec on the GetSnapshot stream.
+
+`ServerStats` splits time into `resolve_us` (authz + snapshot resolution) and `plan_us`.
+
+### ResolveTimeTravel
+
+The snapshot it runs on:
+- **Path-based tables**: a fresh latest (`max_staleness = 0`, so at most one incremental
+  re-listing of the cached latest).
+- **Catalog-managed tables**: the request's `catalog_latest`.
+
+Results are not cached; only the latest instance is.
+
+| target | semantics (mirrors) | response |
+|---|---|---|
+| `timestamp_ms` | `JnrHistory.getActiveCommitAtTimestamp` (below) | `version`, `commit_timestamp_ms`; `earliest_recreatable_version = -1` |
+| `check_version` | `PathBasedSnapshotManager` / `UCManagedTableSnapshotManager.checkVersionExists`: `get_earliest_commit(Recreatable \| Published)`; for catalog-managed tables bounded by the earliest catalog-tail version | `version` = input, `earliest_recreatable_version` = the earliest version for the requested commit type, `latest_version`; `commit_timestamp_ms = -1`. The client applies `version < earliest \|\| (version > latest && !allowOutOfRange)` |
+
+`getActiveCommitAtTimestamp` order:
+1. **After the snapshot's own timestamp**: returns the latest version if `can_return_last_commit`,
+   else fails.
+2. **Otherwise** `latest_version_as_of`.
+3. **On a log-history error** with `can_return_earliest_commit`: `first_version_after`, accepted
+   only if strictly after the timestamp.
+4. **Commit type**: `Recreatable` iff `must_be_recreatable`.
+
+Failures:
+- **No answer** (timestamp out of range, no recreatable commit, timestamp after latest without
+  `can_return_last_commit`): `UNSUPPORTED`, message `LOG_HISTORY: <kernel or JNR text>`. The
+  client falls back to JNR, which raises the user-facing exception.
+- **Catalog-managed table without `catalog_latest`**: `UNSUPPORTED`, `LOG_HISTORY: ` prefix. The
+  published filesystem latest is not the table's latest, so the server never answers from it.
+  Kernel rejects that build (`MaxCatalogVersion`, reported as `UNSUPPORTED` with prefix
+  `CATALOG_STATE_REQUIRED: ` on every RPC). A catalog-managed instance resolved without catalog
+  state is refused as well.
+- **Op failures** classify as for builds.
+
+### Two-tier cache (SPEC v10.3)
+
+- **L1** (`cache::L1Cache`): instances, the latest map and the in-flight table. It implements the
+  `store::SnapshotStore` trait, but `Core` uses its synchronous API so lookup-or-join stays
+  atomic.
+- **L2** (`store::RedisStore`, or `store::MemoryStore` with identical semantics in process):
+  optional, shared across replicas.
+
+Resolution on an L1 miss:
+1. **Read L2.**
+2. **On a hit**, rebuild the native snapshot from the stored kernel hint with **zero ops**. The
+   rebuild engine fails every op. The rebuilt segment id must equal the entry's. Then serve
+   `SnapshotInfo` from L2.
+3. **On a miss**, take `lock:{table_key}:{target}` (`SET NX PX build-deadline`) and build. Write
+   L2 *before* releasing the lock.
+4. **A replica that loses the lock** polls L2 every 50 ms until the deadline, then builds itself.
+5. **Path-based latest**: a stale L2 `latest` still serves as the base of one incremental
+   re-listing.
+6. **Plans**: an L1 miss reads `plan:{seg_id}:{spec_hash}` before generating, and writes it after.
+
+Authz on an in-process credential miss:
+1. Check `authz:{sha256(token)}:{table_key}`. If present, UC is not called. A job that then needs
+   server-side IO fetches the credential lazily.
+2. Otherwise call UC, and on success write `authz` until credential expiry − 60 s.
+
+Keys are prefixed `dks:{kernel_rev}:`. `table_key` is the UC table id when it is a UUID, else
+sha256(canonical location).
+
+| key | type | value | TTL |
+|---|---|---|---|
+| `snap:{table_key}:{seg_id}` | hash | `info` (SnapshotInfo), `seg` (LogSegmentInfo), `hint`, `version`, `built_at`, `confirmed_at` | `--l2-ttl-secs` |
+| `ver:{table_key}` | zset | member `seg_id`, score `version`; without an expected segment the entry with the greatest `confirmed_at` wins (v8 rule) | same |
+| `latest:{table_key}` (path-based) / `latest:{table_key}:{tail_id}` (`catalog_latest`, `tail_id` = hex digest of the canonical tail) | hash | `seg_id`, `version`, `confirmed_at_ms`, `tail_id`. Monotonic per key (compare-and-set script): replaced only by a higher version, or the same version and tail with a later confirmation | 2 × staleness, ≥ 60 s |
+| `plan:{seg_id}:{spec_hash}` | string | zstd(plan bytes) \| `EMPTY` \| `UNSUPPORTED:<reason>` | `--l2-ttl-secs` |
+| `lock:{table_key}:{target}` | string | `{instance_id}:{job}`; target `v{version}` \| `latest` \| `c{mcv}:{tail digest}`; released only by its owner | `--l2-build-deadline-ms` |
+| `authz:{sha256(token)}:{table_key}` | string | authorized-until (ms) | until − now |
+
+Never written to L2:
+- staged-tail results and their plans;
+- tainted builds or plans;
+- UC credentials and token plaintext;
+- plans whose zstd form exceeds 4 MiB.
+
+`ResetCache` clears L1 only.
+
+**SnapshotHint finding (kernel `4633926`)**: `SnapshotHint` is `internal_api` and has no serde.
+- **Every component is reachable and rebuildable** under `internal-api`:
+  - version, freshness, publication watermark;
+  - the retained `LogSegmentFiles`, re-grouped by `SnapshotHint::try_new`;
+  - `Protocol`, `Metadata`, `LastCheckpointHint` (serde);
+  - the at-version `Crc`, via its getters and `Crc::try_from_parts`. Its inline `allFiles` adds
+    have crate-private fields and no `Serialize`, so they go through the public `From<Add> for
+    Scalar` and back through `Add`'s `Deserialize`.
+- **`with_snapshot_hint` does no engine IO.**
+- **Encoding is verified:** `hint::encode` decodes its own output and compares every component
+  (`PartialEq`). A hint that does not round-trip is not stored; the entry then holds info and
+  plans only, and an L2 hit falls back to a build.
+- **Result:** all fixtures below round-trip, and the rebuilt snapshots give equal `SnapshotInfo`,
+  CRC state and normalized plans (`tests/v10.rs`), including `crc-full`'s inline `allFiles` and
+  a log-compaction table.
+
+`DebugStats` (test hooks):
+- `l1_entries`, `l1_bytes` (estimated: snapshot heap + `SnapshotInfo` + plans);
+- `l2_hits` / `l2_misses` (L2 snapshot lookups after an L1 miss);
+- `entry_bytes` (`seg_id` → bytes).
+
+Measured on the kernel fixtures (`snapshot_hints_round_trip_and_sizes`, `--nocapture`). Plans
+are `[JSON_ONLY, ALL_STRUCT]`:
+
+| fixture | version | SnapshotInfo | hint (zstd) | plans (zstd) | snapshot heap |
+|---|---|---|---|---|---|
+| table-with-dv-small | 1 | 485 B | 468 B | 813 / 964 B | 1118 B |
+| basic_partitioned | 1 | 542 B | 453 B | 893 / 1020 B | 1245 B |
+| crc-full (inline allFiles) | 0 | 1823 B | 2281 B | 1280 / 1432 B | 1109 B |
+| v2-checkpoints-parquet-with-sidecars | 6 | 633 B | 1617 B | 707 / 882 B | 1514 B |
+| v1-multi-part-struct-stats-only | 5 | 1549 B | 2568 B | 1095 / 1248 B | 2289 B |
+| type-widening | 2 | 2598 B | 782 B | 822 / 1185 B | 3189 B |
+| compacted-log-files-table | 25 | 3076 B | 741 B | 1085 / 1266 B | 8924 B |
+
+SF1 / HiFi sizes are not measured here: they need the P1-b client runs.
+
+## Server semantics (SPEC §7)
+
+- **Local IO** (SPEC v9) keeps the forwarded-op rules: per-item results for listings, reads and
+  HEAD; `FileNotFound` is benign (a missing `_last_checkpoint`); any other error taints the job,
+  so its result is returned but not cached. The server computes and applies the `ListingHint`
+  itself. Handoff to another waiter only applies to forwarded ops.
+- **Local op deadline** (SPEC v9.1): server-side ops run on a fixed-size pool
+  (`--local-io-threads`, default 8) and the job waits at most the driver's `op_deadline_ms`. On
+  timeout the job fails with `DEADLINE` for the driver and every waiter, is tainted and not
+  cached. The abandoned op keeps its worker and permit until it really returns, then its result is
+  dropped. With every permit taken, new server-side ops fail at once with `UNAVAILABLE`
+  (retryable): no queueing, no extra threads. The default-engine handlers are synchronous, so a
+  timed-out op cannot be dropped; cloud stores' 60 s object_store client timeout bounds how long a
+  stuck call can hold a permit.
+- **Server-side IO failure** that fails a job → `UNAVAILABLE` (retryable); a client-reported op
+  failure stays `OP_FAILED`. The message starts with the wire code (`UNAVAILABLE: server-side IO
+  failed (ObjectStore error): …`, `OP_FAILED: client op failed (IO error): …`) and names the
+  kernel error kind, never its ffi number, which collided with `Error.Code` values (ffi
+  `ObjectStore` = 8, `PERMISSION_DENIED` = 8).
+- **Counters**: `ServerStats.ops_issued` = ops forwarded to this request's stream;
+  `ServerStats.ops_local` = server-side ops run by jobs this request started (a coalesced waiter
+  that only waited reports 0). `DebugStats.ops_local_total` sums all server-side ops.
+  `DebugStats.builds_started` counts snapshot builds. A path-based latest re-listing that finds
+  no new commit (`CACHE_HIT`, renewal) is not a build: it counts in `DebugStats.latest_renewals`.
+  A re-listing that finds new commits, or fails, counts in `builds_started` once it finishes.
+- **Credentials** (SPEC v9): `file://` tables need none. For s3/abfss/gs tables:
+  - `table_id` is a UC UUID → `POST /api/2.1/unity-catalog/temporary-table-credentials
+    {table_id, operation: READ}`; otherwise `temporary-path-credentials {url, operation: PATH_READ}`.
+  - The response maps to object_store options: `aws_temp_credentials` → `aws_access_key_id`,
+    `aws_secret_access_key`, `aws_session_token`; `azure_user_delegation_sas` →
+    `azure_storage_sas_token`; `gcp_oauth_token` → `google_bearer_token`.
+  - Cached per `(sha256(token), table key)` until `expiration_time - 60 s`. The token is never
+    logged or stored in clear.
+  - Checked on every request before the snapshot cache, in both `--io-mode`s (SPEC v9.1), so a
+    cache hit still needs a valid credential for the caller's token (POC authz).
+  - UC 401/403 → `PERMISSION_DENIED`; 404 → `TABLE_NOT_FOUND`; 5xx or network errors →
+    `UNAVAILABLE` (retryable); missing `auth` → `PERMISSION_DENIED`.
+  - UC error text is untrusted: before it enters an error or a log it is sanitized (the caller's
+    token, `Bearer …`, `dapi…`, JWT-like and long opaque words → `[REDACTED]`, control characters
+    dropped) and cut to 256 characters.
+
+- **Cache entry**: `{Arc<Snapshot>, SnapshotInfo, plans: ScanPlanSpec -> ScanPlanResult}`.
+  `SnapshotInfo` is computed once, during the build, through the build's op channel.
+  `active_domain_metadata` mirrors JNR `getActiveDomainMetadataMap` (kernel
+  `get_all_domain_metadata`): active user domains only, no `delta.*` system domains. A hit
+  returns the stored copy. Clustering, ICT timestamp, domain metadata, and row-tracking getters do
+  IO and kernel does not cache them, so they cannot be recomputed on a hit.
+- **Hit (exact version)**: same version, and either
+  - `expected_log_segment` is present and names the same files as the cached segment (a mismatch
+    is a miss), or
+  - `expected_log_segment` is absent and some instance of that version is cached: the most
+    recently built/confirmed one is returned (SPEC v8). Its `log_segment` is in the response.
+  A hit issues 0 ops when every requested plan is cached.
+  - Segments are compared by canonical identity: version, checkpoint version, and the sorted
+    `(parsed URL, size)` of checkpoint parts plus `(parsed URL, size, staged)` of deltas.
+    `last_modified` is ignored. DBR re-qualifies locations through Hadoop (`file:///p` becomes
+    `file:/p`), so raw string comparison never matched a real client.
+- **Path-based `latest {max_staleness_ms}`** (SPEC v7): the server remembers, per table, the last
+  confirmed latest instance and when its listing started.
+  - Confirmed within `max_staleness_ms` → `CACHE_HIT`, 0 ops.
+  - Otherwise one re-listing via `Snapshot::builder_from(confirmed instance)`. No new commit →
+    renew, `CACHE_HIT` with `ops_issued = 1`, same SnapshotInfo and plan cache. New commits →
+    `INCREMENTAL`. No confirmed instance (or it was evicted) → `FULL_BUILD`.
+  - Concurrent latest requests for a table share one re-listing (`COALESCED`).
+  - Tainted results do not renew or replace the confirmation.
+- **Hit / coalescing (`catalog_latest`)**: keyed on `max_catalog_version` plus the canonical log
+  tail (`(version, location, size)` sorted by version). A tail containing staged commits is never
+  served from cache, never coalesced, and its result is never cached.
+  - The build is `Snapshot::builder_for(location).with_log_tail(tail)
+    .with_max_catalog_version(max)`, the same builder calls DBR's JNR path makes through
+    `snapshot_builder_with_log_tail` / `snapshot_builder_with_max_catalog_version` (default CRC
+    replay, no explicit version). The tail replaces filesystem commits from its first version
+    onward and the bound hides newer unratified files. L0 checks both staged and published tails
+    against that in-process build (`catalog_latest_*_matches_in_process_build_*`).
+  - In DBR the latest ratified commit stays staged in UC's response until the next commit
+    registers its backfill, so in steady state a catalog-managed table's `catalog_latest` carries
+    a staged tail and is rebuilt on every request. Only an empty or published-only tail is cached.
+- **ListingHint**: sent only for listings of `_delta_log/` itself (`end_version` = build target,
+  `stop_at_first_non_versioned = true`). `_delta_log/_sidecars/` listings get no hint.
+- **Miss**: incremental `Snapshot::builder_from(newest cached older instance)` if there is one,
+  otherwise a full build.
+- **Coalescing**: builds coalesce on `(table_id, location, target version)`; plan generation
+  coalesces on `(instance, ScanPlanSpec)`. Each waiting stream joins the job's op channel. If the
+  driving stream dies, the in-flight op is re-sent to the next waiting stream. The job continues
+  and does not restart. With no waiter left, the executor returns `KernelError::Cancelled`.
+- **Errors**: a stream loss or a missed op deadline makes `RemotePlanExecutor` return
+  `KernelError::Cancelled`, which surfaces as `CANCELLED` / `DEADLINE`. Only a stream loss hands
+  the op to another waiter; a missed deadline fails the build for the driver and every waiter
+  (SPEC v6). A client-reported op error
+  surfaces as `OP_FAILED`. Kernel `Unsupported` from plan generation (TIMESTAMP partitions with a
+  timezone, adaptive-metadata checkpoint actions) is a per-plan `unsupported` result.
+- **Tainted builds**: any op error other than `FileNotFound` (whole-op or per-item) taints the job.
+  The result still goes to the waiting requests, but it is not cached. Staged-commit instances are
+  never cached.
+- Kernel runs on `spawn_blocking` threads with
+  `PlanBasedEngine::new(None, RemotePlanExecutor)`. `Snapshot` and `Scan` have a compile-time
+  `Send + Sync` assertion.
+
+## Tests (L0)
+
+```bash
+export CARGO_TARGET_DIR=/ephemeral/cargo-out/dks-server
+DKS_REQUIRE_REDIS_TESTS=1 cargo +1.95.0 test -p delta-kernel-server   # needs docker
+cargo +1.95.0 clippy -p delta-kernel-server --all-targets -- -D warnings
+cargo +nightly fmt -- --check   # the repo's rustfmt.toml uses nightly-only options
+```
+
+`tests/local_io.rs` covers SPEC v9: cold-build op split (forwarded = QueryPlan ops only), local
+FileNotFound / taint / ListingHint, a forward-mode smoke run, and the UC credential provider
+against a mock UC HTTP server (endpoint choice, caching and expiry, 401/403/5xx, authz on cache
+hit, token absent from trace logs of the real binary), the binary running with `SSL_CERT_FILE` /
+`SSL_CERT_DIR` pointed at nothing (no system roots; this covers startup and HTTPS client
+construction, not a TLS handshake against a bundled root), and startup rejection of unknown and
+auth storage options for each cloud. Unit
+tests in `src/creds.rs` cover the allowlist (every auth key of each cloud rejected), the merge and
+forced auth, and S3 / Azure / GCS stores sending a request to a local mock that carries only the
+vended credential (SigV4 with the vended key; SAS in the query and no Authorization header;
+`Bearer` with the vended token). `tests/no_ambient_credentials.rs` (own binary) points every AWS /
+Azure / GCE metadata and credential env var at a trap listener, then reads and presigns through
+each store: the trap is never contacted, and only vended credentials appear on the wire.
+
+`tests/v10.rs` covers SPEC v10:
+- **GetScanPlan**: hit by ref (then a plan cache hit with 0 ops); rebuild after eviction and after
+  reset; `STALE_REF` (tampered id, and a checkpoint written at the ref's version); staged refs
+  rebuilt every call and never cached; authz first.
+- **Prefetch vs GetScanPlan**: semantic plan parity on four fixtures.
+- **ResolveTimeTravel vs the in-process kernel + JNR logic**: ICT and non-ICT tables; timestamps
+  before the first and after the last commit under every flag combination; `check_version`; log
+  cleanup behind a checkpoint; a catalog-managed staged commit's ICT.
+- **Snapshot hints**: round trip on 15 fixtures, with the size table above.
+- **L2 (`MemoryStore`)**:
+  - restart / another replica hits with zero ops;
+  - latest hit, and a stale latest as re-list base;
+  - two replicas, one build;
+  - never stores staged or tainted results;
+  - the `SnapshotStore` contract on L1 and memory;
+  - `authz` shared across replicas.
+
+`tests/l2_redis.rs` runs against `docker run redis:7` on a random port. It skips with a message if
+docker is unavailable, unless `DKS_REQUIRE_REDIS_TESTS=1`, which turns the skip into a failure. The
+gates run with it set:
+- the contract and the 4 MiB cap;
+- the exact key schema and TTLs written by a build;
+- two server processes sharing L2 with one build;
+- a restarted process serving from L2 with zero ops.
+
+`tests/loopback.rs` (L0a) starts the server in-process on `127.0.0.1:0` (default `local` IO mode;
+forward-specific mechanics such as handoff of a listing op run in `forward` mode). Its test client decodes
+each forwarded `Operation` (`src/decode.rs`) and executes it with kernel's `SyncPlanExecutor`
+(dev-only `test-utils`) over copies of `kernel/tests/data` fixtures. Every parity test checks:
+
+1. The remote plan and the in-process `declarative_metadata_scan_plan` on the same snapshot
+   execute to the same live add rows, sorted by path.
+2. Both plans' bytes are equal after normalization (`src/normalize.rs`).
+3. `SnapshotInfo` equals an in-process computation.
+
+## How the runtime L1 suite consumes the binary
+
+`DeltaKernelServerParitySuite` (runtime draft worktree, SPEC §8 L1) does not build this crate. It
+runs a prebuilt binary:
+
+```bash
+bazel test //.../tahoe/v2/remote:DeltaKernelServerParitySuite_ffi \
+  --test_env=DELTA_KERNEL_SERVER_BIN=$CARGO_TARGET_DIR/release/delta-kernel-server
+```
+
+The fixture (`KernelServerFixture`, modeled on `LiteRuntimeTestEnvFixture`) does the following:
+
+1. If `DELTA_KERNEL_SERVER_ENDPOINT=host:port` is set, it warm-attaches to that server instead of
+   spawning one.
+2. Otherwise it spawns `$DELTA_KERNEL_SERVER_BIN --listen 127.0.0.1:0 --endpoint-file <tmp>
+   --instance-id <uuid> --enable-test-hooks`, with stderr sent to `$TEST_UNDECLARED_OUTPUTS_DIR`.
+   If `DELTA_KERNEL_SERVER_BIN` is unset, it cancels the suite in `beforeAll`.
+3. It polls until the endpoint file exists. The file is renamed into place, so a partial read is
+   impossible.
+4. It calls `Ping` and checks that the returned `instance_id` matches the one it passed.
+5. It uses `GetDebugStats` (`builds_started`, `builds_coalesced`, `cached_instances_per_table`),
+   `ResetCache`, and `InjectFault` for the concurrency and fault cases.
+6. On shutdown, or from `kill()` / `restart()`, it sends SIGTERM, then SIGKILL after a grace
+   period.
+
+The client sends `ClientInfo{kernel_rev, kernel_features, op_deadline_ms}` on every request. It
+must set the gRPC max message size to 256 MiB on its side too.
