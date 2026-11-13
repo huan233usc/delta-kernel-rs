@@ -200,6 +200,9 @@ docker run --rm --name dks --network dks -p 50051:50051 \
 - **Counters**: `ServerStats.ops_issued` = ops forwarded to this request's stream;
   `ServerStats.ops_local` = server-side ops run by jobs this request started (a coalesced waiter
   that only waited reports 0). `DebugStats.ops_local_total` sums all server-side ops.
+  `DebugStats.builds_started` counts snapshot builds. A path-based latest re-listing that finds
+  no new commit (`CACHE_HIT`, renewal) is not a build: it counts in `DebugStats.latest_renewals`.
+  A re-listing that finds new commits, or fails, counts in `builds_started` once it finishes.
 - **Credentials** (SPEC v9): `file://` tables need none. For s3/abfss/gs tables:
   - `table_id` is a UC UUID → `POST /api/2.1/unity-catalog/temporary-table-credentials
     {table_id, operation: READ}`; otherwise `temporary-path-credentials {url, operation: PATH_READ}`.
@@ -243,6 +246,15 @@ docker run --rm --name dks --network dks -p 50051:50051 \
 - **Hit / coalescing (`catalog_latest`)**: keyed on `max_catalog_version` plus the canonical log
   tail (`(version, location, size)` sorted by version). A tail containing staged commits is never
   served from cache, never coalesced, and its result is never cached.
+  - The build is `Snapshot::builder_for(location).with_log_tail(tail)
+    .with_max_catalog_version(max)`, the same builder calls DBR's JNR path makes through
+    `snapshot_builder_with_log_tail` / `snapshot_builder_with_max_catalog_version` (default CRC
+    replay, no explicit version). The tail replaces filesystem commits from its first version
+    onward and the bound hides newer unratified files. L0 checks both staged and published tails
+    against that in-process build (`catalog_latest_*_matches_in_process_build_*`).
+  - In DBR the latest ratified commit stays staged in UC's response until the next commit
+    registers its backfill, so in steady state a catalog-managed table's `catalog_latest` carries
+    a staged tail and is rebuilt on every request. Only an empty or published-only tail is cached.
 - **ListingHint**: sent only for listings of `_delta_log/` itself (`end_version` = build target,
   `stop_at_first_non_versioned = true`). `_delta_log/_sidecars/` listings get no hint.
 - **Miss**: incremental `Snapshot::builder_from(newest cached older instance)` if there is one,

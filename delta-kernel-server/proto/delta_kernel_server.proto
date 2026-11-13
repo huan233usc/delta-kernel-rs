@@ -192,6 +192,7 @@ message DebugStats {
   int64 builds_started = 1; int64 builds_coalesced = 2; int64 ops_issued_total = 3;
   map<string, int32> cached_instances_per_table = 4;
   int64 ops_local_total = 5;    // v9
+  int64 latest_renewals = 6;    // latest re-listings that resolved CACHE_HIT (not in builds_started)
 }
 message ResetCacheRequest {} message ResetCacheResponse {}
 message FaultSpec {

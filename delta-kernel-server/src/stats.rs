@@ -8,8 +8,15 @@ use crate::proto;
 
 #[derive(Default)]
 pub struct ServerCounters {
-    /// Snapshot builds (full or incremental) started.
+    /// Snapshot builds (full or incremental) started. A path-based latest re-listing counts here
+    /// only once it turns out to be a build (new commits, or a failure); one that resolves to
+    /// `CACHE_HIT` counts in `latest_renewals` instead.
     pub builds_started: AtomicI64,
+    /// Path-based latest re-listings that found no new commit and renewed the cached instance.
+    pub latest_renewals: AtomicI64,
+    /// In-process only (not on the wire): path-based latest re-listings started; lets tests wait
+    /// for a re-listing before it is known to be a build or a renewal.
+    pub latest_relists_started: AtomicI64,
     /// Requests that joined an in-flight build instead of starting one.
     pub builds_coalesced: AtomicI64,
     /// Op sends to client streams (a handed-over op counts once per stream it was sent to).

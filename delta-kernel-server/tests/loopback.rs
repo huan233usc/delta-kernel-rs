@@ -1381,6 +1381,263 @@ async fn catalog_latest_staged_tail_not_cached_not_coalesced() {
     assert!(server.core.cached_instances_per_table().is_empty());
 }
 
+// ------------------------------------------------------------------------------------------------
+// Catalog-managed tables: `catalog_latest` parity with the in-process (JNR) build
+// ------------------------------------------------------------------------------------------------
+
+/// Version 0 of a `catalogManaged` table (which requires in-commit timestamps).
+const CM_V0: &str = r#"{"commitInfo":{"timestamp":1700000000000,"inCommitTimestamp":1700000000000,"operation":"CREATE TABLE","txnId":"cm-0"}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true","io.unitycatalog.tableId":"cm-table"},"createdTime":1700000000000}}
+"#;
+
+/// A catalog-managed table with only its (published) version 0.
+fn cm_fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cm_table");
+    std::fs::create_dir_all(root.join("_delta_log/_staged_commits")).unwrap();
+    std::fs::write(
+        root.join("_delta_log").join(format!("{:020}.json", 0)),
+        CM_V0,
+    )
+    .unwrap();
+    let root = root.canonicalize().unwrap();
+    let url = url::Url::from_directory_path(&root).unwrap();
+    Fixture {
+        _dir: dir,
+        root,
+        url,
+        table_id: "cm-table".into(),
+    }
+}
+
+/// One commit adding `file_<version>.parquet`.
+fn cm_commit(version: i64) -> String {
+    let ts = 1_700_000_000_000i64 + version;
+    format!(
+        "{{\"commitInfo\":{{\"timestamp\":{ts},\"inCommitTimestamp\":{ts},\
+         \"operation\":\"WRITE\",\"txnId\":\"cm-{version}\"}}}}\n\
+         {{\"add\":{{\"path\":\"file_{version}.parquet\",\"partitionValues\":{{}},\"size\":1234,\
+         \"modificationTime\":{ts},\"dataChange\":true,\"stats\":\"{{\\\"numRecords\\\":1}}\"}}}}\n"
+    )
+}
+
+/// Publishes `version` (writes `_delta_log/<version>.json`); returns the tail-relative name.
+fn cm_publish(fx: &Fixture, version: i64) -> String {
+    let name = format!("{version:020}.json");
+    std::fs::write(fx.log_dir().join(&name), cm_commit(version)).unwrap();
+    name
+}
+
+/// Stages `version` under `_staged_commits/`; returns the tail-relative name.
+fn cm_stage(fx: &Fixture, version: i64) -> String {
+    let name = format!("_staged_commits/{version:020}.6e5c4a07-8a1f-4b4e-9d5c-{version:012}.json");
+    std::fs::write(fx.log_dir().join(&name), cm_commit(version)).unwrap();
+    name
+}
+
+fn cm_request(
+    fx: &Fixture,
+    max_catalog_version: i64,
+    tail: &[String],
+    specs: &[proto::ScanPlanSpec],
+) -> proto::GetSnapshotRequest {
+    let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+    catalog_request(fx, max_catalog_version, &tail, specs.to_vec())
+}
+
+/// Live add paths of the JSON-stats plan of a response.
+fn live_paths(resp: &proto::GetSnapshotResponse) -> Vec<String> {
+    let bytes = plan_bytes(&resp.plans[0]).expect("non-empty plan");
+    rows_sorted_by_path(&execute_plan(
+        delta_kernel_server::decode::decode_plan(bytes).unwrap(),
+    ))
+    .iter()
+    .map(|row| {
+        row.get("path")
+            .or_else(|| row.get("add").and_then(|a| a.get("path")))
+            .and_then(|p| p.as_str())
+            .unwrap()
+            .to_string()
+    })
+    .collect()
+}
+
+/// CM2/CM3 at L0: the server's cache lags UC (it holds the published v1); UC's tail fills in
+/// unpublished commits. The staged-tail build equals the in-process JNR build
+/// (`with_log_tail` + `with_max_catalog_version`) and is neither cached nor coalesced, while the
+/// lagging cached instance stays served for its own catalog state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_latest_staged_tail_matches_in_process_build_and_is_not_cached() {
+    let fx = cm_fixture();
+    cm_publish(&fx, 1);
+    // v2 is ratified, staged and already backfilled (UC still lists the staged file); v3 is
+    // ratified but unpublished.
+    let v2_staged = cm_stage(&fx, 2);
+    cm_publish(&fx, 2);
+    let v3_staged = cm_stage(&fx, 3);
+    let server = TestServer::start().await;
+    let specs = default_specs();
+    let mut c = server.client().await;
+
+    // The cache lags: UC once reported v1 with nothing unpublished.
+    let lag_req = cm_request(&fx, 1, &[], &specs);
+    let (lag, _) = run(&mut c, lag_req.clone(), Behavior::default()).await.ok();
+    assert_eq!((lag.version, resolved(&lag)), (1, ResolveKind::FullBuild));
+    assert_parity_with(
+        &local_catalog_snapshot(&fx, &lag_req).unwrap(),
+        &lag,
+        &specs,
+    );
+    assert_eq!(
+        server.core.cached_instances_per_table().get(&fx.table_id),
+        Some(&1)
+    );
+
+    for tail in [
+        vec![v2_staged.clone(), v3_staged.clone()],
+        // Mixed: v2 named by its published file, v3 still staged.
+        vec![format!("{:020}.json", 2), v3_staged.clone()],
+    ] {
+        let before = server.stats().await;
+        let req = cm_request(&fx, 3, &tail, &specs);
+        let (r, ops) = run(&mut c, req.clone(), Behavior::default()).await.ok();
+        assert_eq!(r.version, 3);
+        assert_eq!(resolved(&r), ResolveKind::FullBuild, "{tail:?}");
+        assert!(ops.iter().all(|o| o.kind == "QueryPlan"), "{ops:?}");
+        // Equal to the in-process build JNR performs, including SnapshotInfo and the plans.
+        let local = local_catalog_snapshot(&fx, &req).unwrap();
+        assert_parity_with(&local, &r, &specs);
+        assert_eq!(
+            live_paths(&r),
+            ["file_1.parquet", "file_2.parquet", "file_3.parquet"]
+        );
+        let seg = segment(&r);
+        assert_eq!(seg.delta_is_staged.last(), Some(&true));
+        assert!(
+            seg.deltas
+                .last()
+                .unwrap()
+                .location
+                .contains("/_staged_commits/"),
+            "the staged tail entry is the segment's last delta"
+        );
+        let after = server.stats().await;
+        assert_eq!(after.builds_started - before.builds_started, 1);
+        assert_eq!(
+            server.core.cached_instances_per_table().get(&fx.table_id),
+            Some(&1),
+            "a staged-tail instance is never cached"
+        );
+        // Asking again builds again.
+        let (again, _) = run(&mut c, req, Behavior::default()).await.ok();
+        assert_eq!(resolved(&again), ResolveKind::FullBuild);
+        assert_eq!(again.info, r.info);
+    }
+
+    // The lagging instance still serves its own (published-only) catalog state.
+    let (hit, ops) = run(&mut c, lag_req, Behavior::default()).await.ok();
+    assert_eq!((hit.version, resolved(&hit)), (1, ResolveKind::CacheHit));
+    assert!(ops.is_empty());
+    assert_eq!(hit.info, lag.info);
+}
+
+/// CM1 at L0: a published-only tail is cached under its canonical identity. The bound wins over
+/// a newer unratified file on disk, a repeat is a 0-op CACHE_HIT, and a different tail at the same
+/// version is a different entry. Both equal the in-process JNR build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_latest_published_tail_matches_in_process_build_and_hits() {
+    let fx = cm_fixture();
+    let tail = vec![cm_publish(&fx, 1), cm_publish(&fx, 2)];
+    // Written by a writer whose commit UC never ratified: invisible at max_catalog_version 2.
+    cm_publish(&fx, 3);
+    let server = TestServer::start().await;
+    let specs = default_specs();
+    let mut c = server.client().await;
+
+    for (n, tail) in [tail, vec![]].into_iter().enumerate() {
+        let req = cm_request(&fx, 2, &tail, &specs);
+        let (r1, _) = run(&mut c, req.clone(), Behavior::default()).await.ok();
+        assert_eq!(r1.version, 2);
+        assert_eq!(resolved(&r1), ResolveKind::FullBuild, "{tail:?}");
+        let local = local_catalog_snapshot(&fx, &req).unwrap();
+        assert_parity_with(&local, &r1, &specs);
+        assert_eq!(live_paths(&r1), ["file_1.parquet", "file_2.parquet"]);
+        assert!(segment(&r1).delta_is_staged.iter().all(|s| !s));
+
+        let (r2, ops) = run(&mut c, req, Behavior::default()).await.ok();
+        assert_eq!(resolved(&r2), ResolveKind::CacheHit);
+        assert_eq!(op_counts(&r2), (0, 0));
+        assert!(ops.is_empty());
+        assert_eq!(r2.info, r1.info);
+        assert_parity_with(&local, &r2, &specs);
+        assert_eq!(
+            server.core.cached_instances_per_table().get(&fx.table_id),
+            Some(&(n as i32 + 1)),
+            "one instance per canonical tail"
+        );
+    }
+    assert_eq!(server.stats().await.builds_started, 2);
+}
+
+/// A latest re-listing that finds no new commit resolves to CACHE_HIT and is a renewal, not a
+/// build; one that finds a new commit is a build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn latest_renewal_counts_as_renewal_not_build() {
+    let fx = fixture("basic_partitioned");
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let specs = default_specs();
+    let counts = |s: &proto::DebugStats| (s.builds_started, s.latest_renewals);
+
+    let (r1, _) = run(
+        &mut c,
+        latest_request(&fx, 0, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r1), ResolveKind::FullBuild);
+    assert_eq!(counts(&server.stats().await), (1, 0));
+
+    let (r2, _) = run(
+        &mut c,
+        latest_request(&fx, 0, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r2), ResolveKind::CacheHit);
+    assert_eq!(op_counts(&r2), (0, 1), "one renewal listing");
+    assert_eq!(counts(&server.stats().await), (1, 1));
+
+    // Within staleness: no listing at all, neither counter moves.
+    let (r3, _) = run(
+        &mut c,
+        latest_request(&fx, 60_000, specs.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r3), ResolveKind::CacheHit);
+    assert_eq!(counts(&server.stats().await), (1, 1));
+
+    append_commit(&fx, r1.version + 1, "new.parquet", Some(("letter", "z")));
+    let (r4, _) = run(&mut c, latest_request(&fx, 0, specs), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(resolved(&r4), ResolveKind::Incremental);
+    assert_eq!(counts(&server.stats().await), (2, 1));
+    assert_eq!(
+        server
+            .core
+            .counters
+            .latest_relists_started
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
 /// N1: the server sends a ListingHint for `_delta_log` listings and the client's truncated
 /// result still yields the correct snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1908,7 +2165,7 @@ async fn concurrent_latest_requests_share_one_listing() {
     let mut c0 = server.client().await;
     let req = latest_request(&fx, 0, specs.clone());
     let driver = tokio::spawn(async move { run(&mut c0, req, Behavior::default()).await });
-    server.wait_builds_started(before.builds_started + 1).await;
+    server.wait_relists_started(1).await;
     let mut waiters = Vec::new();
     for _ in 0..7 {
         let mut c = server.client().await;
@@ -1940,7 +2197,9 @@ async fn concurrent_latest_requests_share_one_listing() {
         "8 concurrent latest requests -> one listing"
     );
     assert_eq!(after.ops_issued_total, before.ops_issued_total);
-    assert_eq!(after.builds_started - before.builds_started, 1);
+    // The shared re-listing found no new commit: a renewal, not a build.
+    assert_eq!(after.builds_started, before.builds_started);
+    assert_eq!(after.latest_renewals - before.latest_renewals, 1);
     assert_eq!(after.builds_coalesced - before.builds_coalesced, 7);
 }
 

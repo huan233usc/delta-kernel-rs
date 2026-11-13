@@ -597,7 +597,15 @@ impl Core {
             st.inflight.insert(bk.clone(), job.clone());
         }
         drop(st);
-        self.counters.builds_started.fetch_add(1, Ordering::Relaxed);
+        // A latest re-listing is a build only if it finds new commits; it is counted when its
+        // outcome is known (`spawn_build`).
+        if matches!(target, Target::Latest { .. }) && base.is_some() {
+            self.counters
+                .latest_relists_started
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counters.builds_started.fetch_add(1, Ordering::Relaxed);
+        }
         self.spawn_build(
             job.clone(),
             BuildInputs {
@@ -633,6 +641,7 @@ impl Core {
                 _ => (None, false),
             };
             let is_latest = matches!(target, Target::Latest { .. });
+            let is_relist = is_latest && base.is_some();
             // Confirmation time of a latest result: when its listing started, not when it ended.
             let started = Instant::now();
             let built = tokio::task::spawn_blocking(move || {
@@ -746,6 +755,16 @@ impl Core {
                     "snapshot build panicked: {join_err}"
                 ))),
             };
+            if is_relist {
+                let counter = match &result {
+                    Ok(BuildOutcome {
+                        kind: proto::ResolveKind::CacheHit,
+                        ..
+                    }) => &core.counters.latest_renewals,
+                    _ => &core.counters.builds_started,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(bk) = &build_key {
                 core.state.lock().unwrap().inflight.remove(bk);
             }

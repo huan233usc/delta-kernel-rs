@@ -71,6 +71,24 @@ impl TestServer {
         panic!("build {n} never started");
     }
 
+    /// Waits until `n` path-based latest re-listings have started (in-process counter).
+    pub async fn wait_relists_started(&self, n: i64) {
+        use std::sync::atomic::Ordering;
+        for _ in 0..500 {
+            if self
+                .core
+                .counters
+                .latest_relists_started
+                .load(Ordering::Relaxed)
+                >= n
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("re-listing {n} never started");
+    }
+
     pub async fn start_with(config: CacheConfig, test_hooks: bool) -> Self {
         let core = Core::new("loopback-test".into(), config);
         let (listener, addr) = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
@@ -776,6 +794,35 @@ pub fn local_engine() -> PlanBasedEngine {
     PlanBasedEngine::new(None, Arc::new(SyncPlanExecutor::default()))
 }
 
+/// The in-process catalog-managed build JNR performs (`kernel_snapshot_builder_set_log_tail` and
+/// `..._with_max_catalog_version` on the FFI builder): same builder calls, default CRC replay.
+pub fn local_catalog_snapshot(
+    fx: &Fixture,
+    req: &proto::GetSnapshotRequest,
+) -> delta_kernel::Result<SnapshotRef> {
+    let Some(proto::version_spec::Spec::CatalogLatest(c)) =
+        req.at.as_ref().and_then(|a| a.spec.as_ref())
+    else {
+        panic!("not a catalog_latest request");
+    };
+    let log_tail = c
+        .log_tail
+        .iter()
+        .map(|f| {
+            delta_kernel_server::executor::file_meta_from_status(f)
+                .and_then(delta_kernel::LogPath::try_new)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut builder = Snapshot::builder_for(fx.url.as_str());
+    if !log_tail.is_empty() {
+        builder = builder.with_log_tail(log_tail);
+    }
+    builder
+        .with_max_catalog_version(c.max_catalog_version as u64)
+        .build(&local_engine())
+}
+
 pub fn local_snapshot(fx: &Fixture, version: Option<i64>) -> SnapshotRef {
     let builder = Snapshot::builder_for(fx.url.as_str());
     let builder = match version {
@@ -864,7 +911,21 @@ pub fn assert_parity(
     resp: &proto::GetSnapshotResponse,
     specs: &[proto::ScanPlanSpec],
 ) -> usize {
-    let local = local_snapshot(fx, Some(resp.version));
+    assert_parity_with(&local_snapshot(fx, Some(resp.version)), resp, specs)
+}
+
+/// [`assert_parity`] against a given in-process snapshot (e.g. a catalog-managed build).
+pub fn assert_parity_with(
+    local: &SnapshotRef,
+    resp: &proto::GetSnapshotResponse,
+    specs: &[proto::ScanPlanSpec],
+) -> usize {
+    assert_eq!(
+        resp.version,
+        local.version() as i64,
+        "snapshot version differs"
+    );
+    let local = local.clone();
     let local_info =
         delta_kernel_server::info::compute_snapshot_info(&local, &local_engine()).unwrap();
     assert_eq!(
