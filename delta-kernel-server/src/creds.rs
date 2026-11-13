@@ -148,18 +148,183 @@ pub fn storage_options(scheme: &str, resp: &Value) -> Result<Vec<(String, String
 /// op's deadline is enforced, so the object store's HTTP client bounds each call instead.
 pub const LOCAL_IO_TIMEOUT: &str = "60s";
 
-/// Builds the object store for a cloud table from UC-derived options.
+/// Mozilla's root CAs, bundled into the binary. Every HTTPS client the server builds (UC and the
+/// object stores) trusts them in addition to the system store, so the server also runs in a
+/// minimal container without `/etc/ssl/certs`.
+fn bundled_roots() -> impl Iterator<Item = &'static [u8]> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|c| c.as_ref())
+}
+
+/// Builds the UC HTTP client. Fails only if no usable root certificate can be loaded at all.
+pub fn build_uc_http_client() -> Result<reqwest::Client, String> {
+    let roots = bundled_roots()
+        .map(reqwest::Certificate::from_der)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("bundled root certificates: {e}"))?;
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .tls_certs_merge(roots)
+        .build()
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Storage schemes the server builds object stores for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloudScheme {
+    S3,
+    Azure,
+    Gcs,
+}
+
+impl CloudScheme {
+    const ALL: [CloudScheme; 3] = [CloudScheme::S3, CloudScheme::Azure, CloudScheme::Gcs];
+
+    fn of(location: &Url) -> Result<Self, String> {
+        match object_store::ObjectStoreScheme::parse(location) {
+            Ok((object_store::ObjectStoreScheme::AmazonS3, _)) => Ok(Self::S3),
+            Ok((object_store::ObjectStoreScheme::MicrosoftAzure, _)) => Ok(Self::Azure),
+            Ok((object_store::ObjectStoreScheme::GoogleCloudStorage, _)) => Ok(Self::Gcs),
+            _ => Err(format!(
+                "no cloud object store for scheme {}",
+                location.scheme()
+            )),
+        }
+    }
+
+    /// The canonical object_store name of `key` for this store, or `None` if the store does not
+    /// take it.
+    fn canonical_key(self, key: &str) -> Option<String> {
+        use object_store::aws::AmazonS3ConfigKey;
+        use object_store::azure::AzureConfigKey;
+        use object_store::gcp::GoogleConfigKey;
+        let key = key.to_ascii_lowercase();
+        match self {
+            Self::S3 => key
+                .parse::<AmazonS3ConfigKey>()
+                .ok()
+                .map(|k| k.as_ref().to_string()),
+            Self::Azure => key
+                .parse::<AzureConfigKey>()
+                .ok()
+                .map(|k| k.as_ref().to_string()),
+            Self::Gcs => key
+                .parse::<GoogleConfigKey>()
+                .ok()
+                .map(|k| k.as_ref().to_string()),
+        }
+    }
+}
+
+/// Server-side object_store options (`--storage-option`, `--s3-*`), applied to every cloud store
+/// the server builds, under the UC-vended credential options.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StorageOverrides(Vec<(String, String)>);
+
+impl StorageOverrides {
+    /// Validates every key: it must be an object_store config key of S3, Azure or GCS. A key
+    /// applies only to the stores that take it (an `aws_*` key does not reach an Azure store).
+    pub fn new(options: Vec<(String, String)>) -> Result<Self, String> {
+        for (k, _) in &options {
+            if !CloudScheme::ALL
+                .iter()
+                .any(|s| s.canonical_key(k).is_some())
+            {
+                return Err(format!(
+                    "unknown object_store option {k:?} (expected an S3, Azure or GCS config key)"
+                ));
+            }
+        }
+        Ok(Self(options))
+    }
+
+    /// Parses `KEY=VALUE`.
+    pub fn parse_pair(s: &str) -> Result<(String, String), String> {
+        match s.split_once('=') {
+            Some((k, v)) if !k.trim().is_empty() => Ok((k.trim().to_string(), v.to_string())),
+            _ => Err(format!("expected KEY=VALUE, got {s:?}")),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Option keys (values may be secrets).
+    pub fn keys(&self) -> Vec<&str> {
+        self.0.iter().map(|(k, _)| k.as_str()).collect()
+    }
+}
+
+/// The options a cloud store is built with, by canonical key, in precedence order: the default
+/// [`LOCAL_IO_TIMEOUT`], then the server's overrides, then the UC-vended options. Vended options
+/// win, so a server flag can never replace the caller's credential.
+pub fn merge_store_options(
+    location: &Url,
+    overrides: &StorageOverrides,
+    vended: &[(String, String)],
+) -> Result<Vec<(String, String)>, String> {
+    let scheme = CloudScheme::of(location)?;
+    let mut merged: Vec<(String, String)> = Vec::new();
+    let defaults = [("timeout".to_string(), LOCAL_IO_TIMEOUT.to_string())];
+    for (k, v) in defaults.iter().chain(&overrides.0).chain(vended) {
+        let Some(key) = scheme.canonical_key(k) else {
+            continue;
+        };
+        merged.retain(|(existing, _)| *existing != key);
+        merged.push((key, v.clone()));
+    }
+    Ok(merged)
+}
+
+/// Builds the object store for a cloud table from UC-derived options plus the server overrides.
+/// With an S3 endpoint and no `aws_virtual_hosted_style_request`, requests are path-style
+/// (`{endpoint}/{bucket}/{key}`), which is what LocalStack and MinIO expect.
 pub fn build_store(
     location: &Url,
-    options: &[(String, String)],
+    overrides: &StorageOverrides,
+    vended: &[(String, String)],
 ) -> Result<Arc<DynObjectStore>, String> {
-    let with_timeout = options.iter().cloned().chain(std::iter::once((
-        "timeout".to_string(),
-        LOCAL_IO_TIMEOUT.to_string(),
-    )));
-    let (store, _) = object_store::parse_url_opts(location, with_timeout)
-        .map_err(|e| format!("object store for {}: {e}", location.scheme()))?;
-    Ok(Arc::new(store))
+    let options = merge_store_options(location, overrides, vended)?;
+    let mut client = object_store::ClientOptions::new();
+    for der in bundled_roots() {
+        client = client.with_root_certificate(
+            object_store::Certificate::from_der(der)
+                .map_err(|e| format!("bundled root certificate: {e}"))?,
+        );
+    }
+    let err = |e: object_store::Error| format!("object store for {}: {e}", location.scheme());
+    let store: Arc<DynObjectStore> = match CloudScheme::of(location)? {
+        CloudScheme::S3 => {
+            let mut b = object_store::aws::AmazonS3Builder::new()
+                .with_url(location.as_str())
+                .with_client_options(client);
+            for (k, v) in options {
+                b = b.with_config(k.parse().map_err(err)?, v);
+            }
+            Arc::new(b.build().map_err(err)?)
+        }
+        CloudScheme::Azure => {
+            let mut b = object_store::azure::MicrosoftAzureBuilder::new()
+                .with_url(location.as_str())
+                .with_client_options(client);
+            for (k, v) in options {
+                b = b.with_config(k.parse().map_err(err)?, v);
+            }
+            Arc::new(b.build().map_err(err)?)
+        }
+        CloudScheme::Gcs => {
+            let mut b = object_store::gcp::GoogleCloudStorageBuilder::new()
+                .with_url(location.as_str())
+                .with_client_options(client);
+            for (k, v) in options {
+                b = b.with_config(k.parse().map_err(err)?, v);
+            }
+            Arc::new(b.build().map_err(err)?)
+        }
+    };
+    Ok(store)
 }
 
 /// Longest UC-provided text kept in an error message.
@@ -213,7 +378,11 @@ fn now_ms() -> i64 {
 }
 
 pub struct CredentialProvider {
-    http: reqwest::Client,
+    /// `Err` if no TLS root could be loaded: UC calls then fail with UNAVAILABLE instead of the
+    /// server refusing to start.
+    http: Result<reqwest::Client, String>,
+    /// Server-side object_store options for every cloud store.
+    overrides: StorageOverrides,
     /// Replaces `https://{workspace_host}` as the UC base URL (tests, proxies).
     endpoint_override: Option<String>,
     /// Treat `file://` tables like cloud tables (test hook: exercises the UC path locally).
@@ -224,12 +393,18 @@ pub struct CredentialProvider {
 }
 
 impl CredentialProvider {
-    pub fn new(endpoint_override: Option<String>, credentials_for_file: bool) -> Self {
+    pub fn new(
+        endpoint_override: Option<String>,
+        credentials_for_file: bool,
+        overrides: StorageOverrides,
+    ) -> Self {
+        let http = build_uc_http_client();
+        if let Err(e) = &http {
+            tracing::error!(error = %e, "cannot build the UC HTTP client; UC calls will fail");
+        }
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("build UC http client"),
+            http,
+            overrides,
             endpoint_override,
             credentials_for_file,
             cache: Mutex::default(),
@@ -280,7 +455,8 @@ impl CredentialProvider {
         } else {
             let options =
                 storage_options(location.scheme(), &resp).map_err(ServerError::internal)?;
-            let store = build_store(location, &options).map_err(ServerError::internal)?;
+            let store =
+                build_store(location, &self.overrides, &options).map_err(ServerError::internal)?;
             (options, Arc::new(LocalIo::new(store)))
         };
         let cred = Arc::new(StorageCredential {
@@ -329,8 +505,11 @@ impl CredentialProvider {
                 ),
             )
         };
-        let resp = self
+        let http = self
             .http
+            .as_ref()
+            .map_err(|e| unavailable(format!("UC HTTP client unavailable: {e}")))?;
+        let resp = http
             .post(&url)
             .bearer_auth(&auth.bearer_token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -408,6 +587,16 @@ mod tests {
         }
     }
 
+    fn none() -> StorageOverrides {
+        StorageOverrides::default()
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     fn opts(v: Vec<(String, String)>) -> HashMap<String, String> {
         v.into_iter().collect()
     }
@@ -420,7 +609,7 @@ mod tests {
         assert_eq!(m["aws_access_key_id"], "AK");
         assert_eq!(m["aws_secret_access_key"], "SK");
         assert_eq!(m["aws_session_token"], "ST");
-        build_store(&Url::parse("s3://bucket/t/").unwrap(), &o).unwrap();
+        build_store(&Url::parse("s3://bucket/t/").unwrap(), &none(), &o).unwrap();
         assert!(storage_options("s3", &json!({})).is_err());
     }
 
@@ -431,6 +620,7 @@ mod tests {
         assert_eq!(opts(o.clone())["azure_storage_sas_token"], "sv=2024&sig=x");
         build_store(
             &Url::parse("abfss://c@acct.dfs.core.windows.net/t/").unwrap(),
+            &none(),
             &o,
         )
         .unwrap();
@@ -442,7 +632,7 @@ mod tests {
         let resp = json!({"gcp_oauth_token": {"oauth_token": "ya29.x"}});
         let o = storage_options("gs", &resp).unwrap();
         assert_eq!(opts(o.clone())["google_bearer_token"], "ya29.x");
-        build_store(&Url::parse("gs://bucket/t/").unwrap(), &o).unwrap();
+        build_store(&Url::parse("gs://bucket/t/").unwrap(), &none(), &o).unwrap();
     }
 
     #[test]
@@ -485,5 +675,135 @@ mod tests {
         assert!(d.contains("aws_secret_access_key") && !d.contains("TOPSECRET"));
         assert_eq!(token_hash("abc").len(), 64);
         assert_ne!(token_hash("abc"), "abc");
+    }
+
+    #[test]
+    fn server_options_merge_under_vended_credentials() {
+        let overrides = StorageOverrides::new(pairs(&[
+            ("aws_endpoint", "http://localstack:4566"),
+            ("AWS_ALLOW_HTTP", "true"),
+            ("region", "us-east-1"),
+            // A server flag must not replace the caller's credential.
+            ("aws_access_key_id", "SERVER-KEY"),
+            ("aws_session_token", "SERVER-TOKEN"),
+            ("timeout", "5s"),
+            // Azure-only: does not reach an S3 store.
+            ("azure_storage_account_name", "acct"),
+        ]))
+        .unwrap();
+        let vended = pairs(&[
+            ("aws_access_key_id", "AK"),
+            ("aws_secret_access_key", "SK"),
+            ("aws_session_token", "ST"),
+        ]);
+        let s3 = Url::parse("s3://test/t/").unwrap();
+        let merged = merge_store_options(&s3, &overrides, &vended).unwrap();
+        let m = opts(merged.clone());
+        assert_eq!(
+            m.len(),
+            merged.len(),
+            "one entry per canonical key: {merged:?}"
+        );
+        assert_eq!(m["aws_access_key_id"], "AK");
+        assert_eq!(m["aws_secret_access_key"], "SK");
+        assert_eq!(m["aws_session_token"], "ST");
+        assert_eq!(m["aws_endpoint"], "http://localstack:4566");
+        assert_eq!(m["allow_http"], "true");
+        assert_eq!(m["aws_region"], "us-east-1");
+        assert_eq!(
+            m["timeout"], "5s",
+            "a server option replaces the default timeout"
+        );
+        assert!(!m.contains_key("azure_storage_account_name"));
+
+        // No overrides: just the vended credential plus the default timeout.
+        let m = opts(merge_store_options(&s3, &none(), &vended).unwrap());
+        assert_eq!(m.len(), 4);
+        assert_eq!(m["timeout"], LOCAL_IO_TIMEOUT);
+
+        // The Azure store keeps its own keys and the generic client keys only.
+        let az = Url::parse("abfss://c@acct.dfs.core.windows.net/t/").unwrap();
+        let m = opts(merge_store_options(&az, &overrides, &[]).unwrap());
+        assert_eq!(m["azure_storage_account_name"], "acct");
+        assert!(!m.keys().any(|k| k.starts_with("aws_")), "{m:?}");
+    }
+
+    #[test]
+    fn unknown_or_malformed_storage_options_are_rejected() {
+        assert!(StorageOverrides::new(pairs(&[("aws_endpointt", "x")])).is_err());
+        assert!(StorageOverrides::new(pairs(&[("google_bearer_token", "x")])).is_ok());
+        assert_eq!(
+            StorageOverrides::parse_pair("aws_endpoint=http://h:1/?a=b").unwrap(),
+            ("aws_endpoint".to_string(), "http://h:1/?a=b".to_string())
+        );
+        assert!(StorageOverrides::parse_pair("novalue").is_err());
+        assert!(StorageOverrides::parse_pair("=v").is_err());
+    }
+
+    /// The S3 store built for a UC-vended credential sends requests to `--s3-endpoint`, path-style
+    /// (`/{bucket}/{key}`), over plain HTTP, signed with the vended key, not to AWS.
+    #[tokio::test]
+    async fn s3_store_uses_endpoint_path_style() {
+        use object_store::ObjectStoreExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut n = 0;
+            while !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                n += sock.read(&mut buf[n..]).await.unwrap();
+            }
+            sock.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        let overrides = StorageOverrides::new(pairs(&[
+            ("aws_endpoint", &endpoint),
+            ("aws_allow_http", "true"),
+            ("aws_region", "us-east-1"),
+        ]))
+        .unwrap();
+        let vended = pairs(&[
+            ("aws_access_key_id", "VENDEDKEY"),
+            ("aws_secret_access_key", "SK"),
+            ("aws_session_token", "ST"),
+        ]);
+        let store = build_store(
+            &Url::parse("s3://test/warehouse/t/").unwrap(),
+            &overrides,
+            &vended,
+        )
+        .unwrap();
+        let err = store
+            .get(&object_store::path::Path::from(
+                "warehouse/t/_delta_log/_last_checkpoint",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, object_store::Error::NotFound { .. }), "{err}");
+        let request = server.await.unwrap();
+        let first = request.lines().next().unwrap();
+        assert_eq!(
+            first,
+            "GET /test/warehouse/t/_delta_log/_last_checkpoint HTTP/1.1"
+        );
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.contains(&format!("host: {}", endpoint.trim_start_matches("http://"))),
+            "{request}"
+        );
+        assert!(lower.contains("credential=vendedkey/"), "{request}");
+        assert!(lower.contains("x-amz-security-token: st"), "{request}");
+    }
+
+    #[test]
+    fn https_clients_do_not_need_a_system_trust_store() {
+        // The bundled roots alone satisfy the TLS verifier; this is what lets the binary start in
+        // a container without /etc/ssl/certs (see tests/local_io.rs for the env-var run).
+        assert!(bundled_roots().count() > 100);
+        build_uc_http_client().unwrap();
     }
 }

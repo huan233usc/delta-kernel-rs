@@ -65,11 +65,83 @@ delta-kernel-server \
 | `--max-cache-bytes` | `4 GiB` | global LRU bound over estimated memory (snapshot heap + plan bytes) |
 | `--io-mode` | `local` | `local`: simple IO ops run on the server; `forward`: every op goes to the client |
 | `--local-io-threads` | `8` | worker threads and in-flight cap for server-side IO; when all are busy, requests fail with `UNAVAILABLE` |
-| `--uc-endpoint-override` | none | UC base URL instead of `https://{auth.workspace_host}` (tests, proxies) |
+| `--uc-endpoint-override` | none | UC base URL instead of `https://{auth.workspace_host}` (tests, proxies, HiFi) |
+| `--storage-option KEY=VALUE` | none, repeatable | object_store option for every cloud store the server builds, e.g. `aws_endpoint`, `aws_allow_http`, `aws_region`, `aws_virtual_hosted_style_request`; unknown keys fail at startup |
+| `--s3-endpoint URL` | none | same as `--storage-option aws_endpoint=URL`; requests are path-style (`{endpoint}/{bucket}/{key}`) unless `aws_virtual_hosted_style_request=true` |
+| `--s3-allow-http` | off | same as `--storage-option aws_allow_http=true` |
+| `--s3-region REGION` | none | same as `--storage-option aws_region=REGION` |
 | `--test-uc-credentials-for-file` | off, hidden | test only, needs `--enable-test-hooks`: run the UC credential check for `file://` tables too |
+
+Storage options are merged per store in this order, later wins: default `timeout=60s`, the
+`--s3-*` flags, `--storage-option`, then the UC-vended credential (`aws_access_key_id`,
+`aws_secret_access_key`, `aws_session_token`, `azure_storage_sas_token`, `google_bearer_token`). A
+server flag therefore cannot replace the caller's credential. Keys are compared after object_store
+canonicalization (`endpoint` = `aws_endpoint`), and a key only reaches the stores that take it (an
+`aws_*` key never reaches an Azure store). UC responses carry no endpoint or region, so without
+these flags an `s3://` table goes to real AWS.
+
+TLS roots: the binary bundles Mozilla's root CAs (`webpki-root-certs`) and trusts them in addition
+to the system store, for UC and for every object store. It runs in an image without
+`/etc/ssl/certs` or `ca-certificates`. If no HTTPS client can be built at all, the server still
+starts and UC calls fail with `UNAVAILABLE`.
 
 SIGTERM or Ctrl-C shuts the server down gracefully. Logs go to stderr; `RUST_LOG` controls the
 level (default `info`). Max gRPC message size is 256 MiB in both directions.
+
+## Running in a separate container
+
+The release binary links glibc dynamically, so use a glibc base image of the same or newer
+generation as the build host (e.g. `debian:bookworm-slim`). No `ca-certificates` package is
+needed.
+
+```bash
+mkdir -p /tmp/dks && cp $CARGO_TARGET_DIR/release/delta-kernel-server /tmp/dks/
+docker network create dks || true     # or reuse the network LocalStack runs on
+
+docker run --rm --name dks --network dks -p 50051:50051 \
+  -v /tmp/dks:/dks \
+  debian:bookworm-slim \
+  /dks/delta-kernel-server \
+    --listen 0.0.0.0:50051 \
+    --endpoint-file /dks/endpoint \
+    --instance-id hifi-1 \
+    --enable-test-hooks \
+    --uc-endpoint-override http://<uc-host>:<uc-port> \
+    --s3-endpoint http://<s3-host>:<s3-port> --s3-allow-http --s3-region us-east-1
+```
+
+- **Listen on `0.0.0.0`** inside the container. `127.0.0.1` is the container's own loopback.
+- **The endpoint file holds the bind address** (`0.0.0.0:50051`). A client on the host connects to
+  `127.0.0.1:50051` through `-p`, so do not hand the file to it verbatim.
+- **Addresses as seen from the container**: `<uc-host>` and `<s3-host>` are how the container
+  reaches UC and S3. A service on the host is at the bridge gateway (`docker network inspect dks
+  -f '{{(index .IPAM.Config 0).Gateway}}'`), or `host.docker.internal` with `--add-host
+  host.docker.internal:host-gateway`. A container on the same network is reachable by its name.
+  A host service bound to `127.0.0.1` only cannot be reached from a container; bind it to
+  `0.0.0.0` or use `--network host` (then drop `-p` and the client uses the server's port
+  directly).
+- **`file://` tables** need the table directory mounted at the same path in the container
+  (`-v /path:/path`), because table locations come from the client.
+
+### HiFi run (UC control plane + LocalStack)
+
+1. **Control plane**: in a universe worktree, run
+   `bazel run //managed-catalog/src/test/hifi:control-plane-server`, with LocalStack running as
+   the HiFi setup provides it.
+2. **Read the dynamic endpoints from the test JVM**. Both ports change every run:
+   - UC API URL: `CredentialManager.getApiUrlOpt` → `--uc-endpoint-override`;
+   - LocalStack: Hadoop conf `fs.s3a.endpoint` → `--s3-endpoint`.
+   Tables live in bucket `test` in `us-east-1` and need path-style requests, which is the default
+   once `--s3-endpoint` is set. Rewrite `localhost` to the address the container reaches (see
+   above).
+3. **Start the server** as in the recipe above, with `--uc-endpoint-override http://<gw>:<uc-port>
+   --s3-endpoint http://<gw>:<localstack-port> --s3-allow-http --s3-region us-east-1`. Without
+   `--s3-endpoint`, the server's `_last_checkpoint` read goes to
+   `https://s3.us-east-1.amazonaws.com/test/...` and fails (`Received redirect without
+   LOCATION`).
+4. **Point the client** at the published port (`127.0.0.1:50051`). The client forwards its UC
+   token in `GetSnapshotRequest.auth`; the server exchanges it at the overridden UC endpoint for
+   the LocalStack credential.
 
 ## Server semantics (SPEC §7)
 
@@ -86,7 +158,10 @@ level (default `info`). Max gRPC message size is 256 MiB in both directions.
   timed-out op cannot be dropped; cloud stores' 60 s object_store client timeout bounds how long a
   stuck call can hold a permit.
 - **Server-side IO failure** that fails a job → `UNAVAILABLE` (retryable); a client-reported op
-  failure stays `OP_FAILED`.
+  failure stays `OP_FAILED`. The message starts with the wire code (`UNAVAILABLE: server-side IO
+  failed (ObjectStore error): …`, `OP_FAILED: client op failed (IO error): …`) and names the
+  kernel error kind, never its ffi number, which collided with `Error.Code` values (ffi
+  `ObjectStore` = 8, `PERMISSION_DENIED` = 8).
 - **Counters**: `ServerStats.ops_issued` = ops forwarded to this request's stream;
   `ServerStats.ops_local` = server-side ops run by jobs this request started (a coalesced waiter
   that only waited reports 0). `DebugStats.ops_local_total` sums all server-side ops.
@@ -166,7 +241,10 @@ cargo +nightly fmt -- --check   # the repo's rustfmt.toml uses nightly-only opti
 `tests/local_io.rs` covers SPEC v9: cold-build op split (forwarded = QueryPlan ops only), local
 FileNotFound / taint / ListingHint, a forward-mode smoke run, and the UC credential provider
 against a mock UC HTTP server (endpoint choice, caching and expiry, 401/403/5xx, authz on cache
-hit, token absent from trace logs of the real binary).
+hit, token absent from trace logs of the real binary), the binary running with `SSL_CERT_FILE` /
+`SSL_CERT_DIR` pointed at nothing (no system roots), and storage-option flag validation. Unit
+tests in `src/creds.rs` cover the option merge (vended credentials win) and an S3 store built
+with an endpoint sending a path-style, vended-key-signed request to a local mock.
 
 `tests/loopback.rs` (L0a) starts the server in-process on `127.0.0.1:0` (default `local` IO mode;
 forward-specific mechanics such as handoff of a listing op run in `forward` mode). Its test client decodes

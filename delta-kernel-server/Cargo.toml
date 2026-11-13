@@ -38,6 +38,8 @@ hex = "0.4"
 # UC temporary-credential calls.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 sha2 = "0.10"
+# Bundled root CAs for UC and object-store TLS: the server must run without a system trust store.
+webpki-root-certs = "1"
 clap = { version = "4.5", features = ["derive"] }
 prost = "0.13"
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "time"] }
@@ -64,5 +66,6 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "test-utils",
 ] }
 tar = "0.4"
+tokio = { version = "1.47", features = ["io-util"] }
 tempfile = "3"
 zstd = "0.13"

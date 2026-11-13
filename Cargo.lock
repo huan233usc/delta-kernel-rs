@@ -1580,6 +1580,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "webpki-root-certs",
  "zstd 0.13.3",
 ]
 

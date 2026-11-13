@@ -570,11 +570,14 @@ async fn unreachable_local_io_is_unavailable() {
     };
     assert_eq!(err.code, Code::Unavailable as i32, "{err:?}");
     assert!(err.retryable);
+    // The text names the real code; no bare kernel-error number (SPEC v9.1 HiFi finding).
     assert!(
-        err.message.contains("server-side IO failed"),
+        err.message
+            .starts_with(delta_kernel_server::errors::LOCAL_IO_FAILED_PREFIX),
         "{}",
         err.message
     );
+    assert!(!err.message.contains("(code "), "{}", err.message);
     assert!(server.core.cached_instances_per_table().is_empty());
     let (ok, _) = run(
         &mut c,
@@ -831,4 +834,109 @@ fn local_and_forward_parquet_footer_schemas_match() {
         let forwarded = proto_schema::StructType::decode(bytes.as_slice()).unwrap();
         assert_eq!(local_schema, forwarded, "{}", path.display());
     }
+}
+
+/// HiFi finding: in a container without a system trust store the server panicked building its
+/// UC client. With `SSL_CERT_FILE` / `SSL_CERT_DIR` pointing at nothing (rustls-native-certs then
+/// loads no system roots), the binary still starts, answers Ping, and completes a UC credential
+/// exchange plus a build; storage-option flags are accepted and logged by key only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn binary_runs_without_system_ca_certificates() {
+    let uc = MockUc::start();
+    uc.answer(
+        "tok-no-ca",
+        UcAnswer::Grant {
+            ttl: Duration::from_secs(3600),
+        },
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let empty_dir = dir.path().join("certs");
+    std::fs::create_dir(&empty_dir).unwrap();
+    let empty_file = dir.path().join("empty.pem");
+    std::fs::write(&empty_file, b"").unwrap();
+    let endpoint = dir.path().join("endpoint");
+    let log = dir.path().join("stderr.log");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_delta-kernel-server"))
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--instance-id",
+            "no-ca",
+            "--enable-test-hooks",
+            "--test-uc-credentials-for-file",
+            "--s3-endpoint",
+            "http://127.0.0.1:4566",
+            "--s3-allow-http",
+            "--s3-region",
+            "us-east-1",
+            "--storage-option",
+            "aws_virtual_hosted_style_request=false",
+            "--storage-option",
+            "aws_secret_access_key=SERVER-SIDE-SECRET",
+        ])
+        .arg("--uc-endpoint-override")
+        .arg(&uc.base_url)
+        .arg("--endpoint-file")
+        .arg(&endpoint)
+        .env("SSL_CERT_FILE", &empty_file)
+        .env("SSL_CERT_DIR", &empty_dir)
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut addr = None;
+    for _ in 0..400 {
+        if let Ok(s) = std::fs::read_to_string(&endpoint) {
+            addr = Some(s.trim().parse().unwrap());
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "server exited ({status}): {}",
+                std::fs::read_to_string(&log).unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut c = connect(addr.expect("endpoint file written")).await;
+    let ping = c.ping(proto::PingRequest {}).await.unwrap().into_inner();
+    assert_eq!(ping.instance_id, "no-ca");
+    let fx = fixture("table-with-dv-small");
+    let (ok, _) = run(
+        &mut c,
+        with_auth(request(&fx, 1, default_specs()), "tok-no-ca"),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&ok), ResolveKind::FullBuild);
+    assert_eq!(uc.calls().len(), 1);
+    std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    child.wait().unwrap();
+    let logs = std::fs::read_to_string(&log).unwrap();
+    assert!(!logs.contains("panicked"), "{logs}");
+    assert!(
+        logs.contains("aws_endpoint") && logs.contains("aws_allow_http"),
+        "{logs}"
+    );
+    assert!(!logs.contains("SERVER-SIDE-SECRET"), "{logs}");
+
+    // An unknown option key is a startup error, not a silently ignored flag.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_delta-kernel-server"))
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--storage-option",
+            "aws_endpont=x",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown object_store option"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

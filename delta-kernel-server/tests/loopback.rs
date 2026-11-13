@@ -667,6 +667,14 @@ async fn op_error_is_op_failed() {
         "{}",
         err.message
     );
+    assert!(
+        err.message
+            .starts_with(delta_kernel_server::errors::OP_FAILED_PREFIX)
+            && err.message.contains("(IO error)")
+            && !err.message.contains("(code "),
+        "{}",
+        err.message
+    );
     // Nothing poisoned: a healthy client builds fine afterwards.
     let (resp, _) = run(
         &mut c,

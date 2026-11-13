@@ -99,6 +99,55 @@ pub fn kernel_error_code(e: &KernelError) -> i32 {
     }
 }
 
+/// The name of an ffi `KernelError` code, for messages. Error text never shows the bare number:
+/// it is easily mistaken for a `ServerMsg.error` code (ffi `OBJECT_STORE` = 8 vs
+/// `PERMISSION_DENIED` = 8).
+pub fn kernel_code_name(code: i32) -> &'static str {
+    use codes::*;
+    match code {
+        ARROW => "Arrow",
+        ENGINE_DATA_TYPE => "EngineDataType",
+        EXTRACT => "Extract",
+        GENERIC => "Generic",
+        IO => "IO",
+        PARQUET => "Parquet",
+        OBJECT_STORE => "ObjectStore",
+        OBJECT_STORE_PATH => "ObjectStorePath",
+        FILE_NOT_FOUND => "FileNotFound",
+        MISSING_COLUMN => "MissingColumn",
+        UNEXPECTED_COLUMN_TYPE => "UnexpectedColumnType",
+        MISSING_DATA => "MissingData",
+        MISSING_VERSION => "MissingVersion",
+        DELETION_VECTOR => "DeletionVector",
+        INVALID_URL => "InvalidUrl",
+        MALFORMED_JSON => "MalformedJson",
+        MISSING_METADATA => "MissingMetadata",
+        MISSING_PROTOCOL => "MissingProtocol",
+        INVALID_PROTOCOL => "InvalidProtocol",
+        MISSING_METADATA_AND_PROTOCOL => "MissingMetadataAndProtocol",
+        PARSE => "Parse",
+        JOIN_FAILURE => "JoinFailure",
+        INVALID_TABLE_LOCATION => "InvalidTableLocation",
+        INVALID_STRUCT_DATA => "InvalidStructData",
+        INTERNAL => "Internal",
+        INVALID_EXPRESSION => "InvalidExpression",
+        INVALID_LOG_PATH => "InvalidLogPath",
+        FILE_ALREADY_EXISTS => "FileAlreadyExists",
+        UNSUPPORTED => "Unsupported",
+        INVALID_CHECKPOINT => "InvalidCheckpoint",
+        SCHEMA => "Schema",
+        CANCELLED => "Cancelled",
+        INVALID_LOG_SEGMENT => "InvalidLogSegment",
+        EMPTY_LOG => "EmptyLog",
+        _ => "Unknown",
+    }
+}
+
+/// Message prefix of an `OP_FAILED` error (client-reported op failure).
+pub const OP_FAILED_PREFIX: &str = "OP_FAILED: client op failed";
+/// Message prefix of the `UNAVAILABLE` error for a failed server-side op (SPEC v9.1).
+pub const LOCAL_IO_FAILED_PREFIX: &str = "UNAVAILABLE: server-side IO failed";
+
 /// Converts a wire error from the client back into a kernel error, mirroring ffi's
 /// `From<EngineExecError> for KernelError`.
 pub fn kernel_error_from_code(code: i32, message: String) -> KernelError {
@@ -128,7 +177,10 @@ pub fn kernel_error_from_code(code: i32, message: String) -> KernelError {
         MISSING_PROTOCOL => KernelError::MissingProtocol,
         MISSING_METADATA_AND_PROTOCOL => KernelError::MissingMetadataAndProtocol,
         CANCELLED => KernelError::Cancelled,
-        other => KernelError::generic(format!("engine execution error (code {other}): {message}")),
+        other => KernelError::generic(format!(
+            "engine execution error ({} error): {message}",
+            kernel_code_name(other)
+        )),
     }
 }
 
@@ -252,8 +304,9 @@ pub fn classify_kernel_error(
         return ServerError::new(
             Code::OpFailed,
             format!(
-                "client op failed (code {}): {}; kernel error: {e}",
-                op_err.code, op_err.message
+                "{OP_FAILED_PREFIX} ({} error): {}; kernel error: {e}",
+                kernel_code_name(op_err.code),
+                op_err.message
             ),
         );
     }
@@ -269,5 +322,24 @@ pub fn classify_kernel_error(
             ServerError::new(Code::TableNotFound, e.to_string())
         }
         _ => ServerError::internal(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn op_failure_text_names_the_kernel_error_not_a_number() {
+        let op_err = proto::KernelError {
+            code: codes::OBJECT_STORE,
+            message: "Received redirect without LOCATION".into(),
+        };
+        let e = classify_kernel_error(&KernelError::generic("x"), None, Some(&op_err));
+        assert_eq!(e.code, proto::error::Code::OpFailed);
+        assert!(e.message.starts_with(OP_FAILED_PREFIX), "{}", e.message);
+        assert!(e.message.contains("(ObjectStore error)"), "{}", e.message);
+        assert!(!e.message.contains("code 8"), "{}", e.message);
+        assert_eq!(kernel_code_name(8), "ObjectStore");
     }
 }

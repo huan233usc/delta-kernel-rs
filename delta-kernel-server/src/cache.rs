@@ -20,8 +20,11 @@ use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::{LogPath, Snapshot, SnapshotRef};
 use tokio::sync::watch;
 
-use crate::creds::CredentialProvider;
-use crate::errors::{ServerError, classify_build_error, classify_kernel_error};
+use crate::creds::{CredentialProvider, StorageOverrides};
+use crate::errors::{
+    LOCAL_IO_FAILED_PREFIX, OP_FAILED_PREFIX, ServerError, classify_build_error,
+    classify_kernel_error,
+};
 use crate::executor::{LocalCtx, OpChannel, RemotePlanExecutor, StreamPort};
 use crate::info::{SegmentId, compute_snapshot_info, has_staged_commits, segment_id};
 use crate::local_io::{LocalIo, LocalIoPool};
@@ -60,6 +63,9 @@ pub struct CacheConfig {
     pub credentials_for_file: bool,
     /// Worker threads (and in-flight permits) for server-side IO.
     pub local_io_threads: usize,
+    /// object_store options for every cloud store the server builds (`--storage-option`,
+    /// `--s3-*`); UC-vended credential options take precedence.
+    pub storage_options: StorageOverrides,
 }
 
 impl Default for CacheConfig {
@@ -71,6 +77,7 @@ impl Default for CacheConfig {
             uc_endpoint_override: None,
             credentials_for_file: false,
             local_io_threads: DEFAULT_LOCAL_IO_THREADS,
+            storage_options: StorageOverrides::default(),
         }
     }
 }
@@ -315,6 +322,7 @@ impl Core {
         let creds = CredentialProvider::new(
             config.uc_endpoint_override.clone(),
             config.credentials_for_file,
+            config.storage_options.clone(),
         );
         let io_pool = LocalIoPool::new(config.local_io_threads);
         Arc::new(Self {
@@ -928,7 +936,7 @@ fn local_unavailable(channel: &OpChannel, err: ServerError) -> ServerError {
         ServerError::new(
             Code::Unavailable,
             err.message
-                .replacen("client op failed", "server-side IO failed", 1),
+                .replacen(OP_FAILED_PREFIX, LOCAL_IO_FAILED_PREFIX, 1),
         )
     } else {
         err

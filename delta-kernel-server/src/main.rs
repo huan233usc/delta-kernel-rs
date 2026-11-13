@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use delta_kernel_server::cache::{CacheConfig, Core, DEFAULT_LOCAL_IO_THREADS, IoMode, KERNEL_REV};
+use delta_kernel_server::creds::StorageOverrides;
 use delta_kernel_server::service::{KernelService, bind, serve, write_endpoint_file};
 
 #[derive(Parser, Debug)]
@@ -42,6 +43,22 @@ struct Args {
     /// ones abandoned after their deadline; when all are busy, requests fail with UNAVAILABLE.
     #[arg(long, default_value_t = DEFAULT_LOCAL_IO_THREADS as u16, value_parser = clap::value_parser!(u16).range(1..))]
     local_io_threads: u16,
+    /// object_store option applied to every cloud store the server builds, as KEY=VALUE
+    /// (repeatable), e.g. `aws_endpoint=http://localstack:4566`, `aws_allow_http=true`,
+    /// `aws_region=us-east-1`, `aws_virtual_hosted_style_request=false`. UC-vended credential
+    /// options (key, secret, session token, SAS, OAuth token) always win over these.
+    #[arg(long = "storage-option", value_name = "KEY=VALUE", value_parser = StorageOverrides::parse_pair)]
+    storage_options: Vec<(String, String)>,
+    /// S3 endpoint for every s3:// table (`aws_endpoint`). Requests are path-style unless
+    /// `--storage-option aws_virtual_hosted_style_request=true`.
+    #[arg(long, value_name = "URL")]
+    s3_endpoint: Option<String>,
+    /// Allow plain-HTTP S3 endpoints (`aws_allow_http=true`).
+    #[arg(long, default_value_t = false)]
+    s3_allow_http: bool,
+    /// S3 region (`aws_region`).
+    #[arg(long, value_name = "REGION")]
+    s3_region: Option<String>,
     /// Test only (requires --enable-test-hooks): require UC credentials for file:// tables too.
     #[arg(
         long,
@@ -62,6 +79,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
+    // Convenience flags first: an explicit --storage-option for the same key wins.
+    let mut storage_options: Vec<(String, String)> = Vec::new();
+    if let Some(endpoint) = &args.s3_endpoint {
+        storage_options.push(("aws_endpoint".into(), endpoint.clone()));
+    }
+    if args.s3_allow_http {
+        storage_options.push(("aws_allow_http".into(), "true".into()));
+    }
+    if let Some(region) = &args.s3_region {
+        storage_options.push(("aws_region".into(), region.clone()));
+    }
+    storage_options.extend(args.storage_options.iter().cloned());
+    let storage_options = StorageOverrides::new(storage_options)?;
+    if !storage_options.is_empty() {
+        // Keys only: values may be secrets.
+        tracing::info!(keys = ?storage_options.keys(), "server-side object_store options");
+    }
     let instance_id = args.instance_id.unwrap_or_else(|| {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -78,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             uc_endpoint_override: args.uc_endpoint_override.clone(),
             credentials_for_file: args.test_uc_credentials_for_file,
             local_io_threads: args.local_io_threads as usize,
+            storage_options,
         },
     );
     let (listener, addr) = bind(args.listen).await?;
