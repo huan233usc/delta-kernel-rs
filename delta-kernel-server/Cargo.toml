@@ -30,6 +30,7 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "geo-type-in-dev",
   "internal-api",
 ] }
+async-trait = "0.1"
 bytes = "1.10"
 # v9 hybrid IO: FileListing / ReadBytes / HeadFile / ParquetFooter run on the server through the
 # default engine's object_store handlers.

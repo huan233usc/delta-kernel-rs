@@ -91,12 +91,27 @@ how to authenticate; the store always authenticates with the UC-vended credentia
 - **Merge order** per store, later wins: default `timeout=60s`, the `--s3-*` flags,
   `--storage-option`, the UC-vended credential, then forced auth settings. Keys are compared after
   object_store canonicalization, and a key only reaches stores that take it.
+- **Trusted-operator transport knobs**: `allow_http` (and `--s3-allow-http`), `proxy_url` and
+  `proxy_ca_certificate` do not change how a store authenticates, but they can expose the vended
+  credential on the wire. Plain HTTP sends the session token / SAS / OAuth token unencrypted; a
+  proxy (with its own CA, able to intercept TLS) sees every request. Use them only for trusted
+  private endpoints and proxies (LocalStack, Azurite, a corporate egress proxy you control).
 - **Forced auth**: S3 `aws_skip_signature=false`. Azure `azure_credential_type=sas_token`,
   `azure_skip_signature=false`, `azure_storage_use_emulator=false`, `azure_use_azure_cli=false`.
   GCS `google_skip_signature=false`.
 - **Vended credential must be complete**, or the store is not built: S3 key id, secret and
   session token; Azure SAS; GCS OAuth token. Stores are built with `Builder::new()`, never
   `from_env()`, so server environment credentials are not read either.
+- **Every credential provider is pinned** to the vended credential (object_store 0.14.2), so no
+  ambient source is reachable on any path, including presigning:
+  - S3: `with_credentials(static key/secret/token)`, which object_store uses before any web
+    identity, ECS/EKS container or IMDS provider; `with_s3_express(false)` (no session
+    provider). Presigned URLs are signed locally with the vended key.
+  - Azure: `with_credentials(static SAS)`, emulator off. Presigning with a SAS credential fails
+    locally (no user-delegation-key request).
+  - GCS: `with_credentials(static bearer)`, so application-default credentials are never read,
+    and `with_signing_credentials(NoGcsSigning)`, which always errors. Without it object_store
+    signs through the GCE metadata server. P1-a needs no signed URLs.
 - UC responses carry no endpoint or region, so without these flags an `s3://` table goes to real
   AWS.
 
@@ -268,7 +283,9 @@ auth storage options for each cloud. Unit
 tests in `src/creds.rs` cover the allowlist (every auth key of each cloud rejected), the merge and
 forced auth, and S3 / Azure / GCS stores sending a request to a local mock that carries only the
 vended credential (SigV4 with the vended key; SAS in the query and no Authorization header;
-`Bearer` with the vended token).
+`Bearer` with the vended token). `tests/no_ambient_credentials.rs` (own binary) points every AWS /
+Azure / GCE metadata and credential env var at a trap listener, then reads and presigns through
+each store: the trap is never contacted, and only vended credentials appear on the wire.
 
 `tests/loopback.rs` (L0a) starts the server in-process on `127.0.0.1:0` (default `local` IO mode;
 forward-specific mechanics such as handoff of a listing op run in `forward` mode). Its test client decodes

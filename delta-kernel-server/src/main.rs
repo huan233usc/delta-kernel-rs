@@ -43,17 +43,20 @@ struct Args {
     /// ones abandoned after their deadline; when all are busy, requests fail with UNAVAILABLE.
     #[arg(long, default_value_t = DEFAULT_LOCAL_IO_THREADS as u16, value_parser = clap::value_parser!(u16).range(1..))]
     local_io_threads: u16,
-    /// object_store option applied to every cloud store the server builds, as KEY=VALUE
+    /// Allowlisted object_store transport/addressing option for every cloud store, as KEY=VALUE
     /// (repeatable), e.g. `aws_endpoint=http://localstack:4566`, `aws_allow_http=true`,
-    /// `aws_region=us-east-1`, `aws_virtual_hosted_style_request=false`. UC-vended credential
-    /// options (key, secret, session token, SAS, OAuth token) always win over these.
+    /// `aws_region=us-east-1`. Auth / credential-source keys are rejected; stores always use the
+    /// UC-vended credential. TRUSTED OPERATOR ONLY: `allow_http`, `proxy_url` and
+    /// `proxy_ca_certificate` can expose vended credentials on the wire (plain HTTP, or a proxy
+    /// that can read or intercept traffic); use them only for trusted private endpoints/proxies.
     #[arg(long = "storage-option", value_name = "KEY=VALUE", value_parser = StorageOverrides::parse_pair)]
     storage_options: Vec<(String, String)>,
     /// S3 endpoint for every s3:// table (`aws_endpoint`). Requests are path-style unless
     /// `--storage-option aws_virtual_hosted_style_request=true`.
     #[arg(long, value_name = "URL")]
     s3_endpoint: Option<String>,
-    /// Allow plain-HTTP S3 endpoints (`aws_allow_http=true`).
+    /// Allow plain-HTTP S3 endpoints (`aws_allow_http=true`). Vended credentials (session token,
+    /// signed requests) then travel unencrypted: only for trusted private endpoints (LocalStack).
     #[arg(long, default_value_t = false)]
     s3_allow_http: bool,
     /// S3 region (`aws_region`).

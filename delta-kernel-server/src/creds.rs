@@ -402,6 +402,40 @@ pub fn merge_store_options(
     Ok(merged)
 }
 
+/// GCS signing credentials for stores built from a UC credential. UC vends only an OAuth token,
+/// and P1-a needs no signed URLs, so signing always fails, without falling back to the GCE
+/// metadata server (object_store's default when no signing credential is configured).
+#[derive(Debug)]
+pub struct NoGcsSigning;
+
+#[async_trait::async_trait]
+impl object_store::CredentialProvider for NoGcsSigning {
+    type Credential = object_store::gcp::GcpSigningCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+        Err(object_store::Error::NotSupported {
+            source: "signed URLs are not supported for UC-vended GCS credentials".into(),
+        })
+    }
+}
+
+/// A store built from a UC-vended credential, by cloud (typed, for tests of signing paths).
+pub enum CloudStore {
+    S3(object_store::aws::AmazonS3),
+    Azure(object_store::azure::MicrosoftAzure),
+    Gcs(object_store::gcp::GoogleCloudStorage),
+}
+
+impl CloudStore {
+    pub fn into_dyn(self) -> Arc<DynObjectStore> {
+        match self {
+            Self::S3(s) => Arc::new(s),
+            Self::Azure(s) => Arc::new(s),
+            Self::Gcs(s) => Arc::new(s),
+        }
+    }
+}
+
 /// Builds the object store for a cloud table from UC-derived options plus the server overrides.
 /// With an S3 endpoint and no `aws_virtual_hosted_style_request`, requests are path-style
 /// (`{endpoint}/{bucket}/{key}`), which is what LocalStack and MinIO expect.
@@ -410,7 +444,33 @@ pub fn build_store(
     overrides: &StorageOverrides,
     vended: &[(String, String)],
 ) -> Result<Arc<DynObjectStore>, String> {
+    build_cloud_store(location, overrides, vended).map(CloudStore::into_dyn)
+}
+
+/// [`build_store`], typed. Every credential provider of the store is pinned to the vended
+/// credential, so no ambient source (environment, IMDS / ECS / EKS, Azure MSI / CLI, GCE
+/// metadata, application-default credentials) is reachable on any path:
+///
+/// - S3: `with_credentials(static vended key/secret/token)`, which object_store uses before any
+///   web-identity / container / instance provider, and `with_s3_express(false)` (no session
+///   provider). Presigning signs locally with the same static credential.
+/// - Azure: `with_credentials(static vended SAS)`, emulator off. Presigning with a SAS credential
+///   fails locally (`SASforSASNotSupported`), with no user-delegation-key request.
+/// - GCS: `with_credentials(static vended bearer)` (so application-default credentials are never
+///   read) and `with_signing_credentials(NoGcsSigning)`.
+pub fn build_cloud_store(
+    location: &Url,
+    overrides: &StorageOverrides,
+    vended: &[(String, String)],
+) -> Result<CloudStore, String> {
     let options = merge_store_options(location, overrides, vended)?;
+    let value = |key: &str| -> Result<String, String> {
+        options
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| format!("UC-vended credential is missing {key}"))
+    };
     let mut client = object_store::ClientOptions::new();
     for der in bundled_roots() {
         client = client.with_root_certificate(
@@ -419,33 +479,61 @@ pub fn build_store(
         );
     }
     let err = |e: object_store::Error| format!("object store for {}: {e}", location.scheme());
-    let store: Arc<DynObjectStore> = match CloudScheme::of(location)? {
+    let store = match CloudScheme::of(location)? {
         CloudScheme::S3 => {
             let mut b = object_store::aws::AmazonS3Builder::new()
                 .with_url(location.as_str())
                 .with_client_options(client);
-            for (k, v) in options {
+            for (k, v) in &options {
                 b = b.with_config(k.parse().map_err(err)?, v);
             }
-            Arc::new(b.build().map_err(err)?)
+            let credential = object_store::aws::AwsCredential {
+                key_id: value("aws_access_key_id")?,
+                secret_key: value("aws_secret_access_key")?,
+                token: Some(value("aws_session_token")?),
+            };
+            let b = b
+                .with_credentials(Arc::new(object_store::StaticCredentialProvider::new(
+                    credential,
+                )))
+                .with_s3_express(false)
+                .with_skip_signature(false);
+            CloudStore::S3(b.build().map_err(err)?)
         }
         CloudScheme::Azure => {
             let mut b = object_store::azure::MicrosoftAzureBuilder::new()
                 .with_url(location.as_str())
                 .with_client_options(client);
-            for (k, v) in options {
+            for (k, v) in &options {
                 b = b.with_config(k.parse().map_err(err)?, v);
             }
-            Arc::new(b.build().map_err(err)?)
+            let sas =
+                object_store::azure::split_sas(&value("azure_storage_sas_key")?).map_err(err)?;
+            let b = b
+                .with_credentials(Arc::new(object_store::StaticCredentialProvider::new(
+                    object_store::azure::AzureCredential::SASToken(sas),
+                )))
+                .with_use_emulator(false)
+                .with_skip_signature(false);
+            CloudStore::Azure(b.build().map_err(err)?)
         }
         CloudScheme::Gcs => {
             let mut b = object_store::gcp::GoogleCloudStorageBuilder::new()
                 .with_url(location.as_str())
                 .with_client_options(client);
-            for (k, v) in options {
+            for (k, v) in &options {
                 b = b.with_config(k.parse().map_err(err)?, v);
             }
-            Arc::new(b.build().map_err(err)?)
+            let credential = object_store::gcp::GcpCredential {
+                bearer: value("google_bearer_token")?,
+            };
+            let b = b
+                .with_credentials(Arc::new(object_store::StaticCredentialProvider::new(
+                    credential,
+                )))
+                .with_signing_credentials(Arc::new(NoGcsSigning))
+                .with_skip_signature(false);
+            CloudStore::Gcs(b.build().map_err(err)?)
         }
     };
     Ok(store)
