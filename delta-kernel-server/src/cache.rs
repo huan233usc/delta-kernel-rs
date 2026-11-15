@@ -73,6 +73,8 @@ pub const KERNEL_FEATURES: &[&str] = &[
 const DEFAULT_OP_DEADLINE: Duration = Duration::from_secs(60);
 /// Default `--l2-build-deadline-ms`.
 pub const DEFAULT_L2_BUILD_DEADLINE: Duration = Duration::from_secs(120);
+/// Bound on the shutdown flush of queued latest renewals (`Core::flush_l2_renewals`).
+pub const L2_RENEWAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a replica that lost the L2 build lock re-reads L2.
 const L2_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -937,23 +939,21 @@ fn latest_record(
     ))
 }
 
-/// Writes renewals (best effort: failures are logged at WARN and counted).
-async fn write_renewals(l2: &L2, batch: Vec<Renewal>, counters: &ServerCounters) {
-    for r in batch {
-        let written = async {
-            l2.confirm_snapshot(&r.table, &r.rec.seg_id, r.confirm_at_ms)
-                .await?;
-            l2.put_latest(&r.table, &r.rec, r.staleness).await
-        }
-        .await;
-        match written {
-            Ok(()) => counters.l2_renewals_written.fetch_add(1, Ordering::Relaxed),
-            Err(e) => {
-                tracing::warn!(table_key = %r.table, error = %e, "L2 renewal write failed; dropped");
-                counters.l2_errors.fetch_add(1, Ordering::Relaxed)
-            }
-        };
+/// Writes one renewal (best effort: a failure is logged at WARN and counted).
+async fn write_renewal(l2: &L2, r: &Renewal, counters: &ServerCounters) {
+    let written = async {
+        l2.confirm_snapshot(&r.table, &r.rec.seg_id, r.confirm_at_ms)
+            .await?;
+        l2.put_latest(&r.table, &r.rec, r.staleness).await
     }
+    .await;
+    match written {
+        Ok(()) => counters.l2_renewals_written.fetch_add(1, Ordering::Relaxed),
+        Err(e) => {
+            tracing::warn!(table_key = %r.table, error = %e, "L2 renewal write failed; dropped");
+            counters.l2_errors.fetch_add(1, Ordering::Relaxed)
+        }
+    };
 }
 
 /// What `--l2-preload` rehydrated into L1 (SPEC v12).
@@ -1939,19 +1939,46 @@ impl Core {
                 loop {
                     queue.notify.notified().await;
                     let _writing = queue.writing.lock().await;
-                    write_renewals(l2.as_ref(), queue.take(), &counters).await;
+                    for r in queue.take() {
+                        write_renewal(l2.as_ref(), &r, &counters).await;
+                    }
                 }
             });
         }
     }
 
-    /// Writes every queued latest renewal now, after the writer's in-flight batch (shutdown).
-    pub async fn flush_l2_renewals(&self) {
+    /// Shutdown: waits for the writer's in-flight batch, then writes every queued latest renewal,
+    /// all within `timeout`. On expiry the rest is dropped (WARN, counted in
+    /// `l2_renewals_dropped`) and `false` is returned.
+    pub async fn flush_l2_renewals(&self, timeout: Duration) -> bool {
         let Some(l2) = &self.l2 else {
-            return;
+            return true;
         };
-        let _writing = self.renewals.writing.lock().await;
-        write_renewals(l2.as_ref(), self.renewals.take(), &self.counters).await;
+        // Taken but not yet written when the deadline hits.
+        let in_hand = std::sync::atomic::AtomicUsize::new(0);
+        let flushed = tokio::time::timeout(timeout, async {
+            let _writing = self.renewals.writing.lock().await;
+            let batch = self.renewals.take();
+            in_hand.store(batch.len(), Ordering::Relaxed);
+            for r in batch {
+                write_renewal(l2.as_ref(), &r, &self.counters).await;
+                in_hand.fetch_sub(1, Ordering::Relaxed);
+            }
+        })
+        .await;
+        if flushed.is_err() {
+            // Nothing is left for the writer either: dropped means not written.
+            let dropped = in_hand.load(Ordering::Relaxed) + self.renewals.take().len();
+            self.counters
+                .l2_renewals_dropped
+                .fetch_add(dropped as i64, Ordering::Relaxed);
+            tracing::warn!(
+                dropped,
+                timeout_ms = timeout.as_millis() as u64,
+                "L2 renewal flush timed out; remaining renewals dropped"
+            );
+        }
+        flushed.is_ok()
     }
 
     /// Latest renewals waiting for the background writer.

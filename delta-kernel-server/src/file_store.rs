@@ -20,10 +20,12 @@
 //! - **Read-compare-rename** (`ver`, `latest`): serialized in process and, where the filesystem
 //!   supports `flock`, across processes. Without `flock`, concurrent processes can lose at most one
 //!   update (accepted by SPEC v12).
-//! - **Validation**: every file names its kernel revision and its own key, and `.bin` files end
-//!   with a SHA-256 of their content. A corrupt file, or one whose kernel revision or key does not
-//!   match, is a miss logged at WARN (and counted in [`FileStore::rejected`]); the next write of
-//!   that key replaces it.
+//! - **Validation**: every file names its kernel revision and its own key and is checksummed:
+//!   `.bin` files end with a SHA-256 of their content; `.json` files are sealed as `{"body": {...},
+//!   "sha256": ...}` with the digest over the whole body (unknown fields rejected). A corrupt file
+//!   (including a valid-JSON change to any field), or one whose kernel revision or key does not
+//!   match, is a miss logged at WARN (and counted in [`FileStore::rejected`]); preload skips it;
+//!   the next write of that key replaces it.
 //! - **Read-only** (`--l2-read-only`, SPEC v12.1, [`FileStore::open_read_only`]): reads and preload
 //!   work as above; every write is skipped before touching the filesystem (no entry, no temporary
 //!   file, no directory, no `flock`), so the directory stays byte-identical.
@@ -56,8 +58,8 @@ use crate::store::{
 const MAGIC: &[u8; 6] = b"DKSL2\x01";
 const KIND_SNAP: u8 = b'S';
 const KIND_PLAN: u8 = b'P';
-/// `format` of the JSON entries.
-const JSON_FORMAT: u32 = 1;
+/// `format` of the JSON entries (2: sealed with a digest; unsealed format-1 files are rejected).
+const JSON_FORMAT: u32 = 2;
 const DIGEST_LEN: usize = 32;
 const MAX_PART_LEN: usize = 128;
 
@@ -79,7 +81,42 @@ pub struct L2Scan {
     pub other_revisions: Vec<String>,
 }
 
+/// A JSON entry: `{"body": {...}, "sha256": hex(SHA-256(canonical body))}`. The body carries every
+/// field, including `format`, `kernel_rev` and the entry's own key, so any change to any of them
+/// (a bit flip that still parses, a rewritten field) fails the digest. Unknown fields are rejected.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Sealed<T> {
+    body: T,
+    sha256: String,
+}
+
+/// Canonical bytes of a JSON body: serde_json over the struct (field order fixed, maps sorted).
+fn json_digest<T: Serialize>(body: &T) -> Result<String, String> {
+    let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+    Ok(hex::encode(sha2::Sha256::digest(&bytes)))
+}
+
+fn seal<T: Serialize>(body: &T) -> StoreResult<Vec<u8>> {
+    let sealed = Sealed {
+        body,
+        sha256: json_digest(body)?,
+    };
+    serde_json::to_vec(&sealed).map_err(|e| e.to_string())
+}
+
+/// Parses a sealed JSON entry and checks its digest over the re-serialized body.
+fn unseal<T: Serialize + serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    let sealed: Sealed<T> =
+        serde_json::from_slice(bytes).map_err(|e| format!("not a sealed entry: {e}"))?;
+    if json_digest(&sealed.body)? != sealed.sha256 {
+        return Err("checksum mismatch".into());
+    }
+    Ok(sealed.body)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 struct LatestFile {
     format: u32,
     kernel_rev: String,
@@ -91,12 +128,14 @@ struct LatestFile {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(deny_unknown_fields)]
 struct VerMember {
     version: i64,
     confirmed_at_ms: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct VerFile {
     format: u32,
     kernel_rev: String,
@@ -525,9 +564,9 @@ impl Inner {
         let Some(bytes) = self.read_opt(&path)? else {
             return Ok(Entry::Absent);
         };
-        let ver = match serde_json::from_slice::<VerFile>(&bytes) {
+        let ver = match unseal::<VerFile>(&bytes) {
             Ok(v) => v,
-            Err(e) => return Ok(self.reject(&path, format!("not a version index: {e}"))),
+            Err(e) => return Ok(self.reject(&path, format!("version index: {e}"))),
         };
         if ver.format != JSON_FORMAT {
             return Ok(self.reject(&path, format!("format {}", ver.format)));
@@ -559,7 +598,7 @@ impl Inner {
             },
         };
         if update(&mut ver.members) {
-            let bytes = serde_json::to_vec(&ver).map_err(|e| e.to_string())?;
+            let bytes = seal(&ver)?;
             self.write_atomic(&path, &bytes)?;
         }
         Ok(())
@@ -611,9 +650,9 @@ impl Inner {
         let Some(bytes) = self.read_opt(path)? else {
             return Ok(Entry::Absent);
         };
-        let rec = match serde_json::from_slice::<LatestFile>(&bytes) {
+        let rec = match unseal::<LatestFile>(&bytes) {
             Ok(r) => r,
-            Err(e) => return Ok(self.reject(path, format!("not a latest pointer: {e}"))),
+            Err(e) => return Ok(self.reject(path, format!("latest pointer: {e}"))),
         };
         if rec.format != JSON_FORMAT {
             return Ok(self.reject(path, format!("format {}", rec.format)));
@@ -663,7 +702,7 @@ impl Inner {
                 version: rec.version,
                 confirmed_at_ms: rec.confirmed_at_ms,
             };
-            let bytes = serde_json::to_vec(&file).map_err(|e| e.to_string())?;
+            let bytes = seal(&file)?;
             self.write_atomic(&path, &bytes)?;
         }
         Ok(())

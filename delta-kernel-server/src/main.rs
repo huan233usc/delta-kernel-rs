@@ -8,6 +8,7 @@ use std::time::Duration;
 use clap::Parser;
 use delta_kernel_server::cache::{
     CacheConfig, Core, DEFAULT_L2_BUILD_DEADLINE, DEFAULT_LOCAL_IO_THREADS, IoMode, KERNEL_REV,
+    L2_RENEWAL_FLUSH_TIMEOUT,
 };
 use delta_kernel_server::creds::StorageOverrides;
 use delta_kernel_server::file_store::FileStore;
@@ -260,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown,
     )
     .await?;
-    // Latest renewals still queued for the background L2 writer (best effort).
-    core.flush_l2_renewals().await;
+    // Latest renewals still queued for the background L2 writer: best effort, bounded.
+    core.flush_l2_renewals(L2_RENEWAL_FLUSH_TIMEOUT).await;
     Ok(())
 }

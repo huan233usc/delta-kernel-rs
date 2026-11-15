@@ -1055,6 +1055,26 @@ async fn preload_keeps_authz_for_cloud_entries() {
         .await
         .err();
     assert_eq!(err.code, Code::PermissionDenied as i32);
+    let tt = proto::ResolveTimeTravelRequest {
+        table: Some(proto::TableRef {
+            table_id: fx.table_id.clone(),
+            location: fx.url.to_string(),
+        }),
+        target: Some(proto::resolve_time_travel_request::Target::CheckVersion(1)),
+        can_return_last_commit: false,
+        must_be_recreatable: false,
+        can_return_earliest_commit: false,
+        catalog_latest: None,
+        client: Some(client_info()),
+        auth: with_auth(request(&fx, 1, vec![]), BAD).auth,
+    };
+    let out = run_time_travel(&mut c, tt, Behavior::default()).await;
+    assert!(out.ops.is_empty());
+    assert_eq!(
+        out.err().code,
+        Code::PermissionDenied as i32,
+        "ResolveTimeTravel"
+    );
     let (r, _) = run(
         &mut c,
         with_auth(
@@ -1425,7 +1445,7 @@ async fn latest_renewal_write_is_off_the_request_path() {
     let confirmed = || -> i64 {
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&latest_file).unwrap()).unwrap();
-        v["confirmed_at_ms"].as_i64().unwrap()
+        v["body"]["confirmed_at_ms"].as_i64().unwrap()
     };
     let c0 = confirmed();
     let w0 = store.writes();
@@ -1480,7 +1500,7 @@ async fn latest_renewal_write_is_off_the_request_path() {
     run(&mut cl, latest_request(&fx, 0, vec![]), Behavior::default())
         .await
         .ok();
-    server.core.flush_l2_renewals().await;
+    assert!(server.core.flush_l2_renewals(Duration::from_secs(10)).await);
     assert!(confirmed() > c1);
     assert_eq!(server.core.pending_l2_renewals(), 0);
 }
@@ -1528,7 +1548,7 @@ async fn read_only_renewal_reads_nothing_from_l2() {
             assert!(r.prefetched_plans.iter().all(|p| p.cache_hit));
         }
     }
-    server.core.flush_l2_renewals().await;
+    assert!(server.core.flush_l2_renewals(Duration::from_secs(10)).await);
     assert_eq!(ro.reads(), reads0, "zero L2 reads during renewals");
     assert_eq!(ro.writes(), 0);
     let s = server.stats().await;
@@ -1595,4 +1615,250 @@ async fn read_only_renewal_reads_nothing_from_l2() {
         w.reads() > w1,
         "write mode: the renewal reads the L2 pointer"
     );
+}
+
+// ------------------------------------------------------------------------------------------------
+// v12 review: sealed JSON entries, bounded shutdown flush
+// ------------------------------------------------------------------------------------------------
+
+/// Rewrites a sealed JSON entry's body, keeping its old digest (a valid-JSON corruption).
+fn mutate_body(path: &Path, change: impl FnOnce(&mut serde_json::Value)) {
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    change(&mut v["body"]);
+    std::fs::write(path, serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+/// `latest` and `ver` JSON entries are sealed: any valid-JSON change to any field (version,
+/// seg_id, tail_id, confirmed_at_ms, kernel_rev, table_key, format), an unknown field, or an
+/// unsealed file is a WARN miss, never a pointer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_store_sealed_json_rejects_field_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileStore::open(dir.path(), KERNEL_REV, None).unwrap();
+    let fx = fixture("table-with-dv-small");
+    let info = info_of(&fx, 1);
+    let tk = l2_table_key("", &info.table_root);
+    let seg = segment_id(info.log_segment.as_ref().unwrap()).digest();
+    let snap = StoredSnapshot {
+        seg_id: seg.clone(),
+        table_id: "t".into(),
+        version: 1,
+        info: info.clone(),
+        payload: Some(b"hint".to_vec()),
+        built_at_ms: now_ms(),
+        confirmed_at_ms: now_ms(),
+    };
+    store.put_snapshot(&tk, &snap).await.unwrap();
+    let rec = LatestRecord {
+        seg_id: seg.clone(),
+        version: 1,
+        confirmed_at_ms: now_ms(),
+        tail_id: String::new(),
+    };
+    store.put_latest(&tk, &rec, Duration::ZERO).await.unwrap();
+    let tail_rec = LatestRecord {
+        tail_id: "tailA".into(),
+        ..rec.clone()
+    };
+    store
+        .put_latest(&tk, &tail_rec, Duration::ZERO)
+        .await
+        .unwrap();
+    let root = store.root().to_path_buf();
+    let latest_file = root.join(format!("latest/{tk}.json"));
+    let tail_file = root.join(format!("latest/{tk}__tailA.json"));
+    let ver_file = root.join(format!("ver/{tk}.json"));
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&latest_file).unwrap()).unwrap();
+    assert!(
+        raw["sha256"].is_string() && raw["body"]["format"] == 2,
+        "{raw}"
+    );
+
+    type Mutation = Box<dyn FnOnce(&mut serde_json::Value)>;
+    let latest_mutations: Vec<(&str, Mutation)> = vec![
+        ("version", Box::new(|b| b["version"] = 0.into())),
+        ("seg_id", Box::new(|b| b["seg_id"] = "0".repeat(64).into())),
+        ("tail_id", Box::new(|b| b["tail_id"] = "tailB".into())),
+        (
+            "confirmed_at_ms",
+            Box::new(|b| b["confirmed_at_ms"] = (now_ms() + 3_600_000).into()),
+        ),
+        (
+            "kernel_rev",
+            Box::new(|b| b["kernel_rev"] = FOREIGN_REV.into()),
+        ),
+        ("table_key", Box::new(|b| b["table_key"] = "other".into())),
+        ("format", Box::new(|b| b["format"] = 1.into())),
+        ("unknown field", Box::new(|b| b["extra"] = true.into())),
+    ];
+    let mut rejected = store.rejected();
+    for (field, change) in latest_mutations {
+        let original = std::fs::read(&latest_file).unwrap();
+        mutate_body(&latest_file, change);
+        assert!(
+            store.get_latest(&tk, "").await.unwrap().is_none(),
+            "{field}: mutated pointer served"
+        );
+        rejected += 1;
+        assert_eq!(store.rejected(), rejected, "{field}: WARN miss");
+        assert!(
+            store
+                .scan()
+                .await
+                .unwrap()
+                .latest
+                .iter()
+                .all(|(_, r)| !r.tail_id.is_empty()),
+            "{field}: preload scan skips the pointer"
+        );
+        rejected += 1;
+        std::fs::write(&latest_file, &original).unwrap();
+        assert_eq!(store.get_latest(&tk, "").await.unwrap().unwrap(), rec);
+    }
+    // The catalog-tail pointer is sealed too.
+    let original = std::fs::read(&tail_file).unwrap();
+    mutate_body(&tail_file, |b| b["version"] = 7.into());
+    assert!(store.get_latest(&tk, "tailA").await.unwrap().is_none());
+    std::fs::write(&tail_file, &original).unwrap();
+    assert_eq!(
+        store.get_latest(&tk, "tailA").await.unwrap().unwrap(),
+        tail_rec
+    );
+    // An unsealed body (the v12 format-1 layout) is rejected.
+    let body = serde_json::from_slice::<serde_json::Value>(&original).unwrap()["body"].clone();
+    std::fs::write(&tail_file, serde_json::to_vec(&body).unwrap()).unwrap();
+    assert!(store.get_latest(&tk, "tailA").await.unwrap().is_none());
+
+    // Version index: a member's version or confirmation, or the key.
+    let ver_mutations: Vec<(&str, Mutation)> = vec![
+        (
+            "member version",
+            Box::new({
+                let seg = seg.clone();
+                move |b| b["members"][&seg]["version"] = 2.into()
+            }),
+        ),
+        (
+            "member confirmed_at_ms",
+            Box::new({
+                let seg = seg.clone();
+                move |b| b["members"][&seg]["confirmed_at_ms"] = 0.into()
+            }),
+        ),
+        ("table_key", Box::new(|b| b["table_key"] = "other".into())),
+    ];
+    for (field, change) in ver_mutations {
+        let original = std::fs::read(&ver_file).unwrap();
+        mutate_body(&ver_file, change);
+        let before = store.rejected();
+        assert!(
+            store.snapshot_at_version(&tk, 1).await.unwrap().is_none(),
+            "{field}: mutated index used"
+        );
+        assert!(store.rejected() > before, "{field}: WARN miss");
+        std::fs::write(&ver_file, &original).unwrap();
+        assert_eq!(
+            store
+                .snapshot_at_version(&tk, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .seg_id,
+            seg
+        );
+    }
+}
+
+/// The review scenario: a `latest` pointer rewritten (valid JSON, old digest) to an older segment
+/// of the same table is neither preloaded nor served; the snapshots still preload and the first
+/// latest request resolves the real latest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preload_skips_a_rewritten_latest_pointer() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = fixture("table-with-dv-small");
+    let (v0, latest) = {
+        let server = TestServer::start_l2("seed", file_l2(dir.path())).await;
+        let mut c = server.client().await;
+        let (v0, _) = run(&mut c, request(&fx, 0, vec![]), Behavior::default())
+            .await
+            .ok();
+        let (latest, _) = run(&mut c, latest_request(&fx, 0, vec![]), Behavior::default())
+            .await
+            .ok();
+        (v0, latest)
+    };
+    assert_eq!((v0.version, latest.version), (0, 1));
+    let store = file_l2(dir.path());
+    let tk = l2_table_key(&fx.table_id, fx.url.as_str());
+    let v0_seg = v0.r#ref.as_ref().unwrap().segment_id.clone();
+    mutate_body(&store.root().join(format!("latest/{tk}.json")), |b| {
+        b["seg_id"] = v0_seg.clone().into();
+        b["version"] = 0.into();
+        b["confirmed_at_ms"] = now_ms().into();
+    });
+    let l2: Arc<L2> = store.clone();
+    let core = Core::with_l2("warm".into(), CacheConfig::default(), Some(l2));
+    let report = core.preload(&store, None).await.unwrap();
+    assert_eq!(
+        (report.snapshots, report.latest, report.rejected),
+        (2, 0, 1),
+        "{report:?}"
+    );
+    let server = TestServer::start_core(core, true).await;
+    let mut c = server.client().await;
+    let (r, _) = run(
+        &mut c,
+        latest_request(&fx, 60_000, vec![]),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(r.version, 1, "not the rewritten pointer's version 0");
+    assert_eq!(r.info, latest.info);
+}
+
+/// The shutdown flush is bounded: with the store stuck in a write, it gives up after the timeout,
+/// drops (and counts) what is left, and leaves nothing queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_flush_is_bounded_on_a_stuck_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = file_l2(dir.path());
+    let server = TestServer::start_l2("stuck", store.clone()).await;
+    let mut c = server.client().await;
+    let fx = fixture("table-with-dv-small");
+    run(&mut c, latest_request(&fx, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    store.set_write_delay(Duration::from_secs(3));
+    // The writer takes the first renewal and is stuck writing it; the second stays queued.
+    run(&mut c, latest_request(&fx, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    for _ in 0..200 {
+        if server.core.pending_l2_renewals() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    run(&mut c, latest_request(&fx, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(server.core.pending_l2_renewals(), 1);
+    let t = Instant::now();
+    let flushed = server
+        .core
+        .flush_l2_renewals(Duration::from_millis(300))
+        .await;
+    let took = t.elapsed();
+    assert!(!flushed, "timed out");
+    assert!(took < Duration::from_millis(1500), "bounded: {took:?}");
+    assert_eq!(server.core.pending_l2_renewals(), 0, "nothing left queued");
+    let dropped = server
+        .core
+        .counters
+        .l2_renewals_dropped
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(dropped, 1);
+    store.set_write_delay(Duration::ZERO);
 }

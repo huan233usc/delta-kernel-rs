@@ -348,12 +348,18 @@ SF1 / HiFi sizes are not measured here: they need the P1-b client runs.
 | path | Redis key | content |
 |---|---|---|
 | `snap/<table_key>/<seg_id>.bin` | `snap:…` | envelope with the Redis hash fields + `expires_at` |
-| `ver/<table_key>.json` | `ver:…` | `members`: `seg_id` → `{version, confirmed_at_ms}` |
-| `latest/<table_key>.json`, `latest/<table_key>__<tail_id>.json` | `latest:…` | `seg_id`, `version`, `confirmed_at_ms`, `tail_id` |
+| `ver/<table_key>.json` | `ver:…` | sealed JSON; body `members`: `seg_id` → `{version, confirmed_at_ms}` |
+| `latest/<table_key>.json`, `latest/<table_key>__<tail_id>.json` | `latest:…` | sealed JSON; body `seg_id`, `version`, `confirmed_at_ms`, `tail_id` |
 | `plan/<seg_id>/<spec_hash>.bin` | `plan:…` | envelope with `value` = zstd(plan) \| `EMPTY` \| `UNSUPPORTED:<reason>` |
 
 - A `.bin` envelope is `DKSL2\x01`, a kind byte, length-prefixed fields and a SHA-256 trailer.
-  Every file records its `kernel_rev` and its own key.
+- A sealed JSON entry is `{"body": {...}, "sha256": ...}`.
+  - The digest covers the whole body (serde_json over the struct: fixed field order, sorted
+    members), including `format` (2), `kernel_rev` and the entry's own key.
+  - Unknown fields are rejected.
+  - A valid-JSON change to any field, such as a pointer rewritten to an older segment, fails the
+    digest.
+- Every file records its `kernel_rev` and its own key.
 - **Rules shared with Redis:**
   - same never-store rules (staged tail, tainted, credentials/tokens, plans > 4 MiB compressed);
   - monotonic `latest` (`latest_replaces`);
@@ -370,10 +376,12 @@ SF1 / HiFi sizes are not measured here: they need the P1-b client runs.
   - Where `flock` is unsupported, concurrent processes can lose at most one update (SPEC v12).
   - Files are not fsynced; a file torn by a host crash fails its checksum.
 - **Rejected files are misses:**
-  - a corrupt file;
+  - a corrupt file (checksum or digest mismatch, including valid-JSON field changes, unknown
+    fields, and unsealed format-1 JSON from v12);
   - a file whose `kernel_rev` is not the server's;
   - a file that names another key.
-  - Each logs WARN `L2 file entry rejected; treated as a miss`, and the next write replaces it.
+  - Each logs WARN `L2 file entry rejected; treated as a miss`. Preload skips it (a rejected
+    `latest` pointer is not restored), and the next write replaces it.
   - Other revisions' directories are never read; preload WARNs that they exist.
 - **Expiry.**
   - `snap` and `plan` expire only with `--l2-ttl-secs` (refreshed on put and confirm).
@@ -395,7 +403,9 @@ SF1 / HiFi sizes are not measured here: they need the P1-b client runs.
     counted.
   - **Best effort:** a failed write logs WARN `L2 renewal write failed; dropped`.
   - **Shutdown:** the server flushes the queue after the last request
-    (`Core::flush_l2_renewals`).
+    (`Core::flush_l2_renewals`), bounded by 10 s. It waits for the writer's in-flight batch, then
+    writes the rest. On expiry the remainder is dropped (WARN `L2 renewal flush timed out`, counted
+    in `l2_renewals_dropped`).
   - **Counters** (in process): `l2_renewals_{queued,coalesced,dropped,written}`.
   - Build results are still written through before the request returns.
 - **Renewal reads on disk:**
@@ -600,13 +610,22 @@ gates run with it set:
     preload log line comes before `listening`, and the latest / exact / GetScanPlan requests are
     L1 hits;
   - a preloaded UC-keyed entry is still behind authz: a denied or missing token gets
-    `PERMISSION_DENIED` with no data (GetSnapshot and GetScanPlan), and the allowed token calls UC;
+    `PERMISSION_DENIED` with no data (GetSnapshot, GetScanPlan and ResolveTimeTravel), and the
+    allowed token calls UC;
   - **`--l2-read-only`** servers over a seeded directory:
     - preloaded: latest renewal and exact version are `CACHE_HIT`, and a new plan and a new
       table's build stay in L1;
     - not preloaded, with the tree made unwritable: L1 misses are served from L2;
     - logs show no failed or rejected write, and the tree digest (names, contents, file and
       directory mtimes) is identical afterwards.
+- **Review fixes (v12 cross-review), in process:**
+  - sealed `latest` / `ver` JSON: each valid-JSON field mutation (version, seg_id, tail_id,
+    confirmed_at_ms, kernel_rev, table_key, format), an unknown field, and an unsealed body is a
+    WARN miss and is skipped by the preload scan;
+  - a `latest` pointer rewritten to an older segment of the same table is not preloaded or
+    served;
+  - with the store stuck in a write, the shutdown flush returns after its timeout, drops and
+    counts the rest, and leaves nothing queued.
 - **v12.1, in process:**
   - a read-only store reads every entry and skips every write, leaving the tree byte-identical
     (including a dangling index member) and creating no missing directory;
