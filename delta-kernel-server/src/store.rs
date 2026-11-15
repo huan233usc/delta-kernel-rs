@@ -7,13 +7,15 @@
 //!   lookup-or-join stays atomic, and the trait impl exposes the same state.
 //! - **L2**, optional and shared across replicas: payload = the encoded kernel snapshot hint
 //!   ([`crate::hint`]). [`RedisStore`] is the production backend (`--l2-redis-url`);
-//!   [`MemoryStore`] has identical semantics in process (tests, two `Core`s sharing one L2).
+//!   [`crate::file_store::FileStore`] keeps the same keys in a directory (`--l2-dir`, SPEC v12,
+//!   with `--l2-preload` warm starts); [`MemoryStore`] has identical semantics in process (tests,
+//!   two `Core`s sharing one L2).
 //!
 //! L2 key schema (all keys prefixed `dks:{kernel_rev}:`):
 //!
 //! | key | type | value | TTL |
 //! |---|---|---|---|
-//! | `snap:{table_key}:{seg_id}` | hash | `info`, `seg`, `hint`, `version`, `built_at`, `confirmed_at` | `ttl` (6h) |
+//! | `snap:{table_key}:{seg_id}` | hash | `info`, `seg`, `hint`, `version`, `built_at`, `confirmed_at`, `table_id` | `ttl` (6h) |
 //! | `ver:{table_key}` | zset | member `seg_id`, score `version` | `ttl` |
 //! | `latest:{table_key}` (path-based) / `latest:{table_key}:{tail_id}` (`catalog_latest`) | hash | `seg_id`, `version`, `confirmed_at_ms`, `tail_id`; monotonic ([`latest_replaces`]) | 2 × staleness, ≥ 60s |
 //! | `plan:{seg_id}:{spec_hash}` | string | zstd(plan bytes) \| `EMPTY` \| `UNSUPPORTED:<reason>` | `ttl` |
@@ -55,6 +57,10 @@ pub fn now_ms() -> i64 {
 #[derive(Clone, Debug)]
 pub struct StoredSnapshot<P> {
     pub seg_id: String,
+    /// Request table id of the build that wrote the entry (the L1 key's table id; the location
+    /// when the request had none). Several ids may share one `table_key`; the last writer's is
+    /// kept. `--l2-preload` rebuilds the L1 key from it.
+    pub table_id: String,
     pub version: i64,
     /// Carries `log_segment`, the canonical identity behind `seg_id`.
     pub info: proto::SnapshotInfo,
@@ -488,6 +494,10 @@ impl RedisStore {
         let seg_id = key.rsplit(':').next().unwrap_or_default().to_string();
         Ok(Some(StoredSnapshot {
             seg_id,
+            table_id: fields
+                .get("table_id")
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .unwrap_or_default(),
             version: num("version")?,
             info,
             payload: fields.get("hint").filter(|h| !h.is_empty()).cloned(),
@@ -562,7 +572,8 @@ impl SnapshotStore for RedisStore {
             )
             .hset(&key, "version", snap.version)
             .hset(&key, "built_at", snap.built_at_ms)
-            .hset(&key, "confirmed_at", snap.confirmed_at_ms);
+            .hset(&key, "confirmed_at", snap.confirmed_at_ms)
+            .hset(&key, "table_id", snap.table_id.as_str());
         if let Some(hint) = &snap.payload {
             pipe.hset(&key, "hint", hint.as_slice());
         }

@@ -12,7 +12,8 @@ use common::*;
 use delta_kernel::history_manager::{
     HistoryCommitType, first_version_after, get_earliest_commit, latest_version_as_of,
 };
-use delta_kernel_server::cache::CacheConfig;
+use delta_kernel_server::cache::{CacheConfig, KERNEL_REV};
+use delta_kernel_server::file_store::FileStore;
 use delta_kernel_server::info::segment_id;
 use delta_kernel_server::proto::error::Code;
 use delta_kernel_server::proto::{self, ResolveKind};
@@ -258,61 +259,6 @@ async fn scan_plan_stale_ref() {
         &with_plans(&fresh, vec![p.plan.unwrap()]),
         &[spec_json()],
     );
-}
-
-/// Version 0 of a `catalogManaged` table (which requires in-commit timestamps).
-const CM_V0: &str = r#"{"commitInfo":{"timestamp":1700000000000,"inCommitTimestamp":1700000000000,"operation":"CREATE TABLE","txnId":"cm-0"}}
-{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]}}
-{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true","io.unitycatalog.tableId":"cm-table"},"createdTime":1700000000000}}
-"#;
-
-const CM_TS0: i64 = 1_700_000_000_000;
-
-fn cm_fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("cm_table");
-    std::fs::create_dir_all(root.join("_delta_log/_staged_commits")).unwrap();
-    std::fs::write(
-        root.join("_delta_log").join(format!("{:020}.json", 0)),
-        CM_V0,
-    )
-    .unwrap();
-    let root = root.canonicalize().unwrap();
-    let url = url::Url::from_directory_path(&root).unwrap();
-    Fixture {
-        _dir: dir,
-        root,
-        url,
-        table_id: "cm-table".into(),
-    }
-}
-
-/// Commit `version` with ICT `CM_TS0 + version * 1000`.
-fn cm_commit(version: i64) -> String {
-    let ts = CM_TS0 + version * 1000;
-    format!(
-        "{{\"commitInfo\":{{\"timestamp\":{ts},\"inCommitTimestamp\":{ts},\
-         \"operation\":\"WRITE\",\"txnId\":\"cm-{version}\"}}}}\n\
-         {{\"add\":{{\"path\":\"file_{version}.parquet\",\"partitionValues\":{{}},\"size\":1234,\
-         \"modificationTime\":{ts},\"dataChange\":true,\"stats\":\"{{\\\"numRecords\\\":1}}\"}}}}\n"
-    )
-}
-
-fn cm_publish(fx: &Fixture, version: i64) -> String {
-    let name = format!("{version:020}.json");
-    std::fs::write(fx.log_dir().join(&name), cm_commit(version)).unwrap();
-    name
-}
-
-fn cm_stage(fx: &Fixture, version: i64) -> String {
-    let name = format!("_staged_commits/{version:020}.6e5c4a07-8a1f-4b4e-9d5c-{version:012}.json");
-    std::fs::write(fx.log_dir().join(&name), cm_commit(version)).unwrap();
-    name
-}
-
-fn cm_request(fx: &Fixture, mcv: i64, tail: &[String]) -> proto::GetSnapshotRequest {
-    let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
-    catalog_request(fx, mcv, &tail, vec![])
 }
 
 /// A staged-tail ref is rebuilt from its own staged deltas and never cached; the plan equals the
@@ -1080,11 +1026,20 @@ async fn l2_two_replicas_single_build() {
     );
 }
 
-/// Never written to L2: staged-tail results and tainted builds.
+/// Never written to L2: staged-tail results and tainted builds. Same suite for the in-process
+/// L2 and the file L2 (`--l2-dir`, counted as files on disk).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l2_never_stores_staged_or_tainted() {
     let mem = Arc::new(MemoryStore::new(DEFAULT_L2_TTL));
-    let l2: Arc<L2> = mem.clone();
+    never_stores_staged_or_tainted(mem.clone(), &|| mem.key_count()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = Arc::new(FileStore::open(dir.path(), KERNEL_REV, None).unwrap());
+    let root = file.root().to_path_buf();
+    never_stores_staged_or_tainted(file, &|| count_files(&root)).await;
+}
+
+async fn never_stores_staged_or_tainted(l2: Arc<L2>, stored: &dyn Fn() -> usize) {
+    let tier = l2.tier();
     let server = TestServer::start_l2("a", l2.clone()).await;
     let mut c = server.client().await;
     let fx = cm_fixture();
@@ -1101,9 +1056,9 @@ async fn l2_never_stores_staged_or_tainted() {
     .await
     .ok();
     assert_eq!(
-        mem.key_count(),
+        stored(),
         0,
-        "staged-tail result and its plan not in L2"
+        "{tier}: staged-tail result and its plan not in L2"
     );
 
     // Tainted: a non-FileNotFound failure on an optional read (the CRC) is tolerated by kernel
@@ -1135,7 +1090,7 @@ async fn l2_never_stores_staged_or_tainted() {
             fwd.core.cached_instances_per_table().is_empty(),
             "tainted: not in L1"
         );
-        assert_eq!(mem.key_count(), 0, "tainted: not in L2");
+        assert_eq!(stored(), 0, "{tier}: tainted: not in L2");
     }
 }
 

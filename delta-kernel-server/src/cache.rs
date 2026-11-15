@@ -15,7 +15,8 @@
 //! - L1 eviction: at most `max_instances_per_table` per table, then a global LRU bounded by
 //!   `max_cache_bytes` of estimated memory.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ use async_trait::async_trait;
 use delta_kernel::engine::plans::PlanBasedEngine;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::{LogPath, Snapshot, SnapshotRef};
+use futures::StreamExt as _;
 use sha2::Digest as _;
 use tokio::sync::{OnceCell, watch};
 
@@ -35,6 +37,7 @@ use crate::errors::{
     catalog_state_required, classify_build_error, classify_kernel_error,
 };
 use crate::executor::{LocalCtx, OpChannel, RemotePlanExecutor, StreamPort};
+use crate::file_store::FileStore;
 use crate::info::{
     SegmentId, compute_snapshot_info, has_staged_commits, log_segment_info, segment_id,
 };
@@ -604,9 +607,10 @@ impl L1Cache {
         })
     }
 
-    fn stored(inst: &Instance) -> StoredSnapshot<SnapshotRef> {
+    fn stored(key: &TableKey, inst: &Instance) -> StoredSnapshot<SnapshotRef> {
         StoredSnapshot {
             seg_id: inst.seg_hex.clone(),
+            table_id: key.0.clone(),
             version: inst.version(),
             info: inst.info.clone(),
             payload: Some(inst.snapshot.clone()),
@@ -633,7 +637,7 @@ impl SnapshotStore for L1Cache {
     ) -> StoreResult<Option<StoredSnapshot<SnapshotRef>>> {
         Ok(self
             .find_by_seg(table, seg_id)
-            .map(|(_, i)| Self::stored(&i)))
+            .map(|(k, i)| Self::stored(&k, &i)))
     }
 
     async fn snapshot_at_version(
@@ -644,11 +648,11 @@ impl SnapshotStore for L1Cache {
         let st = self.state.lock().unwrap();
         Ok(st
             .tables
-            .values()
-            .flatten()
-            .filter(|i| i.l2_table == table && i.version() == version)
-            .max_by_key(|i| i.confirmed.load(Ordering::Relaxed))
-            .map(|i| Self::stored(i)))
+            .iter()
+            .flat_map(|(k, insts)| insts.iter().map(move |i| (k, i)))
+            .filter(|(_, i)| i.l2_table == table && i.version() == version)
+            .max_by_key(|(_, i)| i.confirmed.load(Ordering::Relaxed))
+            .map(|(k, i)| Self::stored(k, i)))
     }
 
     async fn put_snapshot(
@@ -900,6 +904,54 @@ fn stale_ref(message: impl Into<String>) -> ServerError {
     ServerError::new(Code::StaleRef, message)
 }
 
+/// What `--l2-preload` rehydrated into L1 (SPEC v12).
+#[derive(Clone, Debug, Default)]
+pub struct PreloadReport {
+    /// Snapshot instances rebuilt from their hints (zero IO) and inserted into L1.
+    pub snapshots: usize,
+    /// Path-based latest pointers restored with their recorded confirmation time.
+    pub latest: usize,
+    /// Plans attached to rehydrated instances.
+    pub plans: usize,
+    /// Corrupt or foreign files and entries whose hint did not rebuild their segment (WARN).
+    pub rejected: u64,
+    /// Expired entries (with `--l2-ttl-secs`).
+    pub expired: u64,
+    /// Valid entries not rehydrated: over `--l2-preload-max-entries` or the per-table bound, or
+    /// stored without a hint (info and plans only).
+    pub skipped: usize,
+    /// `catalog_latest` pointers left to the L2 path: L2 keeps only the tail digest, and an L1
+    /// `catalog_latest` hit needs the request's canonical tail.
+    pub catalog_latest_in_l2: usize,
+    /// Kernel revisions with entries in the directory that this server ignores.
+    pub other_revisions: Vec<String>,
+    pub duration: Duration,
+}
+
+impl PreloadReport {
+    /// Snapshot, latest and plan entries now in L1.
+    pub fn entries(&self) -> usize {
+        self.snapshots + self.latest + self.plans
+    }
+}
+
+/// The L1 key of a preloaded entry: its recorded request table id and normalized table root,
+/// which must map back to the entry's `table_key`.
+fn preload_key(table_key: &str, snap: &StoredSnapshot<Vec<u8>>) -> Result<TableKey, String> {
+    let location = normalize_location(&snap.info.table_root).map_err(|e| e.message)?;
+    let table_id = if snap.table_id.is_empty() {
+        location.clone()
+    } else {
+        snap.table_id.clone()
+    };
+    if l2_table_key(&table_id, &location) != table_key {
+        return Err(format!(
+            "entry of table {table_id} at {location} is not under table key {table_key}"
+        ));
+    }
+    Ok((table_id, location))
+}
+
 impl Core {
     pub fn new(instance_id: String, config: CacheConfig) -> Arc<Self> {
         Self::with_l2(instance_id, config, None)
@@ -945,6 +997,147 @@ impl Core {
     /// touched.
     pub fn reset_cache(&self) {
         self.l1.reset();
+    }
+
+    /// `--l2-preload` (SPEC v12): rehydrates the file L2's snapshot, latest and plan entries into
+    /// L1 before the server accepts connections. Instances are rebuilt from their hints with zero
+    /// IO and checked against their segment like any L2 hit. Per table, entries a latest pointer
+    /// names come first, then the most recently confirmed, up to `max_instances_per_table`;
+    /// `max_entries` caps the instances overall, taking every table's first choice before any
+    /// table's second. Plans and path-based latest pointers of rehydrated instances come along.
+    /// Authz is unchanged: requests still pass `authorize` (UC) before any cache hit.
+    pub async fn preload(
+        self: &Arc<Self>,
+        store: &FileStore,
+        max_entries: Option<usize>,
+    ) -> StoreResult<PreloadReport> {
+        let started = Instant::now();
+        let rejected_before = store.rejected();
+        let scan = store.scan().await?;
+        let mut report = PreloadReport {
+            expired: scan.expired,
+            other_revisions: scan.other_revisions.clone(),
+            ..PreloadReport::default()
+        };
+        let mut pointed: HashSet<(&str, &str)> = HashSet::new();
+        let mut path_latest: Vec<(&str, &LatestRecord)> = vec![];
+        for (tk, rec) in &scan.latest {
+            pointed.insert((tk.as_str(), rec.seg_id.as_str()));
+            if rec.tail_id.is_empty() {
+                path_latest.push((tk.as_str(), rec));
+            } else {
+                report.catalog_latest_in_l2 += 1;
+            }
+        }
+        let mut by_table: BTreeMap<&str, Vec<&StoredSnapshot<Vec<u8>>>> = BTreeMap::new();
+        for (tk, snap) in &scan.snapshots {
+            if snap.payload.is_some() {
+                by_table.entry(tk.as_str()).or_default().push(snap);
+            } else {
+                report.skipped += 1;
+            }
+        }
+        let per_table = self.config.max_instances_per_table.max(1);
+        let mut ranked: Vec<(usize, &str, &StoredSnapshot<Vec<u8>>)> = vec![];
+        for (tk, mut snaps) in by_table {
+            snaps.sort_by_key(|s| {
+                (
+                    Reverse(pointed.contains(&(tk, s.seg_id.as_str()))),
+                    Reverse(s.confirmed_at_ms),
+                    Reverse(s.version),
+                )
+            });
+            report.skipped += snaps.len().saturating_sub(per_table);
+            ranked.extend(
+                snaps
+                    .into_iter()
+                    .take(per_table)
+                    .enumerate()
+                    .map(|(r, s)| (r, tk, s)),
+            );
+        }
+        ranked.sort_by_key(|(rank, _, s)| (*rank, Reverse(s.confirmed_at_ms)));
+        if let Some(max) = max_entries
+            && ranked.len() > max
+        {
+            report.skipped += ranked.len() - max;
+            ranked.truncate(max);
+        }
+        let parallel = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let rebuilt: Vec<_> =
+            futures::stream::iter(ranked.into_iter().map(|(_, tk, snap)| async move {
+                let built = match preload_key(tk, snap) {
+                    Ok(key) => {
+                        let location = key.1.clone();
+                        self.instance_from_l2(&key, &location, snap, None)
+                            .await
+                            .map(|inst| (key, inst))
+                    }
+                    Err(why) => Err(why),
+                };
+                (tk, snap, built)
+            }))
+            .buffered(parallel)
+            .collect()
+            .await;
+        // Least preferred first, so L1's LRU keeps the preferred instances.
+        let mut loaded: HashMap<(&str, &str), (TableKey, Arc<Instance>)> = HashMap::new();
+        for (tk, snap, built) in rebuilt.into_iter().rev() {
+            match built {
+                Ok((key, inst)) => {
+                    let inst = self.l1.insert(&key, inst);
+                    loaded.insert((tk, snap.seg_id.as_str()), (key, inst));
+                    report.snapshots += 1;
+                }
+                Err(why) => {
+                    report.rejected += 1;
+                    tracing::warn!(
+                        table_key = tk,
+                        seg_id = %snap.seg_id,
+                        reason = %why,
+                        "L2 preload: entry not usable; skipped"
+                    );
+                }
+            }
+        }
+        for (tk, rec) in path_latest {
+            let Some((key, inst)) = loaded.get(&(tk, rec.seg_id.as_str())) else {
+                continue;
+            };
+            let age = Duration::from_millis((now_ms() - rec.confirmed_at_ms).max(0) as u64);
+            match Instant::now().checked_sub(age) {
+                Some(at) => {
+                    self.l1.confirm_latest(key, inst.clone(), at);
+                    report.latest += 1;
+                }
+                None => report.skipped += 1,
+            }
+        }
+        let by_seg: HashMap<&str, &Arc<Instance>> = loaded
+            .values()
+            .map(|(_, inst)| (inst.seg_hex.as_str(), inst))
+            .collect();
+        for (seg, spec) in &scan.plans {
+            let Some(inst) = by_seg.get(seg.as_str()) else {
+                continue;
+            };
+            match store.get_plan(seg, spec).await {
+                Ok(Some(plan)) => {
+                    inst.plans
+                        .lock()
+                        .unwrap()
+                        .insert(spec.clone(), PlanSlot::Ready(plan));
+                    report.plans += 1;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "L2 preload: plan read failed; skipped"),
+            }
+        }
+        // Plans grew the instances; apply the memory bound.
+        self.l1.evict_global();
+        report.rejected += store.rejected() - rejected_before;
+        report.duration = started.elapsed();
+        Ok(report)
     }
 
     /// Validates the client's kernel build; any mismatch is `VERSION_MISMATCH`.
@@ -1472,7 +1665,8 @@ impl Core {
 
     /// Reads L2 for a build target. Errors are logged and read as a miss. `waiting` (with the
     /// first read's latest record as baseline) accepts any newer latest confirmation: the
-    /// re-listing of the replica holding the build lock.
+    /// re-listing of the replica holding the build lock. `need_base`: a latest re-listing without
+    /// an L1 base reads a stale L2 latest entry as its base; with one, the entry is not read.
     async fn l2_lookup(
         &self,
         l2: &L2,
@@ -1480,6 +1674,7 @@ impl Core {
         target: &Target,
         expected: Option<&proto::LogSegmentInfo>,
         waiting: Option<Option<&LatestRecord>>,
+        need_base: bool,
     ) -> L2Lookup {
         let mut out = L2Lookup::default();
         let found: StoreResult<()> = async {
@@ -1509,14 +1704,16 @@ impl Core {
                         None => false,
                     };
                     let fresh = age_ms as u128 <= max_staleness.as_millis() || newer_than_baseline;
-                    let snap = l2.get_snapshot(table, &rec.seg_id).await?;
                     if fresh {
-                        out.hit = snap.map(|snap| L2Hit {
-                            snap,
-                            latest_age: Some(Duration::from_millis(age_ms as u64)),
-                        });
-                    } else {
-                        out.stale_base = snap;
+                        out.hit = l2
+                            .get_snapshot(table, &rec.seg_id)
+                            .await?
+                            .map(|snap| L2Hit {
+                                snap,
+                                latest_age: Some(Duration::from_millis(age_ms as u64)),
+                            });
+                    } else if need_base {
+                        out.stale_base = l2.get_snapshot(table, &rec.seg_id).await?;
                     }
                 }
                 Target::CatalogLatest {
@@ -1594,10 +1791,12 @@ impl Core {
     }
 
     /// Writes a fresh, cacheable build result to L2 (never staged-tail or tainted results).
+    #[allow(clippy::too_many_arguments)]
     async fn l2_write_build(
         &self,
         l2: &L2,
         table: &str,
+        table_id: &str,
         instance: &Instance,
         hint: Option<Result<Vec<u8>, String>>,
         target: &Target,
@@ -1617,6 +1816,7 @@ impl Core {
         let now = now_ms();
         let snap = StoredSnapshot {
             seg_id: instance.seg_hex.clone(),
+            table_id: table_id.to_string(),
             version: instance.version(),
             info: instance.info.clone(),
             payload: hint,
@@ -1692,8 +1892,16 @@ impl Core {
             let mut lock: Option<(String, String)> = None;
 
             if let Some(l2) = &l2 {
+                let need_base = base.is_none();
                 let mut found = core
-                    .l2_lookup(l2.as_ref(), &l2_table, &target, expected.as_ref(), None)
+                    .l2_lookup(
+                        l2.as_ref(),
+                        &l2_table,
+                        &target,
+                        expected.as_ref(),
+                        None,
+                        need_base,
+                    )
                     .await;
                 if found.hit.is_none()
                     && let Some((_, bt)) = &build_key
@@ -1722,6 +1930,7 @@ impl Core {
                                         &target,
                                         expected.as_ref(),
                                         Some(baseline.as_ref()),
+                                        need_base,
                                     )
                                     .await;
                                 if found.hit.is_some() {
@@ -1822,6 +2031,7 @@ impl Core {
                         core.l2_write_build(
                             l2.as_ref(),
                             &l2_table,
+                            &key.0,
                             &outcome.instance,
                             hint.clone(),
                             &target,

@@ -11,6 +11,7 @@ pub mod creds;
 pub mod decode;
 pub mod errors;
 pub mod executor;
+pub mod file_store;
 pub mod hint;
 pub mod info;
 pub mod local_io;

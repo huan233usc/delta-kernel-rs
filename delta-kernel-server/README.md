@@ -82,9 +82,13 @@ delta-kernel-server \
 | `--s3-allow-http` | off | same as `--storage-option aws_allow_http=true` |
 | `--s3-region REGION` | none | same as `--storage-option aws_region=REGION` |
 | `--l2-redis-url URL` | off | shared L2 snapshot store (SPEC v10.3), e.g. `redis://10.0.0.5:6379/0`; unreachable at startup → exit; L2 errors later never fail a request |
-| `--l2-ttl-secs` | `21600` (6 h) | TTL of L2 `snap` / `ver` / `plan` keys |
+| `--l2-dir DIR` | off | file-backed L2 (SPEC v12) under `DIR/<kernel_rev>/`, shareable by several server processes; conflicts with `--l2-redis-url`; an uncreatable directory → exit |
+| `--l2-preload` | off, needs `--l2-dir` | rehydrate every snapshot / plan / latest entry of `DIR/<kernel_rev>/` into L1 (from hints, zero IO) **before** binding the port; logs `L2 preload finished entries=… duration_ms=…`; a failed scan logs WARN and starts cold |
+| `--l2-preload-max-entries N` | none, needs `--l2-preload` | cap on rehydrated snapshot instances (every table's first choice before any table's second); their plans and latest pointers come along |
+| `--l2-ttl-secs` | Redis `21600` (6 h); file: no expiry | TTL of L2 `snap` / `ver` / `plan` entries |
 | `--l2-build-deadline-ms` | `120000` | TTL of the cross-replica build lock, and how long a replica that lost it waits for the holder's result before building itself |
 | `--test-uc-credentials-for-file` | off, hidden | test only, needs `--enable-test-hooks`: run the UC credential check for `file://` tables too |
+| `--test-preload-delay-ms` | none, hidden | test only, needs `--enable-test-hooks` and `--l2-preload`: sleep at the end of preload, before the port is bound |
 
 Operator storage options are an **allowlist**. They can only say where and how to connect, never
 how to authenticate; the store always authenticates with the UC-vended credential.
@@ -285,7 +289,7 @@ sha256(canonical location).
 
 | key | type | value | TTL |
 |---|---|---|---|
-| `snap:{table_key}:{seg_id}` | hash | `info` (SnapshotInfo), `seg` (LogSegmentInfo), `hint`, `version`, `built_at`, `confirmed_at` | `--l2-ttl-secs` |
+| `snap:{table_key}:{seg_id}` | hash | `info` (SnapshotInfo), `seg` (LogSegmentInfo), `hint`, `version`, `built_at`, `confirmed_at`, `table_id` (v12: the request table id of the build; `--l2-preload` rebuilds the L1 key from it) | `--l2-ttl-secs` |
 | `ver:{table_key}` | zset | member `seg_id`, score `version`; without an expected segment the entry with the greatest `confirmed_at` wins (v8 rule) | same |
 | `latest:{table_key}` (path-based) / `latest:{table_key}:{tail_id}` (`catalog_latest`, `tail_id` = hex digest of the canonical tail) | hash | `seg_id`, `version`, `confirmed_at_ms`, `tail_id`. Monotonic per key (compare-and-set script): replaced only by a higher version, or the same version and tail with a later confirmation | 2 × staleness, ≥ 60 s |
 | `plan:{seg_id}:{spec_hash}` | string | zstd(plan bytes) \| `EMPTY` \| `UNSUPPORTED:<reason>` | `--l2-ttl-secs` |
@@ -335,6 +339,70 @@ are `[JSON_ONLY, ALL_STRUCT]`:
 | compacted-log-files-table | 25 | 3076 B | 741 B | 1085 / 1266 B | 8924 B |
 
 SF1 / HiFi sizes are not measured here: they need the P1-b client runs.
+
+## v12: file L2 (`--l2-dir`) and warm start (`--l2-preload`)
+
+**Layout and values.** The same keys as Redis, one file per key under `DIR/<kernel_rev>/`:
+
+| path | Redis key | content |
+|---|---|---|
+| `snap/<table_key>/<seg_id>.bin` | `snap:…` | envelope with the Redis hash fields + `expires_at` |
+| `ver/<table_key>.json` | `ver:…` | `members`: `seg_id` → `{version, confirmed_at_ms}` |
+| `latest/<table_key>.json`, `latest/<table_key>__<tail_id>.json` | `latest:…` | `seg_id`, `version`, `confirmed_at_ms`, `tail_id` |
+| `plan/<seg_id>/<spec_hash>.bin` | `plan:…` | envelope with `value` = zstd(plan) \| `EMPTY` \| `UNSUPPORTED:<reason>` |
+
+- A `.bin` envelope is `DKSL2\x01`, a kind byte, length-prefixed fields and a SHA-256 trailer.
+  Every file records its `kernel_rev` and its own key.
+- **Rules shared with Redis:**
+  - same never-store rules (staged tail, tainted, credentials/tokens, plans > 4 MiB compressed);
+  - monotonic `latest` (`latest_replaces`);
+  - same `snapshot_at_version` rule.
+- **Not persisted:** `lock:*` and `authz:*`.
+  - They live in process memory: every process checks authz with UC itself.
+  - There is no cross-process single flight: each process builds on its own miss and writes
+    through.
+- **Atomic writes:** a temporary file `.<name>.tmp-<pid>-<n>` in the target directory, then
+  `rename`.
+- **Read-compare-rename** (`ver`, `latest`): an in-process mutex, plus a best-effort `flock` on
+  the directory.
+  - On local filesystems this makes `latest` exact across processes.
+  - Where `flock` is unsupported, concurrent processes can lose at most one update (SPEC v12).
+  - Files are not fsynced; a file torn by a host crash fails its checksum.
+- **Rejected files are misses:**
+  - a corrupt file;
+  - a file whose `kernel_rev` is not the server's;
+  - a file that names another key.
+  - Each logs WARN `L2 file entry rejected; treated as a miss`, and the next write replaces it.
+  - Other revisions' directories are never read; preload WARNs that they exist.
+- **Expiry.**
+  - `snap` and `plan` expire only with `--l2-ttl-secs` (refreshed on put and confirm).
+  - `latest` never expires: a restarted server needs it as the base of its first re-listing.
+    Freshness still comes from `confirmed_at_ms` against the request's staleness.
+- **Renewal cost on disk:** a path-latest renewal writes the small `latest` JSON. The version
+  index is rewritten only when it orders two entries of one version (or with a TTL), and the
+  stale snap entry is read only when L1 has no base.
+
+**Preload.** `--l2-preload` scans `DIR/<kernel_rev>/` and rebuilds each snapshot from its hint
+(zero IO, segment-checked like any L2 hit). It inserts the snapshots into L1 under
+`(table_id, location)`, attaches their plans, and restores each path-based latest pointer with its
+recorded confirmation time. All of this completes before `bind`.
+- **Per table:** the latest-pointed entry first, then the most recently confirmed, up to
+  `--max-instances-per-table`.
+- **First requests after preload:**
+  - latest at staleness 0 = `CACHE_HIT` with one local renewal listing;
+  - exact version = 0 ops;
+  - a preloaded plan = cache hit;
+  - no build, no L2 snapshot read.
+- **Authz is unchanged.** Requests for credentialed tables call UC (once per process, token and
+  table) before any hit.
+- **`catalog_latest` pointers are not rehydrated.** L2 stores only the tail digest, and an L1
+  `catalog_latest` hit compares full tails. The first such request takes the L2 path: still
+  `CACHE_HIT` with 0 ops.
+
+**Measured preload** (55 kernel fixture tables, release build, local disk):
+- the directory: 275 files, 317 KB; snap files 2 KB median, 8.8 KB max;
+- `entries=220` (55 snapshots + 55 latest + 110 plans);
+- 15–24 ms in process, 19–64 ms in the binary log line (the first run on a cold page cache).
 
 ## Server semantics (SPEC §7)
 
@@ -481,6 +549,33 @@ gates run with it set:
 - the exact key schema and TTLs written by a build;
 - two server processes sharing L2 with one build;
 - a restarted process serving from L2 with zero ops.
+
+`tests/l2_file.rs` covers SPEC v12:
+- **The store:**
+  - the shared contract;
+  - `latest_contract` with three store instances on one directory;
+  - the 4 MiB cap and the on-disk layout;
+  - no lock or authz files, and none seen by a new instance;
+  - opt-in TTL;
+  - corrupt, truncated, wrong-key and other-revision files rejected and then replaced;
+  - 60 concurrent writers of the same keys across three instances: whole entries only, monotonic
+    latest, no temporary files left.
+- **Preload, in process:**
+  - L1 hits after preload;
+  - corrupt and foreign entries skipped, then rebuilt and rehydrated;
+  - the instance cap;
+  - the per-table bound;
+  - `catalog_latest` through L2.
+- **Real server processes:**
+  - two processes on one `--l2-dir`, with one build and plan / latest sharing;
+  - a restart with `--l2-preload`: the port refuses connections until preload finishes, the
+    preload log line comes before `listening`, and the latest / exact / GetScanPlan requests are
+    L1 hits;
+  - a preloaded UC-keyed entry is still behind authz: a denied or missing token gets
+    `PERMISSION_DENIED` with no data (GetSnapshot and GetScanPlan), and the allowed token calls UC.
+
+`l2_never_stores_staged_or_tainted` (`tests/v10.rs`) runs the same suite against the in-process
+and the file L2.
 
 `tests/loopback.rs` (L0a) starts the server in-process on `127.0.0.1:0` (default `local` IO mode;
 forward-specific mechanics such as handoff of a listing op run in `forward` mode). Its test client decodes

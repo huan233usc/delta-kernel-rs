@@ -193,10 +193,20 @@ async fn redis_key_schema_and_ttls() {
     let fields: HashSet<&str> = snap.keys().map(String::as_str).collect();
     assert_eq!(
         fields,
-        ["info", "seg", "hint", "version", "built_at", "confirmed_at"]
-            .into_iter()
-            .collect()
+        [
+            "info",
+            "seg",
+            "hint",
+            "version",
+            "built_at",
+            "confirmed_at",
+            "table_id"
+        ]
+        .into_iter()
+        .collect()
     );
+    // v12: the request table id of the build (the L1 key `--l2-preload` rebuilds).
+    assert_eq!(snap["table_id"], fx.table_id.as_bytes());
     let pttl = |k: String| {
         let mut conn = conn.clone();
         async move {

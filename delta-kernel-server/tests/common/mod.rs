@@ -105,7 +105,11 @@ impl TestServer {
         l2: Option<Arc<delta_kernel_server::store::L2>>,
         test_hooks: bool,
     ) -> Self {
-        let core = Core::with_l2(instance_id.into(), config, l2);
+        Self::start_core(Core::with_l2(instance_id.into(), config, l2), test_hooks).await
+    }
+
+    /// Serves an already constructed core (e.g. one warmed by `Core::preload`).
+    pub async fn start_core(core: Arc<Core>, test_hooks: bool) -> Self {
         let (listener, addr) = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let (tx, rx) = oneshot::channel::<()>();
         let svc = KernelService::new(core.clone(), test_hooks);
@@ -218,6 +222,65 @@ pub fn fixture_at(name: &str, table_dir: &str) -> Fixture {
         url,
         table_id: format!("tbl-{}", name.replace('/', "-")),
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Catalog-managed fixture
+// ------------------------------------------------------------------------------------------------
+
+/// Version 0 of a `catalogManaged` table (which requires in-commit timestamps).
+pub const CM_V0: &str = r#"{"commitInfo":{"timestamp":1700000000000,"inCommitTimestamp":1700000000000,"operation":"CREATE TABLE","txnId":"cm-0"}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["catalogManaged"],"writerFeatures":["catalogManaged","inCommitTimestamp"]}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true","io.unitycatalog.tableId":"cm-table"},"createdTime":1700000000000}}
+"#;
+
+pub const CM_TS0: i64 = 1_700_000_000_000;
+
+pub fn cm_fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cm_table");
+    std::fs::create_dir_all(root.join("_delta_log/_staged_commits")).unwrap();
+    std::fs::write(
+        root.join("_delta_log").join(format!("{:020}.json", 0)),
+        CM_V0,
+    )
+    .unwrap();
+    let root = root.canonicalize().unwrap();
+    let url = Url::from_directory_path(&root).unwrap();
+    Fixture {
+        _dir: dir,
+        root,
+        url,
+        table_id: "cm-table".into(),
+    }
+}
+
+/// Commit `version` with ICT `CM_TS0 + version * 1000`.
+pub fn cm_commit(version: i64) -> String {
+    let ts = CM_TS0 + version * 1000;
+    format!(
+        "{{\"commitInfo\":{{\"timestamp\":{ts},\"inCommitTimestamp\":{ts},\
+         \"operation\":\"WRITE\",\"txnId\":\"cm-{version}\"}}}}\n\
+         {{\"add\":{{\"path\":\"file_{version}.parquet\",\"partitionValues\":{{}},\"size\":1234,\
+         \"modificationTime\":{ts},\"dataChange\":true,\"stats\":\"{{\\\"numRecords\\\":1}}\"}}}}\n"
+    )
+}
+
+pub fn cm_publish(fx: &Fixture, version: i64) -> String {
+    let name = format!("{version:020}.json");
+    std::fs::write(fx.log_dir().join(&name), cm_commit(version)).unwrap();
+    name
+}
+
+pub fn cm_stage(fx: &Fixture, version: i64) -> String {
+    let name = format!("_staged_commits/{version:020}.6e5c4a07-8a1f-4b4e-9d5c-{version:012}.json");
+    std::fs::write(fx.log_dir().join(&name), cm_commit(version)).unwrap();
+    name
+}
+
+pub fn cm_request(fx: &Fixture, mcv: i64, tail: &[String]) -> proto::GetSnapshotRequest {
+    let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+    catalog_request(fx, mcv, &tail, vec![])
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1345,7 +1408,49 @@ pub fn with_auth(mut req: proto::GetSnapshotRequest, token: &str) -> proto::GetS
     req
 }
 
-/// The [`SnapshotStore`] contract every tier implements (L1, MemoryStore, Redis).
+/// Regular files under `dir`, recursively (hidden temporary files included).
+pub fn count_files(dir: &Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.map(|e| e.unwrap())
+        .map(|e| {
+            if e.file_type().unwrap().is_dir() {
+                count_files(&e.path())
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// Paths of regular files under `dir`, relative to it, sorted.
+pub fn list_files(dir: &Path) -> Vec<String> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.map(|e| e.unwrap()) {
+            if e.file_type().unwrap().is_dir() {
+                walk(base, &e.path(), out);
+            } else {
+                out.push(
+                    e.path()
+                        .strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    let mut out = vec![];
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// The [`SnapshotStore`] contract every tier implements (L1, MemoryStore, Redis, file).
 pub async fn store_contract<S: delta_kernel_server::store::SnapshotStore>(
     store: &S,
     info: &proto::SnapshotInfo,
@@ -1361,6 +1466,7 @@ pub async fn store_contract<S: delta_kernel_server::store::SnapshotStore>(
     );
     let snap = StoredSnapshot {
         seg_id: seg.clone(),
+        table_id: "contract-table".into(),
         version: 1,
         info: info.clone(),
         payload: Some(payload),

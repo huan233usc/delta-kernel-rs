@@ -10,6 +10,7 @@ use delta_kernel_server::cache::{
     CacheConfig, Core, DEFAULT_L2_BUILD_DEADLINE, DEFAULT_LOCAL_IO_THREADS, IoMode, KERNEL_REV,
 };
 use delta_kernel_server::creds::StorageOverrides;
+use delta_kernel_server::file_store::FileStore;
 use delta_kernel_server::service::{KernelService, bind, serve, write_endpoint_file};
 use delta_kernel_server::store::{DEFAULT_L2_TTL, L2, RedisStore};
 
@@ -69,11 +70,27 @@ struct Args {
     s3_region: Option<String>,
     /// Redis URL of the shared L2 snapshot store (SPEC v10.3), e.g. `redis://10.0.0.5:6379/0`.
     /// Off by default. L2 failures never fail a request; an unreachable URL fails startup.
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", conflicts_with = "l2_dir")]
     l2_redis_url: Option<String>,
-    /// TTL of L2 snapshot, version-index and plan keys.
-    #[arg(long, default_value_t = DEFAULT_L2_TTL.as_secs())]
-    l2_ttl_secs: u64,
+    /// Directory of a file-backed L2 store (SPEC v12), shared by every server process pointed at
+    /// it: `<dir>/<kernel_rev>/{snap,ver,latest,plan}/`, same keys and never-store rules as Redis.
+    /// Build locks and authz entries are not persisted. Off by default; an uncreatable directory
+    /// fails startup.
+    #[arg(long, value_name = "DIR")]
+    l2_dir: Option<PathBuf>,
+    /// Before binding the listen port, rehydrate every snapshot, plan and latest entry under
+    /// `<l2-dir>/<kernel_rev>/` into the in-process cache (from snapshot hints, zero IO). Logs the
+    /// entry count and duration. Requests still go through authz first.
+    #[arg(long, default_value_t = false, requires = "l2_dir")]
+    l2_preload: bool,
+    /// Cap on the snapshot instances `--l2-preload` rehydrates (each table's first choice before
+    /// any table's second). Their plans and latest pointers come along.
+    #[arg(long, value_name = "N", requires = "l2_preload")]
+    l2_preload_max_entries: Option<usize>,
+    /// TTL of L2 snapshot, version-index and plan entries. Default: 6 h on Redis; no expiry on
+    /// the file store (`--l2-dir`), whose entries must survive restarts.
+    #[arg(long, value_name = "SECS")]
+    l2_ttl_secs: Option<u64>,
     /// How long a replica holds the L2 build lock, and how long other replicas wait for its
     /// result before building themselves.
     #[arg(long, default_value_t = DEFAULT_L2_BUILD_DEADLINE.as_millis() as u64)]
@@ -86,6 +103,10 @@ struct Args {
         requires = "enable_test_hooks"
     )]
     test_uc_credentials_for_file: bool,
+    /// Test only (requires --enable-test-hooks): sleep this long at the end of `--l2-preload`,
+    /// before the port is bound.
+    #[arg(long, hide = true, requires_all = ["enable_test_hooks", "l2_preload"])]
+    test_preload_delay_ms: Option<u64>,
 }
 
 #[tokio::main]
@@ -96,6 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
+        // Plain `key=value` fields in log files (e.g. the `L2 preload finished` line).
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
     let args = Args::parse();
     // Convenience flags first: an explicit --storage-option for the same key wins.
@@ -122,9 +145,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default();
         format!("dks-{}-{nanos}", std::process::id())
     });
-    let l2: Option<Arc<L2>> = match &args.l2_redis_url {
-        Some(url) => {
-            let store = RedisStore::connect(url, KERNEL_REV, Duration::from_secs(args.l2_ttl_secs))
+    let ttl = args.l2_ttl_secs.map(Duration::from_secs);
+    let mut file_l2: Option<Arc<FileStore>> = None;
+    let l2: Option<Arc<L2>> = match (&args.l2_redis_url, &args.l2_dir) {
+        (Some(url), _) => {
+            let store = RedisStore::connect(url, KERNEL_REV, ttl.unwrap_or(DEFAULT_L2_TTL))
                 .await
                 .map_err(|e| format!("--l2-redis-url: {e}"))?;
             // The URL may carry a password: log the host part only.
@@ -132,7 +157,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(l2 = %host, "L2 snapshot store connected");
             Some(Arc::new(store))
         }
-        None => None,
+        (None, Some(dir)) => {
+            let store = Arc::new(
+                FileStore::open(dir, KERNEL_REV, ttl).map_err(|e| format!("--l2-dir: {e}"))?,
+            );
+            tracing::info!(dir = %store.root().display(), ttl_secs = ?args.l2_ttl_secs, "L2 file store opened");
+            file_l2 = Some(store.clone());
+            Some(store)
+        }
+        (None, None) => None,
+    };
+    let l2_kind = match (&args.l2_redis_url, &args.l2_dir) {
+        (Some(_), _) => "redis",
+        (None, Some(_)) => "file",
+        (None, None) => "off",
     };
     let core = Core::with_l2(
         instance_id.clone(),
@@ -144,11 +182,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             credentials_for_file: args.test_uc_credentials_for_file,
             local_io_threads: args.local_io_threads as usize,
             storage_options,
-            l2_ttl: Duration::from_secs(args.l2_ttl_secs),
+            l2_ttl: ttl.unwrap_or(DEFAULT_L2_TTL),
             l2_build_deadline: Duration::from_millis(args.l2_build_deadline_ms.max(1)),
         },
         l2,
     );
+    // SPEC v12: the cache is warm before the port accepts connections. A failed preload leaves
+    // the server cold (WARN) rather than down.
+    if args.l2_preload {
+        let store = file_l2
+            .as_ref()
+            .expect("clap: --l2-preload requires --l2-dir");
+        match core.preload(store, args.l2_preload_max_entries).await {
+            Ok(report) => {
+                if let Some(ms) = args.test_preload_delay_ms {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                if !report.other_revisions.is_empty() {
+                    tracing::warn!(
+                        other_kernel_revs = ?report.other_revisions,
+                        "L2 dir has entries of other kernel revisions; ignored"
+                    );
+                }
+                tracing::info!(
+                    entries = report.entries(),
+                    snapshots = report.snapshots,
+                    latest = report.latest,
+                    plans = report.plans,
+                    rejected = report.rejected,
+                    expired = report.expired,
+                    skipped = report.skipped,
+                    catalog_latest_in_l2 = report.catalog_latest_in_l2,
+                    duration_ms = report.duration.as_secs_f64() * 1000.0,
+                    "L2 preload finished"
+                );
+            }
+            Err(e) => tracing::warn!(error = %e, "L2 preload failed; starting cold"),
+        }
+    }
     let (listener, addr) = bind(args.listen).await?;
     if let Some(path) = &args.endpoint_file {
         write_endpoint_file(path, addr)?;
@@ -159,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kernel_rev = KERNEL_REV,
         test_hooks = args.enable_test_hooks,
         io_mode = ?args.io_mode,
-        l2 = args.l2_redis_url.is_some(),
+        l2 = l2_kind,
         "delta-kernel-server listening"
     );
     let shutdown = async {
