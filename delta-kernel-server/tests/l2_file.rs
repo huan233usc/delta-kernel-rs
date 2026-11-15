@@ -1484,3 +1484,115 @@ async fn latest_renewal_write_is_off_the_request_path() {
     assert!(confirmed() > c1);
     assert_eq!(server.core.pending_l2_renewals(), 0);
 }
+
+/// `--l2-read-only` (SPEC v12.1 decision b): the directory cannot change during a read-only run,
+/// so a latest renewal from an L1 base reads nothing from L2. With every L2 read delayed,
+/// staleness-0 renewals return without waiting, are CACHE_HIT with only the renewal listing, and
+/// make zero L2 reads. Scope: without an L1 base, read-only still reads the L2 pointer (as its
+/// base), exact-version L1 misses still read L2, and a writable store still looks up the pointer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_only_renewal_reads_nothing_from_l2() {
+    const DELAY: Duration = Duration::from_millis(1500);
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (fixture("table-with-dv-small"), fixture("crc-full"));
+    let seeded = seed(file_l2(dir.path()), &[&a, &b]).await;
+
+    let ro = Arc::new(FileStore::open_read_only(dir.path(), KERNEL_REV, None).unwrap());
+    assert!(ro.read_only());
+    let l2: Arc<L2> = ro.clone();
+    let core = Core::with_l2("ro-warm".into(), CacheConfig::default(), Some(l2));
+    assert_eq!(core.preload(&ro, None).await.unwrap().snapshots, 2);
+    let server = TestServer::start_core(core, true).await;
+    let mut cl = server.client().await;
+    ro.set_read_delay(DELAY);
+    let reads0 = ro.reads();
+    for round in 0..3 {
+        for (fx, first) in [(&a, &seeded[0]), (&b, &seeded[1])] {
+            let t = Instant::now();
+            let (r, ops) = run(
+                &mut cl,
+                latest_request(fx, 0, default_specs()),
+                Behavior::default(),
+            )
+            .await
+            .ok();
+            assert!(
+                t.elapsed() < DELAY / 2,
+                "round {round}: renewal waited on the store: {:?}",
+                t.elapsed()
+            );
+            assert_eq!(resolved(&r), ResolveKind::CacheHit);
+            assert_eq!(op_counts(&r), (0, 1), "the renewal listing only");
+            assert!(ops.is_empty());
+            assert_eq!(r.info, first.info);
+            assert!(r.prefetched_plans.iter().all(|p| p.cache_hit));
+        }
+    }
+    server.core.flush_l2_renewals().await;
+    assert_eq!(ro.reads(), reads0, "zero L2 reads during renewals");
+    assert_eq!(ro.writes(), 0);
+    let s = server.stats().await;
+    assert_eq!(
+        (s.l2_hits, s.l2_misses, s.builds_started, s.latest_renewals),
+        (0, 0, 0, 6),
+        "no L2 lookup at all"
+    );
+    ro.set_read_delay(Duration::ZERO);
+    drop(server);
+
+    // Read-only without an L1 base: the stale L2 pointer is read once as the base; afterwards the
+    // L1 pointer is authoritative. An exact-version L1 miss reads L2.
+    let ro2 = Arc::new(FileStore::open_read_only(dir.path(), KERNEL_REV, None).unwrap());
+    let cold = TestServer::start_l2("ro-cold", ro2.clone()).await;
+    let mut cl = cold.client().await;
+    let (r, _) = run(&mut cl, latest_request(&a, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(
+        (resolved(&r), op_counts(&r)),
+        (ResolveKind::CacheHit, (0, 1))
+    );
+    let r1 = ro2.reads();
+    assert!(r1 > 0, "no L1 base: the L2 pointer and entry are read");
+    let (r, _) = run(&mut cl, latest_request(&a, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(
+        (resolved(&r), op_counts(&r)),
+        (ResolveKind::CacheHit, (0, 1))
+    );
+    assert_eq!(ro2.reads(), r1, "L1 base: nothing read");
+    let (r, _) = run(
+        &mut cl,
+        request_with_segment(&b, seeded[1].version, vec![], &seeded[1]),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(
+        (resolved(&r), op_counts(&r)),
+        (ResolveKind::CacheHit, (0, 0))
+    );
+    assert!(ro2.reads() > r1, "exact-version L1 miss: read from L2");
+    drop(cold);
+
+    // Write mode is unchanged: a renewal from an L1 base still looks up the L2 pointer.
+    let w = file_l2(dir.path());
+    let writer = TestServer::start_l2("writer", w.clone()).await;
+    let mut cl = writer.client().await;
+    run(&mut cl, latest_request(&a, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    let w1 = w.reads();
+    let (r, _) = run(&mut cl, latest_request(&a, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(
+        (resolved(&r), op_counts(&r)),
+        (ResolveKind::CacheHit, (0, 1))
+    );
+    assert!(
+        w.reads() > w1,
+        "write mode: the renewal reads the L2 pointer"
+    );
+}

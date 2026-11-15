@@ -139,6 +139,9 @@ struct Inner {
     writes: AtomicU64,
     /// Test hook: delay before each file write.
     write_delay_ms: AtomicU64,
+    /// Entry files read (opened), and a test-hook delay before each read.
+    reads: AtomicU64,
+    read_delay_ms: AtomicU64,
 }
 
 /// Holds the in-process RMW mutex and, where supported, an exclusive `flock` on the directory of
@@ -165,7 +168,7 @@ fn part(s: &str) -> StoreResult<&str> {
     }
 }
 
-fn read_opt(path: &Path) -> StoreResult<Option<Vec<u8>>> {
+fn read_file(path: &Path) -> StoreResult<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(b) => Ok(Some(b)),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
@@ -316,6 +319,16 @@ impl Inner {
             .map_or(0, |ttl| now_ms() + ttl.as_millis().max(1) as i64)
     }
 
+    /// Reads an entry file (`None` if absent), counting the read.
+    fn read_opt(&self, path: &Path) -> StoreResult<Option<Vec<u8>>> {
+        let delay = self.read_delay_ms.load(Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        read_file(path)
+    }
+
     fn check_rev(&self, rev: &str) -> Result<(), String> {
         if rev == self.kernel_rev {
             Ok(())
@@ -445,7 +458,7 @@ impl Inner {
 
     fn read_snap(&self, table: &str, seg: &str) -> StoreResult<Entry<StoredSnapshot<Vec<u8>>>> {
         let path = self.snap_path(table, seg)?;
-        let Some(bytes) = read_opt(&path)? else {
+        let Some(bytes) = self.read_opt(&path)? else {
             return Ok(Entry::Absent);
         };
         Ok(match self.decode_snap(&bytes, table, seg) {
@@ -509,7 +522,7 @@ impl Inner {
 
     fn read_ver(&self, table: &str) -> StoreResult<Entry<VerFile>> {
         let path = self.ver_path(table)?;
-        let Some(bytes) = read_opt(&path)? else {
+        let Some(bytes) = self.read_opt(&path)? else {
             return Ok(Entry::Absent);
         };
         let ver = match serde_json::from_slice::<VerFile>(&bytes) {
@@ -595,7 +608,7 @@ impl Inner {
     // ---------- latest ----------
 
     fn read_latest_file(&self, path: &Path) -> StoreResult<Entry<LatestFile>> {
-        let Some(bytes) = read_opt(path)? else {
+        let Some(bytes) = self.read_opt(path)? else {
             return Ok(Entry::Absent);
         };
         let rec = match serde_json::from_slice::<LatestFile>(&bytes) {
@@ -660,7 +673,7 @@ impl Inner {
 
     fn get_plan(&self, seg: &str, spec: &str) -> StoreResult<Option<proto::ScanPlanResult>> {
         let path = self.plan_path(seg, spec)?;
-        let Some(bytes) = read_opt(&path)? else {
+        let Some(bytes) = self.read_opt(&path)? else {
             return Ok(None);
         };
         let decoded = (|| -> Result<Option<proto::ScanPlanResult>, String> {
@@ -830,14 +843,12 @@ impl FileStore {
                 skipped_writes: AtomicU64::new(0),
                 writes: AtomicU64::new(0),
                 write_delay_ms: AtomicU64::new(0),
+                reads: AtomicU64::new(0),
+                read_delay_ms: AtomicU64::new(0),
             }),
             locks: Mutex::default(),
             authz: Mutex::default(),
         }
-    }
-
-    pub fn read_only(&self) -> bool {
-        self.inner.read_only
     }
 
     /// Writes skipped because the store is read-only.
@@ -848,6 +859,18 @@ impl FileStore {
     /// Entry files written so far by this store.
     pub fn writes(&self) -> u64 {
         self.inner.writes.load(Ordering::Relaxed)
+    }
+
+    /// Entry files read so far by this store.
+    pub fn reads(&self) -> u64 {
+        self.inner.reads.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: sleep this long before every entry-file read (`Duration::ZERO` disables).
+    pub fn set_read_delay(&self, delay: Duration) {
+        self.inner
+            .read_delay_ms
+            .store(delay.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Test hook: sleep this long before every file write (`Duration::ZERO` disables).
@@ -888,6 +911,10 @@ impl SnapshotStore for FileStore {
 
     fn tier(&self) -> &'static str {
         "l2-file"
+    }
+
+    fn read_only(&self) -> bool {
+        self.inner.read_only
     }
 
     async fn get_snapshot(

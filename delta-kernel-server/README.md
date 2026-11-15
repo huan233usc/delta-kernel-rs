@@ -398,9 +398,15 @@ SF1 / HiFi sizes are not measured here: they need the P1-b client runs.
     (`Core::flush_l2_renewals`).
   - **Counters** (in process): `l2_renewals_{queued,coalesced,dropped,written}`.
   - Build results are still written through before the request returns.
-- **Renewal reads on disk:** a renewal reads only the small `latest` pointer (to look for a
-  fresher one). The version index is rewritten only when it orders two entries of one version (or
-  with a TTL), and the stale snap entry is read only when L1 has no base.
+- **Renewal reads on disk:**
+  - In write mode, a renewal reads only the small `latest` pointer, to look for a fresher one
+    from another process.
+  - With `--l2-read-only`, a renewal from an L1 base reads nothing from L2. The directory cannot
+    change during a read-only run, so after preload the L1 pointer is authoritative and the
+    renewal listing is the only freshness check.
+  - Without an L1 base, read-only still reads the stale L2 pointer once as its base.
+  - The version index is rewritten only when it orders two entries of one version (or with a
+    TTL), and the stale snap entry is read only when L1 has no base.
 - **Counting:** a latest re-listing from a stale L2 base that finds no new commit counts in
   `latest_renewals`, not `builds_started`, like one from an L1 base.
 
@@ -604,6 +610,9 @@ gates run with it set:
 - **v12.1, in process:**
   - a read-only store reads every entry and skips every write, leaving the tree byte-identical
     (including a dangling index member) and creating no missing directory;
+  - read-only renewals with every L2 read delayed 1.5 s return immediately, are `CACHE_HIT`
+    `(0, 1)` and make zero L2 reads, while the cold-start, exact-miss and write-mode lookups still
+    read;
   - a latest renewal returns while the store's writes are delayed 1.5 s: five renewals make two
     background writes (the second coalesced), the pointer stays monotonic, and a flush writes
     what is queued.

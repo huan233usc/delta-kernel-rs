@@ -108,6 +108,13 @@ pub trait SnapshotStore: Send + Sync {
 
     fn tier(&self) -> &'static str;
 
+    /// Whether the store accepts no writes (`--l2-read-only`, SPEC v12.1). Its contents then
+    /// cannot change while the server runs, so an L1 latest pointer is never older than the L2
+    /// one.
+    fn read_only(&self) -> bool {
+        false
+    }
+
     async fn get_snapshot(
         &self,
         table: &str,

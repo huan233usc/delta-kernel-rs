@@ -1987,10 +1987,15 @@ impl Core {
             let l2_table = l2_table_key(&key.0, &key.1);
             // Staged-tail targets have no build key and never touch L2.
             let l2 = core.l2.clone().filter(|_| build_key.is_some());
+            // SPEC v12.1: a read-only L2 cannot change during the run, so a latest re-listing from
+            // an L1 base cannot find a fresher L2 pointer; the listing is the only freshness check
+            // and the request reads nothing from L2.
+            let skip_lookup =
+                is_latest && base.is_some() && l2.as_ref().is_some_and(|l2| l2.read_only());
             let mut base = base;
             let mut lock: Option<(String, String)> = None;
 
-            if let Some(l2) = &l2 {
+            if let Some(l2) = l2.as_ref().filter(|_| !skip_lookup) {
                 let need_base = base.is_none();
                 let mut found = core
                     .l2_lookup(
