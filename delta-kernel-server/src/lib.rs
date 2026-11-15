@@ -17,6 +17,7 @@ pub mod info;
 pub mod local_io;
 pub mod normalize;
 pub mod plan;
+pub mod renewal;
 pub mod service;
 pub mod stats;
 pub mod store;

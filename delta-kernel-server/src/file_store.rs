@@ -24,6 +24,9 @@
 //!   with a SHA-256 of their content. A corrupt file, or one whose kernel revision or key does not
 //!   match, is a miss logged at WARN (and counted in [`FileStore::rejected`]); the next write of
 //!   that key replaces it.
+//! - **Read-only** (`--l2-read-only`, SPEC v12.1, [`FileStore::open_read_only`]): reads and preload
+//!   work as above; every write is skipped before touching the filesystem (no entry, no temporary
+//!   file, no directory, no `flock`), so the directory stays byte-identical.
 //! - **Expiry**: with `--l2-ttl-secs`, `snap` and `plan` entries expire like the Redis keys
 //!   (refreshed on put and confirm). Without it they never expire: they are content-addressed (an
 //!   old entry is never wrong) and a restarted server must still find them. `latest` pointers never
@@ -128,6 +131,14 @@ struct Inner {
     /// Serializes this process's read-compare-rename updates.
     rmw: Mutex<()>,
     rejected: AtomicU64,
+    /// `--l2-read-only`: never write under the directory.
+    read_only: bool,
+    /// Writes skipped because the store is read-only.
+    skipped_writes: AtomicU64,
+    /// Entry files written (renamed into place).
+    writes: AtomicU64,
+    /// Test hook: delay before each file write.
+    write_delay_ms: AtomicU64,
 }
 
 /// Holds the in-process RMW mutex and, where supported, an exclusive `flock` on the directory of
@@ -327,6 +338,14 @@ impl Inner {
     }
 
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> StoreResult<()> {
+        // Unreachable: every write method returns before this on a read-only store.
+        if self.read_only {
+            return Err("file L2: read-only store".into());
+        }
+        let delay = self.write_delay_ms.load(Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
         let dir = path.parent().expect("entry paths have a parent");
         fs::create_dir_all(dir).map_err(|e| format!("file L2: create {}: {e}", dir.display()))?;
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("entry");
@@ -342,10 +361,15 @@ impl Inner {
             let _ = fs::remove_file(&tmp);
             return Err(format!("file L2: write {}: {e}", path.display()));
         }
+        self.writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     fn rmw_lock(&self, dir: &Path) -> StoreResult<RmwGuard<'_>> {
+        // Unreachable on a read-only store, like `write_atomic`.
+        if self.read_only {
+            return Err("file L2: read-only store".into());
+        }
         let guard = self.rmw.lock().unwrap_or_else(|e| e.into_inner());
         fs::create_dir_all(dir).map_err(|e| format!("file L2: create {}: {e}", dir.display()))?;
         // Advisory and best effort: a filesystem without flock degrades to SPEC v12's "at most
@@ -554,8 +578,8 @@ impl Inner {
             }
         }
         // The snap entry expired or was deleted: drop the dangling index member (Redis ZREM),
-        // unless a concurrent put just wrote it again.
-        if !dangling.is_empty() {
+        // unless a concurrent put just wrote it again. A read-only store leaves it.
+        if !dangling.is_empty() && !self.read_only {
             self.update_ver(table, |members| {
                 let mut changed = false;
                 for seg in &dangling {
@@ -777,17 +801,68 @@ impl FileStore {
         let root = dir.join(part(kernel_rev)?);
         fs::create_dir_all(&root)
             .map_err(|e| format!("file L2: create {}: {e}", root.display()))?;
-        Ok(Self {
+        Ok(Self::with_root(root, kernel_rev, ttl, false))
+    }
+
+    /// `--l2-read-only` (SPEC v12.1): reads `<dir>/<kernel_rev>/` and never writes under `dir`,
+    /// not even to create it (a missing directory is an empty store).
+    pub fn open_read_only(
+        dir: &Path,
+        kernel_rev: &str,
+        ttl: Option<Duration>,
+    ) -> StoreResult<Self> {
+        let root = dir.join(part(kernel_rev)?);
+        if !root.is_dir() {
+            tracing::warn!(dir = %root.display(), "read-only L2 directory does not exist; no entries");
+        }
+        Ok(Self::with_root(root, kernel_rev, ttl, true))
+    }
+
+    fn with_root(root: PathBuf, kernel_rev: &str, ttl: Option<Duration>, read_only: bool) -> Self {
+        Self {
             inner: Arc::new(Inner {
                 root,
                 kernel_rev: kernel_rev.to_string(),
                 ttl,
                 rmw: Mutex::new(()),
                 rejected: AtomicU64::new(0),
+                read_only,
+                skipped_writes: AtomicU64::new(0),
+                writes: AtomicU64::new(0),
+                write_delay_ms: AtomicU64::new(0),
             }),
             locks: Mutex::default(),
             authz: Mutex::default(),
-        })
+        }
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.inner.read_only
+    }
+
+    /// Writes skipped because the store is read-only.
+    pub fn skipped_writes(&self) -> u64 {
+        self.inner.skipped_writes.load(Ordering::Relaxed)
+    }
+
+    /// Entry files written so far by this store.
+    pub fn writes(&self) -> u64 {
+        self.inner.writes.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: sleep this long before every file write (`Duration::ZERO` disables).
+    pub fn set_write_delay(&self, delay: Duration) {
+        self.inner
+            .write_delay_ms
+            .store(delay.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// `true` (and counted) if a write must be skipped.
+    fn skip_write(&self) -> bool {
+        if self.inner.read_only {
+            self.inner.skipped_writes.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.read_only
     }
 
     /// `<dir>/<kernel_rev>`.
@@ -834,11 +909,17 @@ impl SnapshotStore for FileStore {
     }
 
     async fn put_snapshot(&self, table: &str, snap: &StoredSnapshot<Vec<u8>>) -> StoreResult<()> {
+        if self.skip_write() {
+            return Ok(());
+        }
         let (inner, table, snap) = (self.inner.clone(), table.to_string(), snap.clone());
         blocking(move || inner.put_snapshot(&table, &snap)).await
     }
 
     async fn confirm_snapshot(&self, table: &str, seg_id: &str, at_ms: i64) -> StoreResult<()> {
+        if self.skip_write() {
+            return Ok(());
+        }
         let (inner, table, seg) = (self.inner.clone(), table.to_string(), seg_id.to_string());
         blocking(move || inner.confirm_snapshot(&table, &seg, at_ms)).await
     }
@@ -861,6 +942,9 @@ impl SnapshotStore for FileStore {
         rec: &LatestRecord,
         _staleness: Duration,
     ) -> StoreResult<()> {
+        if self.skip_write() {
+            return Ok(());
+        }
         let (inner, table, rec) = (self.inner.clone(), table.to_string(), rec.clone());
         blocking(move || inner.put_latest(&table, &rec)).await
     }
@@ -884,6 +968,9 @@ impl SnapshotStore for FileStore {
         spec_hash: &str,
         plan: &proto::ScanPlanResult,
     ) -> StoreResult<PlanPut> {
+        if self.skip_write() {
+            return Ok(PlanPut::ReadOnly);
+        }
         let (inner, seg, spec, plan) = (
             self.inner.clone(),
             seg_id.to_string(),

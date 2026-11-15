@@ -14,6 +14,8 @@
 //!   commits are returned to the waiting requests but never inserted into L1 or written to L2.
 //! - L1 eviction: at most `max_instances_per_table` per table, then a global LRU bounded by
 //!   `max_cache_bytes` of estimated memory.
+//! - Build results are written through to L2 before the request returns; a latest renewal's L2
+//!   writes go to a background writer ([`crate::renewal`], SPEC v12.1).
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -45,6 +47,7 @@ use crate::local_io::{LocalIo, LocalIoPool};
 use crate::plan::{PlanOutcome, generate_plan, spec_key};
 use crate::proto::error::Code;
 use crate::proto::{self, version_spec};
+use crate::renewal::{DEFAULT_RENEWAL_QUEUE_CAPACITY, Enqueued, Renewal, RenewalQueue};
 use crate::stats::{Faults, ServerCounters};
 use crate::store::{
     DEFAULT_L2_TTL, L2, LatestRecord, PlanPut, SnapshotStore, StoreResult, StoredSnapshot, now_ms,
@@ -830,6 +833,9 @@ pub struct Core {
     pub l1: L1Cache,
     l2: Option<Arc<L2>>,
     job_seq: AtomicU64,
+    /// Latest-renewal L2 writes, done off the request path (SPEC v12.1).
+    renewals: Arc<RenewalQueue>,
+    renewal_writer_started: AtomicBool,
 }
 
 /// What a request resolved to before plans are generated.
@@ -902,6 +908,52 @@ fn time_travel_needs_catalog_latest() -> ServerError {
 
 fn stale_ref(message: impl Into<String>) -> ServerError {
     ServerError::new(Code::StaleRef, message)
+}
+
+/// The `latest` pointer a latest build or renewal writes, with the request staleness (the Redis
+/// TTL); `None` for exact-version and staged-tail targets.
+fn latest_record(
+    instance: &Instance,
+    target: &Target,
+    confirmed_at_ms: i64,
+) -> Option<(LatestRecord, Duration)> {
+    let (tail_id, staleness) = match target {
+        Target::Latest { max_staleness } => (String::new(), *max_staleness),
+        Target::CatalogLatest {
+            tail_id,
+            tail_has_staged: false,
+            ..
+        } => (tail_digest(tail_id), Duration::ZERO),
+        _ => return None,
+    };
+    Some((
+        LatestRecord {
+            seg_id: instance.seg_hex.clone(),
+            version: instance.version(),
+            confirmed_at_ms,
+            tail_id,
+        },
+        staleness,
+    ))
+}
+
+/// Writes renewals (best effort: failures are logged at WARN and counted).
+async fn write_renewals(l2: &L2, batch: Vec<Renewal>, counters: &ServerCounters) {
+    for r in batch {
+        let written = async {
+            l2.confirm_snapshot(&r.table, &r.rec.seg_id, r.confirm_at_ms)
+                .await?;
+            l2.put_latest(&r.table, &r.rec, r.staleness).await
+        }
+        .await;
+        match written {
+            Ok(()) => counters.l2_renewals_written.fetch_add(1, Ordering::Relaxed),
+            Err(e) => {
+                tracing::warn!(table_key = %r.table, error = %e, "L2 renewal write failed; dropped");
+                counters.l2_errors.fetch_add(1, Ordering::Relaxed)
+            }
+        };
+    }
 }
 
 /// What `--l2-preload` rehydrated into L1 (SPEC v12).
@@ -977,6 +1029,8 @@ impl Core {
             l1,
             l2,
             job_seq: AtomicU64::new(1),
+            renewals: Arc::new(RenewalQueue::new(DEFAULT_RENEWAL_QUEUE_CAPACITY)),
+            renewal_writer_started: AtomicBool::new(false),
         })
     }
 
@@ -1839,24 +1893,70 @@ impl Core {
         target: &Target,
         confirmed_at_ms: i64,
     ) {
-        let (tail_id, staleness) = match target {
-            Target::Latest { max_staleness } => (String::new(), *max_staleness),
-            Target::CatalogLatest {
-                tail_id,
-                tail_has_staged: false,
-                ..
-            } => (tail_digest(tail_id), Duration::ZERO),
-            _ => return,
-        };
-        let rec = LatestRecord {
-            seg_id: instance.seg_hex.clone(),
-            version: instance.version(),
-            confirmed_at_ms,
-            tail_id,
+        let Some((rec, staleness)) = latest_record(instance, target, confirmed_at_ms) else {
+            return;
         };
         if let Err(e) = l2.put_latest(table, &rec, staleness).await {
             self.l2_error("put latest", &e);
         }
+    }
+
+    /// Queues a latest renewal's L2 writes (re-confirm the `snap` entry, advance the pointer) for
+    /// the background writer, so the request does not wait on the store (SPEC v12.1).
+    fn defer_renewal(
+        self: &Arc<Self>,
+        table: &str,
+        instance: &Instance,
+        target: &Target,
+        confirmed_at_ms: i64,
+    ) {
+        let Some(l2) = self.l2.clone() else {
+            return;
+        };
+        let Some((rec, staleness)) = latest_record(instance, target, confirmed_at_ms) else {
+            return;
+        };
+        let counter = match self.renewals.push(Renewal {
+            table: table.to_string(),
+            rec,
+            confirm_at_ms: now_ms(),
+            staleness,
+        }) {
+            Enqueued::Queued => &self.counters.l2_renewals_queued,
+            Enqueued::Coalesced => &self.counters.l2_renewals_coalesced,
+            Enqueued::Dropped => {
+                tracing::warn!(
+                    table_key = table,
+                    "L2 renewal queue full; renewal not written"
+                );
+                &self.counters.l2_renewals_dropped
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if !self.renewal_writer_started.swap(true, Ordering::SeqCst) {
+            let (queue, counters) = (self.renewals.clone(), self.counters.clone());
+            tokio::spawn(async move {
+                loop {
+                    queue.notify.notified().await;
+                    let _writing = queue.writing.lock().await;
+                    write_renewals(l2.as_ref(), queue.take(), &counters).await;
+                }
+            });
+        }
+    }
+
+    /// Writes every queued latest renewal now, after the writer's in-flight batch (shutdown).
+    pub async fn flush_l2_renewals(&self) {
+        let Some(l2) = &self.l2 else {
+            return;
+        };
+        let _writing = self.renewals.writing.lock().await;
+        write_renewals(l2.as_ref(), self.renewals.take(), &self.counters).await;
+    }
+
+    /// Latest renewals waiting for the background writer.
+    pub fn pending_l2_renewals(&self) -> usize {
+        self.renewals.len()
     }
 
     fn spawn_build(self: &Arc<Self>, job: Arc<Job<BuildOutcome>>, inputs: BuildInputs) {
@@ -1881,7 +1981,6 @@ impl Core {
                 _ => (None, false),
             };
             let is_latest = matches!(target, Target::Latest { .. });
-            let is_relist = is_latest && base.is_some();
             // Confirmation time of a latest result: when its listing started, not when it ended.
             let started = Instant::now();
             let started_ms = now_ms();
@@ -1988,6 +2087,9 @@ impl Core {
                 }
             }
 
+            // A re-listing from an L1 base or a stale L2 latest counts as a build only once it
+            // finds new commits (below); a renewal counts in `latest_renewals`.
+            let is_relist = is_latest && base.is_some();
             if !is_relist {
                 core.counters.builds_started.fetch_add(1, Ordering::Relaxed);
             }
@@ -2039,21 +2141,9 @@ impl Core {
                         )
                         .await
                     }
+                    // Off the request path: the store is not touched before the job completes.
                     L2Write::Renewal => {
-                        if let Err(e) = l2
-                            .confirm_snapshot(&l2_table, &outcome.instance.seg_hex, now_ms())
-                            .await
-                        {
-                            core.l2_error("confirm", &e);
-                        }
-                        core.l2_write_latest(
-                            l2.as_ref(),
-                            &l2_table,
-                            &outcome.instance,
-                            &target,
-                            started_ms,
-                        )
-                        .await;
+                        core.defer_renewal(&l2_table, &outcome.instance, &target, started_ms)
                     }
                     L2Write::None => {}
                 }
@@ -2321,7 +2411,7 @@ impl Core {
                 && !tainted
             {
                 match l2.put_plan(&instance.seg_hex, &key, r).await {
-                    Ok(PlanPut::Stored) => {}
+                    Ok(PlanPut::Stored | PlanPut::ReadOnly) => {}
                     Ok(PlanPut::TooLarge(len)) => {
                         core.counters
                             .l2_plans_too_large

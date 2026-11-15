@@ -680,6 +680,7 @@ impl ServerProc {
             .args(["--listen", "127.0.0.1:0"])
             .arg("--endpoint-file")
             .arg(&endpoint)
+            .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
             .spawn()
             .unwrap();
@@ -718,6 +719,14 @@ impl ServerProc {
             .status();
         let _ = self.child.wait();
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+/// A failed test does not leak its server process.
+impl Drop for ServerProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -767,13 +776,20 @@ async fn start_preloaded(
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let delay = delay_ms.to_string();
     let spawned = Instant::now();
-    let mut child = server_command(instance_id, l2_dir, extra)
+    let child = server_command(instance_id, l2_dir, extra)
         .args(["--listen", &addr.to_string(), "--l2-preload"])
         .args(["--test-preload-delay-ms", &delay])
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
+    // Owns the child from here on: a failed assertion below does not leak it.
+    let mut proc = ServerProc {
+        child,
+        addr,
+        log: log.clone(),
+        _dir: dir,
+    };
     let mut accepted = None;
     let mut refused = 0;
     while spawned.elapsed() < Duration::from_secs(60) {
@@ -784,7 +800,7 @@ async fn start_preloaded(
             }
             Err(_) => refused += 1,
         }
-        if let Ok(Some(status)) = child.try_wait() {
+        if let Ok(Some(status)) = proc.child.try_wait() {
             panic!(
                 "server exited {status}: {}",
                 std::fs::read_to_string(&log).unwrap_or_default()
@@ -804,16 +820,7 @@ async fn start_preloaded(
         .expect("listening log line");
     assert!(preload_at < listening_at, "preload finished before bind");
     let line = logs[preload_at..].lines().next().unwrap().to_string();
-    (
-        ServerProc {
-            child,
-            addr,
-            log,
-            _dir: dir,
-        },
-        accepted,
-        line,
-    )
+    (proc, accepted, line)
 }
 
 /// Two server processes on one `--l2-dir`: one build. The second process serves the snapshot,
@@ -1072,4 +1079,408 @@ async fn preload_keeps_authz_for_cloud_entries() {
     let s = p.stats().await;
     assert_eq!((s.builds_started, s.l2_hits), (0, 0));
     p.stop();
+}
+
+// ------------------------------------------------------------------------------------------------
+// v12.1: read-only L2, background renewal writes
+// ------------------------------------------------------------------------------------------------
+
+/// Digest of a directory tree: every entry's relative path and kind, file contents, and the
+/// modification time of every file and directory (so a temporary file created and renamed away
+/// shows too).
+fn tree_digest(root: &Path) -> String {
+    use sha2::Digest as _;
+    fn walk(base: &Path, dir: &Path, h: &mut sha2::Sha256) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        let meta = std::fs::metadata(dir).unwrap();
+        h.update(format!(
+            "D {} {:?}\n",
+            dir.strip_prefix(base).unwrap().display(),
+            meta.modified().unwrap()
+        ));
+        for path in entries {
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                walk(base, &path, h);
+            } else {
+                h.update(format!(
+                    "F {} {} {:?}\n",
+                    path.strip_prefix(base).unwrap().display(),
+                    meta.len(),
+                    meta.modified().unwrap()
+                ));
+                h.update(std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut h = sha2::Sha256::new();
+    walk(root, root, &mut h);
+    hex::encode(h.finalize())
+}
+
+/// Makes a tree read-only (no writes possible, even by the owner) until dropped.
+struct ReadOnlyTree(PathBuf);
+
+impl ReadOnlyTree {
+    fn set(dir: &Path, writable: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |is_dir: bool| match (is_dir, writable) {
+            (true, true) => 0o755,
+            (true, false) => 0o555,
+            (false, true) => 0o644,
+            (false, false) => 0o444,
+        };
+        if writable {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode(true))).unwrap();
+        }
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                Self::set(&path, writable);
+            } else {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode(false)))
+                    .unwrap();
+            }
+        }
+        if !writable {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode(true))).unwrap();
+        }
+    }
+
+    fn new(dir: &Path) -> Self {
+        Self::set(dir, false);
+        Self(dir.to_path_buf())
+    }
+}
+
+impl Drop for ReadOnlyTree {
+    fn drop(&mut self) {
+        Self::set(&self.0, true);
+    }
+}
+
+/// A read-only store reads every entry (preload scan included) and skips every write before it
+/// touches the filesystem: the tree is byte-identical, including the dangling version-index
+/// member a writable store would drop, and a missing directory is not created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_store_read_only_never_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_l2(dir.path());
+    let fx = fixture("table-with-dv-small");
+    let info = info_of(&fx, 1);
+    let tk = l2_table_key("", &info.table_root);
+    let seg = segment_id(info.log_segment.as_ref().unwrap()).digest();
+    let snap = StoredSnapshot {
+        seg_id: seg.clone(),
+        table_id: "t".into(),
+        version: 1,
+        info: info.clone(),
+        payload: Some(b"hint".to_vec()),
+        built_at_ms: now_ms(),
+        confirmed_at_ms: now_ms(),
+    };
+    let rec = LatestRecord {
+        seg_id: seg.clone(),
+        version: 1,
+        confirmed_at_ms: now_ms(),
+        tail_id: String::new(),
+    };
+    let plan = plan_of(vec![3; 100]);
+    writer.put_snapshot(&tk, &snap).await.unwrap();
+    writer.put_plan(&seg, "spec", &plan).await.unwrap();
+    writer.put_latest(&tk, &rec, Duration::ZERO).await.unwrap();
+    let gone = StoredSnapshot {
+        seg_id: "seg-gone".into(),
+        ..snap.clone()
+    };
+    writer.put_snapshot(&tk, &gone).await.unwrap();
+    std::fs::remove_file(writer.root().join(format!("snap/{tk}/seg-gone.bin"))).unwrap();
+    let before = tree_digest(dir.path());
+
+    let ro = FileStore::open_read_only(dir.path(), KERNEL_REV, None).unwrap();
+    assert!(ro.read_only());
+    assert_eq!(
+        ro.get_snapshot(&tk, &seg).await.unwrap().unwrap().info,
+        info
+    );
+    assert_eq!(
+        ro.snapshot_at_version(&tk, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .seg_id,
+        seg
+    );
+    assert_eq!(ro.get_latest(&tk, "").await.unwrap().unwrap(), rec);
+    assert_eq!(
+        ro.get_plan(&seg, "spec").await.unwrap().unwrap().result,
+        plan.result
+    );
+    assert_eq!(ro.scan().await.unwrap().snapshots.len(), 1);
+
+    let newer = StoredSnapshot {
+        seg_id: "seg-new".into(),
+        ..snap.clone()
+    };
+    ro.put_snapshot(&tk, &newer).await.unwrap();
+    ro.confirm_snapshot(&tk, &seg, now_ms() + 10_000)
+        .await
+        .unwrap();
+    ro.put_latest(
+        &tk,
+        &LatestRecord {
+            version: 9,
+            ..rec.clone()
+        },
+        Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ro.put_plan(&seg, "spec2", &plan).await.unwrap(),
+        PlanPut::ReadOnly
+    );
+    assert_eq!((ro.skipped_writes(), ro.writes()), (4, 0));
+    assert_eq!(ro.get_latest(&tk, "").await.unwrap().unwrap(), rec);
+    assert!(ro.get_snapshot(&tk, "seg-new").await.unwrap().is_none());
+    assert_eq!(tree_digest(dir.path()), before, "byte-identical");
+
+    let missing = dir.path().join("absent");
+    let ro2 = FileStore::open_read_only(&missing, KERNEL_REV, None).unwrap();
+    assert!(ro2.scan().await.unwrap().snapshots.is_empty());
+    ro2.put_snapshot(&tk, &snap).await.unwrap();
+    assert!(!missing.exists(), "a read-only store creates nothing");
+}
+
+/// `--l2-read-only` servers over a seeded directory: the preloaded one serves CACHE_HIT (latest
+/// renewal, exact version), generates a new plan and builds a new table into L1 only; a second one
+/// without preload serves L1 misses from L2 (run with the tree made unwritable, its log shows no
+/// failed write). The directory is byte-identical afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn read_only_server_serves_from_l2_and_never_writes() {
+    let l2 = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        fixture("table-with-dv-small"),
+        fixture("basic_partitioned"),
+        fixture("crc-full"),
+    );
+    let vb_version = latest_version(&b);
+    let (la, vb) = {
+        let p = ServerProc::start("seed", l2.path(), &[]).await;
+        let mut cl = connect(p.addr).await;
+        let (la, _) = run(
+            &mut cl,
+            latest_request(&a, 0, default_specs()),
+            Behavior::default(),
+        )
+        .await
+        .ok();
+        let (vb, _) = run(
+            &mut cl,
+            request(&b, vb_version, vec![spec_json()]),
+            Behavior::default(),
+        )
+        .await
+        .ok();
+        p.stop();
+        (la, vb)
+    };
+    let before = tree_digest(l2.path());
+    let other_spec = proto::ScanPlanSpec {
+        timestamp_timezone: Some("Europe/Berlin".into()),
+        ..spec_json()
+    };
+
+    // Preloaded, read-only.
+    let (p, _, line) = start_preloaded("ro-warm", l2.path(), 0, &["--l2-read-only"]).await;
+    assert_eq!(log_field(&line, "snapshots"), Some("2"), "{line}");
+    let mut cl = connect(p.addr).await;
+    let (r, _) = run(
+        &mut cl,
+        latest_request(&a, 0, default_specs()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r), ResolveKind::CacheHit);
+    assert_eq!(op_counts(&r), (0, 1), "renewal listing only");
+    assert_eq!(r.info, la.info);
+    let (r, _) = run(
+        &mut cl,
+        request_with_segment(&b, vb_version, vec![spec_json()], &vb),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r), ResolveKind::CacheHit);
+    assert_eq!(op_counts(&r), (0, 0));
+    let (plan, _) = run_scan_plan(
+        &mut cl,
+        plan_request(&la, other_spec.clone()),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert!(!plan.plan.unwrap().cache_hit, "generated, kept in L1 only");
+    let (rc, _) = run(
+        &mut cl,
+        latest_request(&c, 0, vec![spec_json()]),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&rc), ResolveKind::FullBuild, "new table: built");
+    let (rc2, ops) = run(
+        &mut cl,
+        request_with_segment(&c, rc.version, vec![spec_json()], &rc),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&rc2), ResolveKind::CacheHit, "then served from L1");
+    assert!(ops.is_empty());
+    assert_eq!(p.stats().await.builds_started, 1);
+    let warm_log = p.stop();
+    assert_eq!(
+        tree_digest(l2.path()),
+        before,
+        "warm read-only server wrote nothing"
+    );
+
+    // No preload, and nothing under the directory is writable: misses read L2.
+    let guard = ReadOnlyTree::new(l2.path());
+    let q = ServerProc::start("ro-cold", l2.path(), &["--l2-read-only"]).await;
+    let mut cl = connect(q.addr).await;
+    let (r, ops) = run(
+        &mut cl,
+        request_with_segment(&b, vb_version, vec![spec_json()], &vb),
+        Behavior::default(),
+    )
+    .await
+    .ok();
+    assert_eq!(resolved(&r), ResolveKind::CacheHit);
+    assert_eq!(op_counts(&r), (0, 0), "L2 read on an L1 miss");
+    assert!(ops.is_empty());
+    assert!(r.prefetched_plans[0].cache_hit);
+    let (r, _) = run(&mut cl, latest_request(&a, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(
+        resolved(&r),
+        ResolveKind::CacheHit,
+        "stale L2 latest as base"
+    );
+    assert_eq!(op_counts(&r), (0, 1));
+    let (r, _) = run(&mut cl, latest_request(&c, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(resolved(&r), ResolveKind::FullBuild);
+    let s = q.stats().await;
+    assert_eq!(
+        (s.l2_hits, s.builds_started, s.latest_renewals),
+        (1, 1, 1),
+        "b from L2; c built; a renewed from its stale L2 base"
+    );
+    let cold_log = q.stop();
+    drop(guard);
+    for (name, log) in [("warm", &warm_log), ("cold", &cold_log)] {
+        let log = strip_ansi(log);
+        assert!(log.contains("read_only=true"), "{name}: {log}");
+        // No write was attempted: no failed L2 call, write or rejected file, nothing at WARN.
+        for bad in [
+            "treated as a miss",
+            "renewal write failed",
+            "entry rejected",
+            "read-only store",
+            " WARN ",
+        ] {
+            assert!(!log.contains(bad), "{name} log has {bad:?}: {log}");
+        }
+    }
+    assert_eq!(tree_digest(l2.path()), before, "byte-identical");
+    assert!(hidden_files(l2.path()).is_empty());
+}
+
+/// In write mode a latest renewal's L2 writes go to the background writer: the RPC returns while
+/// the store's writes are delayed, later renewals of the key coalesce, the pointer stays monotonic,
+/// and a flush writes what is still queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn latest_renewal_write_is_off_the_request_path() {
+    const DELAY: Duration = Duration::from_millis(1500);
+    let dir = tempfile::tempdir().unwrap();
+    let store = file_l2(dir.path());
+    let server = TestServer::start_l2("writer", store.clone()).await;
+    let mut cl = server.client().await;
+    let fx = fixture("table-with-dv-small");
+    let (r0, _) = run(&mut cl, latest_request(&fx, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    assert_eq!(resolved(&r0), ResolveKind::FullBuild);
+    let tk = l2_table_key(&fx.table_id, fx.url.as_str());
+    let latest_file = store.root().join(format!("latest/{tk}.json"));
+    let confirmed = || -> i64 {
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&latest_file).unwrap()).unwrap();
+        v["confirmed_at_ms"].as_i64().unwrap()
+    };
+    let c0 = confirmed();
+    let w0 = store.writes();
+
+    store.set_write_delay(DELAY);
+    let started = Instant::now();
+    for n in 0..5 {
+        let t = Instant::now();
+        let (r, _) = run(&mut cl, latest_request(&fx, 0, vec![]), Behavior::default())
+            .await
+            .ok();
+        assert_eq!(resolved(&r), ResolveKind::CacheHit);
+        assert_eq!(op_counts(&r), (0, 1));
+        assert!(
+            t.elapsed() < DELAY / 2,
+            "renewal {n} waited on the store: {:?}",
+            t.elapsed()
+        );
+    }
+    assert!(started.elapsed() < DELAY);
+    assert_eq!(
+        confirmed(),
+        c0,
+        "not on disk yet: the writer is in its delayed write"
+    );
+
+    // In the background: the first renewal, then the other four as one coalesced write.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while store.writes() < w0 + 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(DELAY + Duration::from_millis(500)).await;
+    assert_eq!(store.writes() - w0, 2, "five renewals, two writes");
+    let k = &server.core.counters;
+    let get = |c: &std::sync::atomic::AtomicI64| c.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        get(&k.l2_renewals_queued) + get(&k.l2_renewals_coalesced),
+        5
+    );
+    assert_eq!(
+        (get(&k.l2_renewals_written), get(&k.l2_renewals_dropped)),
+        (2, 0)
+    );
+    assert_eq!(server.core.pending_l2_renewals(), 0);
+    let c1 = confirmed();
+    assert!(c1 > c0);
+    let latest = store.get_latest(&tk, "").await.unwrap().unwrap();
+    assert_eq!((latest.version, latest.confirmed_at_ms), (r0.version, c1));
+
+    // A flush (shutdown) writes what is still queued.
+    store.set_write_delay(Duration::ZERO);
+    run(&mut cl, latest_request(&fx, 0, vec![]), Behavior::default())
+        .await
+        .ok();
+    server.core.flush_l2_renewals().await;
+    assert!(confirmed() > c1);
+    assert_eq!(server.core.pending_l2_renewals(), 0);
 }

@@ -85,6 +85,7 @@ delta-kernel-server \
 | `--l2-dir DIR` | off | file-backed L2 (SPEC v12) under `DIR/<kernel_rev>/`, shareable by several server processes; conflicts with `--l2-redis-url`; an uncreatable directory → exit |
 | `--l2-preload` | off, needs `--l2-dir` | rehydrate every snapshot / plan / latest entry of `DIR/<kernel_rev>/` into L1 (from hints, zero IO) **before** binding the port; logs `L2 preload finished entries=… duration_ms=…`; a failed scan logs WARN and starts cold |
 | `--l2-preload-max-entries N` | none, needs `--l2-preload` | cap on rehydrated snapshot instances (every table's first choice before any table's second); their plans and latest pointers come along |
+| `--l2-read-only` | off, needs `--l2-dir` | SPEC v12.1: read the directory (preload, lookups on L1 misses) but never write under it: no entries, temporary files, directories or locks; new builds and plans stay in L1. The P3 benchmark servers run `--l2-dir … --l2-preload --l2-read-only`; only the seeding server writes |
 | `--l2-ttl-secs` | Redis `21600` (6 h); file: no expiry | TTL of L2 `snap` / `ver` / `plan` entries |
 | `--l2-build-deadline-ms` | `120000` | TTL of the cross-replica build lock, and how long a replica that lost it waits for the holder's result before building itself |
 | `--test-uc-credentials-for-file` | off, hidden | test only, needs `--enable-test-hooks`: run the UC credential check for `file://` tables too |
@@ -378,9 +379,30 @@ SF1 / HiFi sizes are not measured here: they need the P1-b client runs.
   - `snap` and `plan` expire only with `--l2-ttl-secs` (refreshed on put and confirm).
   - `latest` never expires: a restarted server needs it as the base of its first re-listing.
     Freshness still comes from `confirmed_at_ms` against the request's staleness.
-- **Renewal cost on disk:** a path-latest renewal writes the small `latest` JSON. The version
-  index is rewritten only when it orders two entries of one version (or with a TTL), and the
-  stale snap entry is read only when L1 has no base.
+- **Read-only mode** (`--l2-read-only`, `FileStore::open_read_only`):
+  - Every write method returns before touching the filesystem and counts the skip;
+    `put_plan` returns `PlanPut::ReadOnly`.
+  - `open` creates no directory, and a missing one is an empty store.
+  - The dangling version-index cleanup is skipped.
+  - The file-write and `flock` helpers refuse on a read-only store as a safety net.
+- **Latest renewals are written in the background (v12.1, every L2 backend):**
+  - A latest re-listing that finds no new commit hands its L2 writes (re-confirm `snap`, advance
+    `latest`) to a background writer, and the request returns without touching the store.
+  - **Coalescing:** the queue holds one pending renewal per `(table_key, tail_id)`. A newer
+    renewal replaces the pending one only if it wins under `latest_replaces`, so the queue never
+    moves a pointer backwards; the store applies the same rule again.
+  - **Bounded:** up to 4096 pending keys; beyond that a renewal of a new key is dropped and
+    counted.
+  - **Best effort:** a failed write logs WARN `L2 renewal write failed; dropped`.
+  - **Shutdown:** the server flushes the queue after the last request
+    (`Core::flush_l2_renewals`).
+  - **Counters** (in process): `l2_renewals_{queued,coalesced,dropped,written}`.
+  - Build results are still written through before the request returns.
+- **Renewal reads on disk:** a renewal reads only the small `latest` pointer (to look for a
+  fresher one). The version index is rewritten only when it orders two entries of one version (or
+  with a TTL), and the stale snap entry is read only when L1 has no base.
+- **Counting:** a latest re-listing from a stale L2 base that finds no new commit counts in
+  `latest_renewals`, not `builds_started`, like one from an L1 base.
 
 **Preload.** `--l2-preload` scans `DIR/<kernel_rev>/` and rebuilds each snapshot from its hint
 (zero IO, segment-checked like any L2 hit). It inserts the snapshots into L1 under
@@ -572,7 +594,21 @@ gates run with it set:
     preload log line comes before `listening`, and the latest / exact / GetScanPlan requests are
     L1 hits;
   - a preloaded UC-keyed entry is still behind authz: a denied or missing token gets
-    `PERMISSION_DENIED` with no data (GetSnapshot and GetScanPlan), and the allowed token calls UC.
+    `PERMISSION_DENIED` with no data (GetSnapshot and GetScanPlan), and the allowed token calls UC;
+  - **`--l2-read-only`** servers over a seeded directory:
+    - preloaded: latest renewal and exact version are `CACHE_HIT`, and a new plan and a new
+      table's build stay in L1;
+    - not preloaded, with the tree made unwritable: L1 misses are served from L2;
+    - logs show no failed or rejected write, and the tree digest (names, contents, file and
+      directory mtimes) is identical afterwards.
+- **v12.1, in process:**
+  - a read-only store reads every entry and skips every write, leaving the tree byte-identical
+    (including a dangling index member) and creating no missing directory;
+  - a latest renewal returns while the store's writes are delayed 1.5 s: five renewals make two
+    background writes (the second coalesced), the pointer stays monotonic, and a flush writes
+    what is queued.
+- **`src/renewal.rs` unit tests:** per-key coalescing never moves backwards; a full queue drops
+  new keys but still coalesces existing ones.
 
 `l2_never_stores_staged_or_tainted` (`tests/v10.rs`) runs the same suite against the in-process
 and the file L2.

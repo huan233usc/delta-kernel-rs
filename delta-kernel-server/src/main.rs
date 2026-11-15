@@ -83,6 +83,10 @@ struct Args {
     /// entry count and duration. Requests still go through authz first.
     #[arg(long, default_value_t = false, requires = "l2_dir")]
     l2_preload: bool,
+    /// Read `--l2-dir` (preload and lookups on L1 misses) but never write under it: no entries,
+    /// no temporary files, no directories, no locks (SPEC v12.1). New builds stay in L1.
+    #[arg(long, default_value_t = false, requires = "l2_dir")]
+    l2_read_only: bool,
     /// Cap on the snapshot instances `--l2-preload` rehydrates (each table's first choice before
     /// any table's second). Their plans and latest pointers come along.
     #[arg(long, value_name = "N", requires = "l2_preload")]
@@ -158,10 +162,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Arc::new(store))
         }
         (None, Some(dir)) => {
-            let store = Arc::new(
-                FileStore::open(dir, KERNEL_REV, ttl).map_err(|e| format!("--l2-dir: {e}"))?,
+            let store = if args.l2_read_only {
+                FileStore::open_read_only(dir, KERNEL_REV, ttl)
+            } else {
+                FileStore::open(dir, KERNEL_REV, ttl)
+            };
+            let store = Arc::new(store.map_err(|e| format!("--l2-dir: {e}"))?);
+            tracing::info!(
+                dir = %store.root().display(),
+                ttl_secs = ?args.l2_ttl_secs,
+                read_only = args.l2_read_only,
+                "L2 file store opened"
             );
-            tracing::info!(dir = %store.root().display(), ttl_secs = ?args.l2_ttl_secs, "L2 file store opened");
             file_l2 = Some(store.clone());
             Some(store)
         }
@@ -244,9 +256,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     serve(
         listener,
-        KernelService::new(core, args.enable_test_hooks),
+        KernelService::new(core.clone(), args.enable_test_hooks),
         shutdown,
     )
     .await?;
+    // Latest renewals still queued for the background L2 writer (best effort).
+    core.flush_l2_renewals().await;
     Ok(())
 }

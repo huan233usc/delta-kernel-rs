@@ -83,6 +83,8 @@ pub struct LatestRecord {
 pub enum PlanPut {
     Stored,
     TooLarge(usize),
+    /// The store accepts no writes (`--l2-read-only`).
+    ReadOnly,
 }
 
 /// Whether `new` may replace `cur` as a table's latest pointer of one target (path-based, or one

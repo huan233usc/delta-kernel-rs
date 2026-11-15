@@ -44,6 +44,12 @@ pub struct ServerCounters {
     pub l2_authz_hits: AtomicI64,
     /// In-process only: failed L2 calls (each treated as a miss).
     pub l2_errors: AtomicI64,
+    /// In-process only (SPEC v12.1): latest renewals handed to the background L2 writer as a new
+    /// key, merged into a pending one, dropped because the queue was full, and written.
+    pub l2_renewals_queued: AtomicI64,
+    pub l2_renewals_coalesced: AtomicI64,
+    pub l2_renewals_dropped: AtomicI64,
+    pub l2_renewals_written: AtomicI64,
     /// In-process only: GetScanPlan refs naming this server instance.
     pub ref_same_instance: AtomicI64,
 }
