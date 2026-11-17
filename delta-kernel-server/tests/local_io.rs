@@ -582,9 +582,9 @@ async fn unreachable_local_io_is_unavailable() {
         .kernel_error
         .as_ref()
         .expect("local_unavailable must preserve the real kernel failure");
-    assert_ne!(
+    assert_eq!(
         kernel_error.code,
-        delta_kernel_server::errors::codes::UNKNOWN,
+        delta_kernel_server::errors::codes::OBJECT_STORE,
         "{kernel_error:?}"
     );
     assert!(!kernel_error.message.is_empty(), "{kernel_error:?}");

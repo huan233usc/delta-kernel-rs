@@ -485,6 +485,8 @@ pub fn classify_kernel_error(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::*;
 
     /// Only kernel's "latest of a catalog-managed table without a bound" condition maps to
@@ -567,213 +569,234 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kernel_error_from_code_matches_ffi_engine_exec_mapping() {
-        type ExpectedKernelError = fn(&KernelError) -> bool;
-        let direct_cases: &[(&str, i32, ExpectedKernelError)] = &[
-            (
-                "CheckpointWrite",
-                codes::CHECKPOINT_WRITE,
-                |e| matches!(e, KernelError::CheckpointWrite(m) if m == "boom"),
-            ),
-            (
-                "EngineDataType",
-                codes::ENGINE_DATA_TYPE,
-                |e| matches!(e, KernelError::EngineDataType(m) if m == "boom"),
-            ),
-            (
-                "Generic",
-                codes::GENERIC,
-                |e| matches!(e, KernelError::Generic(m) if m == "boom"),
-            ),
-            (
-                "CommitRange",
-                codes::COMMIT_RANGE,
-                |e| matches!(e, KernelError::CommitRange(m) if m == "boom"),
-            ),
-            (
-                "MaxCatalogVersion",
-                codes::MAX_CATALOG_VERSION,
-                |e| matches!(e, KernelError::MaxCatalogVersion(m) if m == "boom"),
-            ),
-            (
-                "Internal",
-                codes::INTERNAL,
-                |e| matches!(e, KernelError::InternalError(m) if m == "boom"),
-            ),
-            (
-                "FileNotFound",
-                codes::FILE_NOT_FOUND,
-                |e| matches!(e, KernelError::FileNotFound(m) if m == "boom"),
-            ),
-            (
-                "MissingColumn",
-                codes::MISSING_COLUMN,
-                |e| matches!(e, KernelError::MissingColumn(m) if m == "boom"),
-            ),
-            (
-                "UnexpectedColumnType",
-                codes::UNEXPECTED_COLUMN_TYPE,
-                |e| matches!(e, KernelError::UnexpectedColumnType(m) if m == "boom"),
-            ),
-            (
-                "MissingData",
-                codes::MISSING_DATA,
-                |e| matches!(e, KernelError::MissingData(m) if m == "boom"),
-            ),
-            (
-                "DeletionVector",
-                codes::DELETION_VECTOR,
-                |e| matches!(e, KernelError::DeletionVector(m) if m == "boom"),
-            ),
-            (
-                "InvalidProtocol",
-                codes::INVALID_PROTOCOL,
-                |e| matches!(e, KernelError::InvalidProtocol(m) if m == "boom"),
-            ),
-            (
-                "JoinFailure",
-                codes::JOIN_FAILURE,
-                |e| matches!(e, KernelError::JoinFailure(m) if m == "boom"),
-            ),
-            (
-                "InvalidColumnMappingMode",
-                codes::INVALID_COLUMN_MAPPING_MODE,
-                |e| matches!(e, KernelError::InvalidColumnMappingMode(m) if m == "boom"),
-            ),
-            (
-                "InvalidTableLocation",
-                codes::INVALID_TABLE_LOCATION,
-                |e| matches!(e, KernelError::InvalidTableLocation(m) if m == "boom"),
-            ),
-            (
-                "InvalidDecimal",
-                codes::INVALID_DECIMAL,
-                |e| matches!(e, KernelError::InvalidDecimal(m) if m == "boom"),
-            ),
-            (
-                "InvalidInterval",
-                codes::INVALID_INTERVAL,
-                |e| matches!(e, KernelError::InvalidInterval(m) if m == "boom"),
-            ),
-            (
-                "InvalidGeoParams",
-                codes::INVALID_GEO_PARAMS,
-                |e| matches!(e, KernelError::InvalidGeoParams(m) if m == "boom"),
-            ),
-            (
-                "InvalidStructData",
-                codes::INVALID_STRUCT_DATA,
-                |e| matches!(e, KernelError::InvalidStructData(m) if m == "boom"),
-            ),
-            (
-                "InvalidExpression",
-                codes::INVALID_EXPRESSION,
-                |e| matches!(e, KernelError::InvalidExpressionEvaluation(m) if m == "boom"),
-            ),
-            (
-                "InvalidLogPath",
-                codes::INVALID_LOG_PATH,
-                |e| matches!(e, KernelError::InvalidLogPath(m) if m == "boom"),
-            ),
-            (
-                "InvalidLogSegment",
-                codes::INVALID_LOG_SEGMENT,
-                |e| matches!(e, KernelError::InvalidLogSegment(m) if m == "boom"),
-            ),
-            ("InvalidSnapshotHint", codes::INVALID_SNAPSHOT_HINT, |e| {
-                matches!(e, KernelError::SnapshotHint(_))
-            }),
-            (
-                "FileAlreadyExists",
-                codes::FILE_ALREADY_EXISTS,
-                |e| matches!(e, KernelError::FileAlreadyExists(m) if m == "boom"),
-            ),
-            (
-                "TableAlreadyExistsAtPath",
-                codes::TABLE_ALREADY_EXISTS_AT_PATH,
-                |e| matches!(e, KernelError::TableAlreadyExistsAtPath(m) if m == "boom"),
-            ),
-            (
-                "Unsupported",
-                codes::UNSUPPORTED,
-                |e| matches!(e, KernelError::Unsupported(m) if m == "boom"),
-            ),
-            (
-                "InvalidCheckpoint",
-                codes::INVALID_CHECKPOINT,
-                |e| matches!(e, KernelError::InvalidCheckpoint(m) if m == "boom"),
-            ),
-            (
-                "Schema",
-                codes::SCHEMA,
-                |e| matches!(e, KernelError::Schema(m) if m == "boom"),
-            ),
-            (
-                "InvalidTransactionState",
-                codes::INVALID_TRANSACTION_STATE,
-                |e| matches!(e, KernelError::InvalidTransactionState(m) if m == "boom"),
-            ),
-            ("EmptyLog", codes::EMPTY_LOG, |e| {
-                matches!(e, KernelError::EmptyLog)
-            }),
-            ("MissingMetadata", codes::MISSING_METADATA, |e| {
-                matches!(e, KernelError::MissingMetadata)
-            }),
-            ("MissingProtocol", codes::MISSING_PROTOCOL, |e| {
-                matches!(e, KernelError::MissingProtocol)
-            }),
-            (
-                "MissingMetadataAndProtocol",
-                codes::MISSING_METADATA_AND_PROTOCOL,
-                |e| matches!(e, KernelError::MissingMetadataAndProtocol),
-            ),
-            ("Cancelled", codes::CANCELLED, |e| {
-                matches!(e, KernelError::Cancelled)
-            }),
-        ];
-        for (name, code, expected) in direct_cases {
-            let actual = kernel_error_from_code(*code, "boom".into());
-            assert!(expected(&actual), "{name}: {actual:?}");
+    #[derive(Debug)]
+    struct FfiErrorMappings {
+        discriminants: BTreeMap<String, i32>,
+        kernel_to_ffi: BTreeMap<String, String>,
+        kernel_fallback: String,
+        engine_direct: BTreeMap<String, String>,
+        engine_fallback: BTreeSet<String>,
+    }
+
+    fn ffi_error_mappings() -> FfiErrorMappings {
+        const SOURCE: &str = include_str!("../../ffi/src/error.rs");
+        let discriminants = ffi_kernel_error_discriminants(SOURCE);
+        let kernel_to_ffi = ffi_kernel_error_from_kernel_arms(SOURCE);
+        let kernel_fallback = ffi_kernel_error_from_kernel_fallback(SOURCE);
+        let (engine_direct, engine_fallback) = ffi_engine_exec_arms(SOURCE);
+        FfiErrorMappings {
+            discriminants,
+            kernel_to_ffi,
+            kernel_fallback,
+            engine_direct,
+            engine_fallback,
+        }
+    }
+
+    fn ffi_kernel_error_discriminants(source: &str) -> BTreeMap<String, i32> {
+        let enum_body = source
+            .split_once("pub enum FFIKernelError {")
+            .expect("FFIKernelError enum")
+            .1
+            .split_once("\n}")
+            .expect("FFIKernelError enum end")
+            .0;
+        enum_body
+            .lines()
+            .filter_map(|line| {
+                let line = line
+                    .split_once("//")
+                    .map_or(line, |(before, _)| before)
+                    .trim();
+                let (name, value) = line.trim_end_matches(',').split_once(" = ")?;
+                let name = name.trim();
+                if !name.chars().next().is_some_and(char::is_uppercase) {
+                    return None;
+                }
+                Some((
+                    name.to_string(),
+                    value.trim().parse::<i32>().expect("ffi discriminant"),
+                ))
+            })
+            .collect()
+    }
+
+    fn ffi_kernel_error_from_kernel_arms(source: &str) -> BTreeMap<String, String> {
+        let match_body = source
+            .split_once("impl From<&KernelError> for FFIKernelError")
+            .expect("From<&KernelError>")
+            .1
+            .split_once("match e {")
+            .expect("From<&KernelError> match")
+            .1
+            .split_once("\n        }\n    }\n}")
+            .expect("From<&KernelError> match end")
+            .0;
+        let mut mappings = BTreeMap::new();
+        let mut pending_kernel = None;
+        for line in match_body.lines() {
+            if let Some(kernel) = extract_prefixed_ident(line, "KernelError::") {
+                pending_kernel = Some(kernel);
+            }
+            if let Some(ffi) = extract_prefixed_ident(line, "FFIKernelError::")
+                && let Some(kernel) = pending_kernel.take()
+            {
+                mappings.insert(kernel, ffi);
+            }
+            if line.contains("Self::from(source.as_ref())") {
+                pending_kernel = None;
+            }
+        }
+        mappings
+    }
+
+    fn ffi_kernel_error_from_kernel_fallback(source: &str) -> String {
+        let match_body = source
+            .split_once("impl From<&KernelError> for FFIKernelError")
+            .expect("From<&KernelError>")
+            .1
+            .split_once("match e {")
+            .expect("From<&KernelError> match")
+            .1
+            .split_once("\n        }\n    }\n}")
+            .expect("From<&KernelError> match end")
+            .0;
+        match_body
+            .lines()
+            .find(|line| line.trim_start().starts_with("_ => FFIKernelError::"))
+            .and_then(|line| extract_prefixed_ident(line, "FFIKernelError::"))
+            .expect("KernelError fallback ffi mapping")
+    }
+
+    fn ffi_engine_exec_arms(source: &str) -> (BTreeMap<String, String>, BTreeSet<String>) {
+        let match_body = source
+            .split_once("impl From<EngineExecError> for KernelError")
+            .expect("From<EngineExecError>")
+            .1
+            .split_once("match etype {")
+            .expect("From<EngineExecError> match")
+            .1
+            .split_once("\n        }\n    }\n}")
+            .expect("From<EngineExecError> match end")
+            .0;
+
+        let mut arms = Vec::new();
+        let mut current = String::new();
+        for line in match_body.lines() {
+            let trimmed = line.trim_start();
+            let starts_arm =
+                trimmed.starts_with("FFIKernelError::") || trimmed.starts_with("code @");
+            if starts_arm && !current.is_empty() {
+                arms.push(std::mem::take(&mut current));
+            }
+            if starts_arm || !current.is_empty() {
+                current.push_str(line);
+                current.push('\n');
+            }
+        }
+        if !current.is_empty() {
+            arms.push(current);
         }
 
-        let generic_codes = [
-            codes::UNKNOWN,
-            1,
-            codes::ARROW,
-            codes::EXTRACT,
-            codes::IO,
-            codes::PARQUET,
-            codes::OBJECT_STORE,
-            codes::OBJECT_STORE_PATH,
-            codes::REQWEST,
-            codes::INVALID_URL,
-            codes::MALFORMED_JSON,
-            codes::PARSE,
-            codes::UTF8,
-            codes::PARSE_INT,
-            codes::PARSE_INTERVAL,
-            codes::CHANGE_DATA_FEED_UNSUPPORTED,
-            codes::CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA,
-            codes::ROW_TRACKING_CHANGE_FEED_UNSUPPORTED,
-            codes::LOG_HISTORY,
-            codes::MISSING_VERSION,
-            codes::UNPUBLISHED_VERSION,
-            codes::START_VERSION_NOT_FOUND,
-        ];
-        for code in generic_codes {
-            let actual = kernel_error_from_code(code, "boom".into());
-            assert!(
-                matches!(
-                    actual,
-                    KernelError::Generic(ref message)
-                        if message == &format!(
-                            "engine execution error ({}): boom",
-                            ffi_kernel_error_debug_name(code)
-                        )
-                ),
-                "{code}: {actual:?}"
-            );
+        let mut direct = BTreeMap::new();
+        let mut fallback = BTreeSet::new();
+        for arm in arms {
+            let ffi_variants = extract_all_prefixed_idents(&arm, "FFIKernelError::");
+            if arm.contains("KernelError::generic") {
+                fallback.extend(ffi_variants);
+                continue;
+            }
+            let kernel = if arm.contains("SnapshotHintError::") {
+                Some("SnapshotHint".to_string())
+            } else {
+                extract_prefixed_ident(&arm, "KernelError::")
+            };
+            if let Some(kernel) = kernel {
+                assert_eq!(
+                    ffi_variants.len(),
+                    1,
+                    "direct EngineExecError arm should name one ffi variant: {arm}"
+                );
+                direct.insert(ffi_variants[0].clone(), kernel);
+            }
+        }
+        (direct, fallback)
+    }
+
+    fn extract_all_prefixed_idents(text: &str, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        while let Some(relative) = text[start..].find(prefix) {
+            let index = start + relative;
+            if index > 0 {
+                let previous = text[..index].chars().next_back().expect("previous char");
+                if previous.is_ascii_alphanumeric() || previous == '_' {
+                    start = index + prefix.len();
+                    continue;
+                }
+            }
+            let rest = &text[index + prefix.len()..];
+            let ident_len = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            out.push(rest[..ident_len].to_string());
+            start = index + prefix.len() + ident_len;
+        }
+        out
+    }
+
+    fn extract_prefixed_ident(text: &str, prefix: &str) -> Option<String> {
+        extract_all_prefixed_idents(text, prefix).into_iter().next()
+    }
+
+    fn debug_variant_name(e: &KernelError) -> String {
+        let debug = format!("{e:?}");
+        debug
+            .split(['(', '{'])
+            .next()
+            .expect("debug variant")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn kernel_error_from_code_matches_ffi_engine_exec_mapping() {
+        let ffi = ffi_error_mappings();
+        let covered: BTreeSet<_> = ffi
+            .engine_direct
+            .keys()
+            .chain(ffi.engine_fallback.iter())
+            .cloned()
+            .collect();
+        assert_eq!(
+            covered,
+            ffi.discriminants.keys().cloned().collect::<BTreeSet<_>>()
+        );
+
+        for (ffi_variant, code) in &ffi.discriminants {
+            let actual = kernel_error_from_code(*code, "boom".into());
+            if let Some(expected_variant) = ffi.engine_direct.get(ffi_variant) {
+                assert_eq!(
+                    debug_variant_name(&actual),
+                    *expected_variant,
+                    "{ffi_variant} ({code}): {actual:?}"
+                );
+            } else {
+                assert!(
+                    ffi.engine_fallback.contains(ffi_variant),
+                    "{ffi_variant} has no direct or fallback EngineExecError mapping"
+                );
+                assert!(
+                    matches!(
+                        actual,
+                        KernelError::Generic(ref message)
+                            if message == &format!(
+                                "engine execution error ({ffi_variant}): boom"
+                            )
+                    ),
+                    "{ffi_variant} ({code}): {actual:?}"
+                );
+            }
         }
     }
 
@@ -839,49 +862,29 @@ mod tests {
             })
         }
 
-        let cases: &[(&str, KernelError, i32)] = &[
+        let cases: Vec<(&str, KernelError)> = vec![
             (
                 "Arrow",
                 delta_kernel::arrow::error::ArrowError::ComputeError("boom".into()).into(),
-                codes::ARROW,
             ),
             (
                 "CheckpointWrite",
                 KernelError::CheckpointWrite("boom".into()),
-                codes::CHECKPOINT_WRITE,
             ),
-            (
-                "EngineDataType",
-                KernelError::EngineDataType("boom".into()),
-                codes::ENGINE_DATA_TYPE,
-            ),
-            ("Extract", KernelError::Extract("u8", "i32"), codes::EXTRACT),
-            (
-                "ScalarConversion",
-                scalar_conversion_error(),
-                codes::UNKNOWN,
-            ),
-            (
-                "Generic",
-                KernelError::Generic("boom".into()),
-                codes::GENERIC,
-            ),
+            ("EngineDataType", KernelError::EngineDataType("boom".into())),
+            ("Extract", KernelError::Extract("u8", "i32")),
+            ("ScalarConversion", scalar_conversion_error()),
+            ("Generic", KernelError::Generic("boom".into())),
             (
                 "GenericError",
                 KernelError::GenericError {
                     source: std::io::Error::other("boom").into(),
                 },
-                codes::GENERIC,
             ),
-            (
-                "CommitRange",
-                KernelError::CommitRange("boom".into()),
-                codes::COMMIT_RANGE,
-            ),
+            ("CommitRange", KernelError::CommitRange("boom".into())),
             (
                 "MaxCatalogVersion",
                 KernelError::MaxCatalogVersion("boom".into()),
-                codes::MAX_CATALOG_VERSION,
             ),
             (
                 "LogTailVersionsNotContiguous",
@@ -889,201 +892,120 @@ mod tests {
                     first_version: 1,
                     second_version: 3,
                 },
-                codes::INVALID_LOG_SEGMENT,
             ),
             (
                 "IOError",
                 KernelError::IOError(std::io::Error::other("boom")),
-                codes::IO,
             ),
             (
                 "Parquet",
                 delta_kernel::parquet::errors::ParquetError::General("boom".into()).into(),
-                codes::PARQUET,
             ),
             (
                 "ObjectStore",
                 KernelError::ObjectStore(object_store_error()),
-                codes::OBJECT_STORE,
             ),
             (
                 "ObjectStoreNotFound",
                 KernelError::ObjectStore(object_store_not_found()),
-                codes::FILE_NOT_FOUND,
             ),
             (
                 "ObjectStorePath",
                 KernelError::ObjectStorePath(object_store_path_error()),
-                codes::OBJECT_STORE_PATH,
             ),
-            (
-                "Reqwest",
-                KernelError::Reqwest(reqwest_error()),
-                codes::REQWEST,
-            ),
-            (
-                "FileNotFound",
-                KernelError::FileNotFound("missing".into()),
-                codes::FILE_NOT_FOUND,
-            ),
-            (
-                "MissingColumn",
-                KernelError::MissingColumn("col".into()),
-                codes::MISSING_COLUMN,
-            ),
+            ("Reqwest", KernelError::Reqwest(reqwest_error())),
+            ("FileNotFound", KernelError::FileNotFound("missing".into())),
+            ("MissingColumn", KernelError::MissingColumn("col".into())),
             (
                 "InvalidPartitionValues",
                 KernelError::InvalidPartitionValues("boom".into()),
-                codes::UNKNOWN,
             ),
             (
                 "UnexpectedColumnType",
                 KernelError::UnexpectedColumnType("col".into()),
-                codes::UNEXPECTED_COLUMN_TYPE,
             ),
-            (
-                "MissingData",
-                KernelError::MissingData("col".into()),
-                codes::MISSING_DATA,
-            ),
-            ("EmptyLog", KernelError::EmptyLog, codes::EMPTY_LOG),
-            (
-                "MissingVersion",
-                KernelError::MissingVersion(7),
-                codes::MISSING_VERSION,
-            ),
+            ("MissingData", KernelError::MissingData("col".into())),
+            ("EmptyLog", KernelError::EmptyLog),
+            ("MissingVersion", KernelError::MissingVersion(7)),
             (
                 "StartVersionNotFound",
                 KernelError::StartVersionNotFound {
                     requested: 1,
                     earliest: 3,
                 },
-                codes::START_VERSION_NOT_FOUND,
             ),
-            (
-                "UnpublishedVersion",
-                KernelError::UnpublishedVersion(7),
-                codes::UNPUBLISHED_VERSION,
-            ),
-            (
-                "DeletionVector",
-                KernelError::DeletionVector("boom".into()),
-                codes::DELETION_VECTOR,
-            ),
+            ("UnpublishedVersion", KernelError::UnpublishedVersion(7)),
+            ("DeletionVector", KernelError::DeletionVector("boom".into())),
             (
                 "InvalidSelectionVector",
                 KernelError::InvalidSelectionVector("boom".into()),
-                codes::UNKNOWN,
             ),
             (
                 "InvalidTransactionState",
                 KernelError::InvalidTransactionState("boom".into()),
-                codes::INVALID_TRANSACTION_STATE,
             ),
-            (
-                "InvalidUrl",
-                KernelError::InvalidUrl(invalid_url_error()),
-                codes::INVALID_URL,
-            ),
+            ("InvalidUrl", KernelError::InvalidUrl(invalid_url_error())),
             (
                 "MalformedJson",
                 KernelError::MalformedJson(malformed_json_error()),
-                codes::MALFORMED_JSON,
             ),
-            (
-                "MissingMetadata",
-                KernelError::MissingMetadata,
-                codes::MISSING_METADATA,
-            ),
-            (
-                "MissingProtocol",
-                KernelError::MissingProtocol,
-                codes::MISSING_PROTOCOL,
-            ),
+            ("MissingMetadata", KernelError::MissingMetadata),
+            ("MissingProtocol", KernelError::MissingProtocol),
             (
                 "InvalidProtocol",
                 KernelError::InvalidProtocol("boom".into()),
-                codes::INVALID_PROTOCOL,
             ),
             (
                 "MissingMetadataAndProtocol",
                 KernelError::MissingMetadataAndProtocol,
-                codes::MISSING_METADATA_AND_PROTOCOL,
             ),
             (
                 "ParseError",
                 KernelError::ParseError("boom".into(), DataType::STRING),
-                codes::PARSE,
             ),
-            (
-                "JoinFailure",
-                KernelError::JoinFailure("boom".into()),
-                codes::JOIN_FAILURE,
-            ),
-            (
-                "Utf8Error",
-                KernelError::Utf8Error(utf8_error()),
-                codes::UTF8,
-            ),
+            ("JoinFailure", KernelError::JoinFailure("boom".into())),
+            ("Utf8Error", KernelError::Utf8Error(utf8_error())),
             (
                 "ParseIntError",
                 KernelError::ParseIntError(parse_int_error()),
-                codes::PARSE_INT,
             ),
             (
                 "InvalidColumnMappingMode",
                 KernelError::InvalidColumnMappingMode("boom".into()),
-                codes::INVALID_COLUMN_MAPPING_MODE,
             ),
             (
                 "InvalidTableLocation",
                 KernelError::InvalidTableLocation("boom".into()),
-                codes::INVALID_TABLE_LOCATION,
             ),
-            (
-                "InvalidDecimal",
-                KernelError::InvalidDecimal("boom".into()),
-                codes::INVALID_DECIMAL,
-            ),
+            ("InvalidDecimal", KernelError::InvalidDecimal("boom".into())),
             (
                 "InvalidInterval",
                 KernelError::InvalidInterval("boom".into()),
-                codes::INVALID_INTERVAL,
             ),
             (
                 "InvalidGeoParams",
                 KernelError::InvalidGeoParams("boom".into()),
-                codes::INVALID_GEO_PARAMS,
             ),
             (
                 "InvalidStructData",
                 KernelError::InvalidStructData("boom".into()),
-                codes::INVALID_STRUCT_DATA,
             ),
-            (
-                "InternalError",
-                KernelError::InternalError("boom".into()),
-                codes::INTERNAL,
-            ),
+            ("InternalError", KernelError::InternalError("boom".into())),
             (
                 "Backtraced",
-                KernelError::internal_error("boom"),
-                codes::INTERNAL,
+                KernelError::Backtraced {
+                    source: Box::new(KernelError::InternalError("boom".into())),
+                    backtrace: Box::new(std::backtrace::Backtrace::force_capture()),
+                },
             ),
             (
                 "InvalidExpressionEvaluation",
                 KernelError::InvalidExpressionEvaluation("boom".into()),
-                codes::INVALID_EXPRESSION,
             ),
-            (
-                "InvalidLogPath",
-                KernelError::InvalidLogPath("boom".into()),
-                codes::INVALID_LOG_PATH,
-            ),
+            ("InvalidLogPath", KernelError::InvalidLogPath("boom".into())),
             (
                 "InvalidLogSegment",
                 KernelError::InvalidLogSegment("boom".into()),
-                codes::INVALID_LOG_SEGMENT,
             ),
             (
                 "SnapshotHint",
@@ -1092,95 +1014,114 @@ mod tests {
                     source: None,
                 }
                 .into(),
-                codes::INVALID_SNAPSHOT_HINT,
             ),
             (
                 "FileAlreadyExists",
                 KernelError::FileAlreadyExists("boom".into()),
-                codes::FILE_ALREADY_EXISTS,
             ),
             (
                 "TableAlreadyExistsAtPath",
                 KernelError::TableAlreadyExistsAtPath("boom".into()),
-                codes::TABLE_ALREADY_EXISTS_AT_PATH,
             ),
-            (
-                "Unsupported",
-                KernelError::Unsupported("boom".into()),
-                codes::UNSUPPORTED,
-            ),
+            ("Unsupported", KernelError::Unsupported("boom".into())),
             (
                 "ChecksumWriteUnsupported",
                 KernelError::ChecksumWriteUnsupported("boom".into()),
-                codes::UNKNOWN,
             ),
             (
                 "ParseIntervalError",
                 KernelError::ParseIntervalError(ParseIntervalError::NotAnInterval("boom".into())),
-                codes::PARSE_INTERVAL,
             ),
             (
                 "ChangeDataFeedUnsupported",
                 KernelError::ChangeDataFeedUnsupported(7),
-                codes::CHANGE_DATA_FEED_UNSUPPORTED,
             ),
             (
                 "RowTrackingChangeFeedUnsupported",
                 KernelError::RowTrackingChangeFeedUnsupported(7),
-                codes::ROW_TRACKING_CHANGE_FEED_UNSUPPORTED,
             ),
             (
                 "ChangeDataFeedIncompatibleSchema",
                 KernelError::ChangeDataFeedIncompatibleSchema("expected".into(), "actual".into()),
-                codes::CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA,
             ),
             (
                 "InvalidCheckpoint",
                 KernelError::InvalidCheckpoint("boom".into()),
-                codes::INVALID_CHECKPOINT,
             ),
-            ("Schema", KernelError::Schema("boom".into()), codes::SCHEMA),
+            ("Schema", KernelError::Schema("boom".into())),
             (
                 "StatsValidation",
                 KernelError::StatsValidation("boom".into()),
-                codes::UNKNOWN,
             ),
-            (
-                "LogHistory",
-                KernelError::LogHistory(log_history_error()),
-                codes::LOG_HISTORY,
-            ),
+            ("LogHistory", KernelError::LogHistory(log_history_error())),
             (
                 "PlanResultTypeMismatch",
                 KernelError::PlanResultTypeMismatch {
                     expected: "Unit",
                     actual: "Data",
                 },
-                codes::UNKNOWN,
             ),
-            ("Cancelled", KernelError::Cancelled, codes::CANCELLED),
+            ("Cancelled", KernelError::Cancelled),
         ];
 
+        let ffi = ffi_error_mappings();
         assert_eq!(
-            kernel_error_case_names(cases),
+            kernel_error_case_names(&cases),
             current_kernel_error_variant_names()
         );
-        for (name, error, expected) in cases {
+        for (name, error) in &cases {
+            let expected_debug = if *name == "ObjectStoreNotFound" {
+                "ObjectStore"
+            } else {
+                *name
+            };
+            assert_eq!(
+                debug_variant_name(error),
+                expected_debug,
+                "{name}: {error:?}"
+            );
+
+            let ffi_variant = expected_ffi_variant_for_case(name, error, &ffi);
+            let expected = ffi
+                .discriminants
+                .get(&ffi_variant)
+                .unwrap_or_else(|| panic!("missing ffi discriminant for {ffi_variant}"));
             assert_eq!(kernel_error_code(error), *expected, "{name}: {error}");
         }
     }
 
-    fn kernel_error_case_names(
-        cases: &[(&'static str, KernelError, i32)],
-    ) -> std::collections::BTreeSet<&'static str> {
+    fn expected_ffi_variant_for_case(
+        name: &str,
+        error: &KernelError,
+        ffi: &FfiErrorMappings,
+    ) -> String {
+        match name {
+            // The wire protocol deliberately reports storage NotFound the way a JVM storage client
+            // does, so table-missing errors line up with the existing DBR mapping.
+            "ObjectStoreNotFound" => "FileNotFoundError".to_string(),
+            "Backtraced" => {
+                let KernelError::Backtraced { source, .. } = error else {
+                    panic!("Backtraced row was not Backtraced: {error:?}");
+                };
+                expected_ffi_variant_for_case(&debug_variant_name(source), source, ffi)
+            }
+            _ => ffi
+                .kernel_to_ffi
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| ffi.kernel_fallback.clone()),
+        }
+    }
+
+    fn kernel_error_case_names(cases: &[(&'static str, KernelError)]) -> BTreeSet<&'static str> {
         cases
             .iter()
-            .map(|(name, _, _)| *name)
+            .map(|(name, _)| *name)
             .filter(|name| *name != "ObjectStoreNotFound")
             .collect()
     }
 
-    fn current_kernel_error_variant_names() -> std::collections::BTreeSet<&'static str> {
+    fn current_kernel_error_variant_names() -> BTreeSet<&'static str> {
         const SOURCE: &str = include_str!("../../kernel/src/error.rs");
         let enum_body = SOURCE
             .split_once("pub enum KernelError {")
