@@ -259,6 +259,7 @@ pub fn kernel_error_from_code(code: i32, message: String) -> KernelError {
         DELETION_VECTOR => KernelError::DeletionVector(message),
         INVALID_PROTOCOL => KernelError::InvalidProtocol(message),
         JOIN_FAILURE => KernelError::JoinFailure(message),
+        INVALID_COLUMN_MAPPING_MODE => KernelError::InvalidColumnMappingMode(message),
         INVALID_TABLE_LOCATION => KernelError::InvalidTableLocation(message),
         INVALID_STRUCT_DATA => KernelError::InvalidStructData(message),
         INVALID_EXPRESSION => KernelError::InvalidExpressionEvaluation(message),
@@ -503,6 +504,24 @@ mod tests {
             let e = classify_kernel_error(&KernelError::Cancelled, Some(reason), None);
             assert_eq!(e.kernel_error, None, "{reason:?}: {e:?}");
         }
+    }
+
+    #[test]
+    fn op_failed_invalid_column_mapping_mode_preserves_ffi_code() {
+        let op_err = proto::KernelError {
+            code: codes::INVALID_COLUMN_MAPPING_MODE,
+            message: "unsupported".into(),
+        };
+        let kernel_error = kernel_error_from_code(op_err.code, op_err.message.clone());
+        let e = classify_kernel_error(&kernel_error, None, Some(&op_err));
+        assert_eq!(e.code, proto::error::Code::OpFailed);
+        assert_eq!(
+            e.kernel_error,
+            Some(proto::KernelError {
+                code: codes::INVALID_COLUMN_MAPPING_MODE,
+                message: "Invalid column mapping mode: unsupported".into(),
+            })
+        );
     }
 
     #[test]
