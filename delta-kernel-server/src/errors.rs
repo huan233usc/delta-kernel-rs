@@ -574,22 +574,43 @@ mod tests {
         discriminants: BTreeMap<String, i32>,
         kernel_to_ffi: BTreeMap<String, String>,
         kernel_fallback: String,
+        kernel_fallback_variants: BTreeSet<String>,
         engine_direct: BTreeMap<String, String>,
         engine_fallback: BTreeSet<String>,
+        engine_messageless: BTreeSet<String>,
     }
 
     fn ffi_error_mappings() -> FfiErrorMappings {
         const SOURCE: &str = include_str!("../../ffi/src/error.rs");
         let discriminants = ffi_kernel_error_discriminants(SOURCE);
-        let kernel_to_ffi = ffi_kernel_error_from_kernel_arms(SOURCE);
+        let (kernel_to_ffi, kernel_handled) = ffi_kernel_error_from_kernel_arms(SOURCE);
         let kernel_fallback = ffi_kernel_error_from_kernel_fallback(SOURCE);
-        let (engine_direct, engine_fallback) = ffi_engine_exec_arms(SOURCE);
+        let kernel_fallback_variants = current_kernel_error_variant_names()
+            .into_iter()
+            .map(str::to_string)
+            .filter(|variant| !kernel_handled.contains(variant))
+            .collect();
+        let (engine_direct, engine_fallback, engine_messageless) = ffi_engine_exec_arms(SOURCE);
+        assert!(
+            !discriminants.is_empty(),
+            "parsed no FFIKernelError discriminants"
+        );
+        assert!(
+            !kernel_to_ffi.is_empty(),
+            "parsed no KernelError to FFIKernelError mappings"
+        );
+        assert!(
+            !engine_direct.is_empty(),
+            "parsed no direct EngineExecError mappings"
+        );
         FfiErrorMappings {
             discriminants,
             kernel_to_ffi,
             kernel_fallback,
+            kernel_fallback_variants,
             engine_direct,
             engine_fallback,
+            engine_messageless,
         }
     }
 
@@ -621,7 +642,9 @@ mod tests {
             .collect()
     }
 
-    fn ffi_kernel_error_from_kernel_arms(source: &str) -> BTreeMap<String, String> {
+    fn ffi_kernel_error_from_kernel_arms(
+        source: &str,
+    ) -> (BTreeMap<String, String>, BTreeSet<String>) {
         let match_body = source
             .split_once("impl From<&KernelError> for FFIKernelError")
             .expect("From<&KernelError>")
@@ -633,21 +656,22 @@ mod tests {
             .expect("From<&KernelError> match end")
             .0;
         let mut mappings = BTreeMap::new();
-        let mut pending_kernel = None;
-        for line in match_body.lines() {
-            if let Some(kernel) = extract_prefixed_ident(line, "KernelError::") {
-                pending_kernel = Some(kernel);
+        let mut handled = BTreeSet::new();
+        for arm in split_match_arms(match_body, |trimmed| {
+            trimmed.starts_with("KernelError::") || trimmed.starts_with("_ =>")
+        }) {
+            let kernel_variants = extract_all_prefixed_idents(&arm, "KernelError::");
+            handled.extend(kernel_variants.iter().cloned());
+            if arm.contains("Self::from(source.as_ref())") {
+                continue;
             }
-            if let Some(ffi) = extract_prefixed_ident(line, "FFIKernelError::")
-                && let Some(kernel) = pending_kernel.take()
-            {
-                mappings.insert(kernel, ffi);
-            }
-            if line.contains("Self::from(source.as_ref())") {
-                pending_kernel = None;
+            if let Some(ffi) = extract_prefixed_ident(&arm, "FFIKernelError::") {
+                for kernel in kernel_variants {
+                    mappings.insert(kernel, ffi.clone());
+                }
             }
         }
-        mappings
+        (mappings, handled)
     }
 
     fn ffi_kernel_error_from_kernel_fallback(source: &str) -> String {
@@ -668,7 +692,9 @@ mod tests {
             .expect("KernelError fallback ffi mapping")
     }
 
-    fn ffi_engine_exec_arms(source: &str) -> (BTreeMap<String, String>, BTreeSet<String>) {
+    fn ffi_engine_exec_arms(
+        source: &str,
+    ) -> (BTreeMap<String, String>, BTreeSet<String>, BTreeSet<String>) {
         let match_body = source
             .split_once("impl From<EngineExecError> for KernelError")
             .expect("From<EngineExecError>")
@@ -680,27 +706,12 @@ mod tests {
             .expect("From<EngineExecError> match end")
             .0;
 
-        let mut arms = Vec::new();
-        let mut current = String::new();
-        for line in match_body.lines() {
-            let trimmed = line.trim_start();
-            let starts_arm =
-                trimmed.starts_with("FFIKernelError::") || trimmed.starts_with("code @");
-            if starts_arm && !current.is_empty() {
-                arms.push(std::mem::take(&mut current));
-            }
-            if starts_arm || !current.is_empty() {
-                current.push_str(line);
-                current.push('\n');
-            }
-        }
-        if !current.is_empty() {
-            arms.push(current);
-        }
-
         let mut direct = BTreeMap::new();
         let mut fallback = BTreeSet::new();
-        for arm in arms {
+        let mut messageless = BTreeSet::new();
+        for arm in split_match_arms(match_body, |trimmed| {
+            trimmed.starts_with("FFIKernelError::") || trimmed.starts_with("code @")
+        }) {
             let ffi_variants = extract_all_prefixed_idents(&arm, "FFIKernelError::");
             if arm.contains("KernelError::generic") {
                 fallback.extend(ffi_variants);
@@ -717,10 +728,32 @@ mod tests {
                     1,
                     "direct EngineExecError arm should name one ffi variant: {arm}"
                 );
+                if arm.contains("messageless_error(") {
+                    messageless.insert(ffi_variants[0].clone());
+                }
                 direct.insert(ffi_variants[0].clone(), kernel);
             }
         }
-        (direct, fallback)
+        (direct, fallback, messageless)
+    }
+
+    fn split_match_arms(match_body: &str, starts_arm: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut arms = Vec::new();
+        let mut current = String::new();
+        for line in match_body.lines() {
+            let trimmed = line.trim_start();
+            if starts_arm(trimmed) && !current.is_empty() {
+                arms.push(std::mem::take(&mut current));
+            }
+            if starts_arm(trimmed) || !current.is_empty() {
+                current.push_str(line);
+                current.push('\n');
+            }
+        }
+        if !current.is_empty() {
+            arms.push(current);
+        }
+        arms
     }
 
     fn extract_all_prefixed_idents(text: &str, prefix: &str) -> Vec<String> {
@@ -781,6 +814,12 @@ mod tests {
                     *expected_variant,
                     "{ffi_variant} ({code}): {actual:?}"
                 );
+                if !ffi.engine_messageless.contains(ffi_variant) {
+                    assert!(
+                        actual.to_string().contains("boom"),
+                        "{ffi_variant} ({code}) should pass through message: {actual:?}"
+                    );
+                }
             } else {
                 assert!(
                     ffi.engine_fallback.contains(ffi_variant),
@@ -1065,6 +1104,21 @@ mod tests {
         ];
 
         let ffi = ffi_error_mappings();
+        let expected_kernel_fallback_variants: BTreeSet<String> = [
+            "ScalarConversion",
+            "InvalidPartitionValues",
+            "InvalidSelectionVector",
+            "ChecksumWriteUnsupported",
+            "StatsValidation",
+            "PlanResultTypeMismatch",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(
+            ffi.kernel_fallback_variants, expected_kernel_fallback_variants,
+            "KernelError variants falling through the ffi wildcard changed"
+        );
         assert_eq!(
             kernel_error_case_names(&cases),
             current_kernel_error_variant_names()
