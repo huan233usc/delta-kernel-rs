@@ -2517,11 +2517,14 @@ fn build_blocking(
 /// not `OP_FAILED` (which reports client-side op failures).
 fn local_unavailable(channel: &OpChannel, err: ServerError) -> ServerError {
     if err.code == Code::OpFailed && channel.first_failure_is_local() {
-        ServerError::new(
-            Code::Unavailable,
-            err.message
+        ServerError {
+            code: Code::Unavailable,
+            message: err
+                .message
                 .replacen(OP_FAILED_PREFIX, LOCAL_IO_FAILED_PREFIX, 1),
-        )
+            retryable: true,
+            kernel_error: err.kernel_error,
+        }
     } else {
         err
     }

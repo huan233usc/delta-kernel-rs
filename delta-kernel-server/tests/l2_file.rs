@@ -666,25 +666,39 @@ fn server_command(instance_id: &str, l2_dir: &Path, extra: &[&str]) -> Command {
     cmd.args(["--enable-test-hooks", "--instance-id", instance_id])
         .arg("--l2-dir")
         .arg(l2_dir)
-        .args(extra)
-        .env("RUST_LOG", "info");
+        .args(extra);
     cmd
 }
 
 impl ServerProc {
     /// Starts a server on a free port and waits for its endpoint file.
     async fn start(instance_id: &str, l2_dir: &Path, extra: &[&str]) -> Self {
+        Self::start_with_log(instance_id, l2_dir, extra, false).await
+    }
+
+    async fn start_logged(instance_id: &str, l2_dir: &Path, extra: &[&str]) -> Self {
+        Self::start_with_log(instance_id, l2_dir, extra, true).await
+    }
+
+    async fn start_with_log(
+        instance_id: &str,
+        l2_dir: &Path,
+        extra: &[&str],
+        log_info: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let endpoint = dir.path().join("endpoint");
         let log = dir.path().join("stderr.log");
-        let mut child = server_command(instance_id, l2_dir, extra)
-            .args(["--listen", "127.0.0.1:0"])
+        let mut cmd = server_command(instance_id, l2_dir, extra);
+        cmd.args(["--listen", "127.0.0.1:0"])
             .arg("--endpoint-file")
             .arg(&endpoint)
             .stdout(Stdio::null())
-            .stderr(std::fs::File::create(&log).unwrap())
-            .spawn()
-            .unwrap();
+            .stderr(std::fs::File::create(&log).unwrap());
+        if log_info {
+            cmd.env("RUST_LOG", "info");
+        }
+        let mut child = cmd.spawn().unwrap();
         for _ in 0..800 {
             if let Ok(s) = std::fs::read_to_string(&endpoint) {
                 return Self {
@@ -780,6 +794,7 @@ async fn start_preloaded(
     let child = server_command(instance_id, l2_dir, extra)
         .args(["--listen", &addr.to_string(), "--l2-preload"])
         .args(["--test-preload-delay-ms", &delay])
+        .env("RUST_LOG", "info")
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
@@ -1374,7 +1389,7 @@ async fn read_only_server_serves_from_l2_and_never_writes() {
 
     // No preload, and nothing under the directory is writable: misses read L2.
     let guard = ReadOnlyTree::new(l2.path());
-    let q = ServerProc::start("ro-cold", l2.path(), &["--l2-read-only"]).await;
+    let q = ServerProc::start_logged("ro-cold", l2.path(), &["--l2-read-only"]).await;
     let mut cl = connect(q.addr).await;
     let (r, ops) = run(
         &mut cl,

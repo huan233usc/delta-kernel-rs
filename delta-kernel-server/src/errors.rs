@@ -18,6 +18,7 @@ pub mod codes {
     pub const PARQUET: i32 = 7;
     pub const OBJECT_STORE: i32 = 8;
     pub const OBJECT_STORE_PATH: i32 = 9;
+    pub const REQWEST: i32 = 10;
     pub const FILE_NOT_FOUND: i32 = 11;
     pub const MISSING_COLUMN: i32 = 12;
     pub const UNEXPECTED_COLUMN_TYPE: i32 = 13;
@@ -32,18 +33,37 @@ pub mod codes {
     pub const MISSING_METADATA_AND_PROTOCOL: i32 = 22;
     pub const PARSE: i32 = 23;
     pub const JOIN_FAILURE: i32 = 24;
+    pub const UTF8: i32 = 25;
+    pub const PARSE_INT: i32 = 26;
+    pub const INVALID_COLUMN_MAPPING_MODE: i32 = 27;
     pub const INVALID_TABLE_LOCATION: i32 = 28;
+    pub const INVALID_DECIMAL: i32 = 29;
     pub const INVALID_STRUCT_DATA: i32 = 30;
     pub const INTERNAL: i32 = 31;
     pub const INVALID_EXPRESSION: i32 = 32;
     pub const INVALID_LOG_PATH: i32 = 33;
     pub const FILE_ALREADY_EXISTS: i32 = 34;
     pub const UNSUPPORTED: i32 = 35;
+    pub const PARSE_INTERVAL: i32 = 36;
+    pub const CHANGE_DATA_FEED_UNSUPPORTED: i32 = 37;
+    pub const CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA: i32 = 38;
     pub const INVALID_CHECKPOINT: i32 = 39;
+    pub const CHECKPOINT_WRITE: i32 = 41;
     pub const SCHEMA: i32 = 42;
+    pub const LOG_HISTORY: i32 = 43;
+    pub const ROW_TRACKING_CHANGE_FEED_UNSUPPORTED: i32 = 44;
     pub const CANCELLED: i32 = 45;
+    pub const INVALID_TRANSACTION_STATE: i32 = 46;
     pub const INVALID_LOG_SEGMENT: i32 = 47;
+    pub const UNPUBLISHED_VERSION: i32 = 48;
     pub const EMPTY_LOG: i32 = 49;
+    pub const INVALID_SNAPSHOT_HINT: i32 = 50;
+    pub const START_VERSION_NOT_FOUND: i32 = 51;
+    pub const INVALID_GEO_PARAMS: i32 = 52;
+    pub const MAX_CATALOG_VERSION: i32 = 53;
+    pub const TABLE_ALREADY_EXISTS_AT_PATH: i32 = 54;
+    pub const COMMIT_RANGE: i32 = 55;
+    pub const INVALID_INTERVAL: i32 = 56;
 }
 
 /// Maps a kernel error to its ffi numeric code (the inverse of [`kernel_error_from_code`]).
@@ -51,9 +71,14 @@ pub fn kernel_error_code(e: &KernelError) -> i32 {
     use codes::*;
     match e {
         KernelError::Arrow(_) => ARROW,
+        KernelError::CheckpointWrite(_) => CHECKPOINT_WRITE,
         KernelError::EngineDataType(_) => ENGINE_DATA_TYPE,
         KernelError::Extract(..) => EXTRACT,
+        KernelError::ScalarConversion(_) => UNKNOWN,
         KernelError::Generic(_) | KernelError::GenericError { .. } => GENERIC,
+        KernelError::CommitRange(_) => COMMIT_RANGE,
+        KernelError::MaxCatalogVersion(_) => MAX_CATALOG_VERSION,
+        KernelError::LogTailVersionsNotContiguous { .. } => INVALID_LOG_SEGMENT,
         KernelError::IOError(_) => IO,
         KernelError::Parquet(_) => PARQUET,
         KernelError::ObjectStore(object_store_err) => {
@@ -68,12 +93,18 @@ pub fn kernel_error_code(e: &KernelError) -> i32 {
             }
         }
         KernelError::ObjectStorePath(_) => OBJECT_STORE_PATH,
+        KernelError::Reqwest(_) => REQWEST,
         KernelError::FileNotFound(_) => FILE_NOT_FOUND,
         KernelError::MissingColumn(_) => MISSING_COLUMN,
+        KernelError::InvalidPartitionValues(_) => UNKNOWN,
         KernelError::UnexpectedColumnType(_) => UNEXPECTED_COLUMN_TYPE,
         KernelError::MissingData(_) => MISSING_DATA,
+        KernelError::EmptyLog => EMPTY_LOG,
         KernelError::MissingVersion(_) => MISSING_VERSION,
+        KernelError::StartVersionNotFound { .. } => START_VERSION_NOT_FOUND,
+        KernelError::UnpublishedVersion(_) => UNPUBLISHED_VERSION,
         KernelError::DeletionVector(_) => DELETION_VECTOR,
+        KernelError::InvalidSelectionVector(_) => UNKNOWN,
         KernelError::InvalidUrl(_) => INVALID_URL,
         KernelError::MalformedJson(_) => MALFORMED_JSON,
         KernelError::MissingMetadata => MISSING_METADATA,
@@ -82,18 +113,33 @@ pub fn kernel_error_code(e: &KernelError) -> i32 {
         KernelError::MissingMetadataAndProtocol => MISSING_METADATA_AND_PROTOCOL,
         KernelError::ParseError(..) => PARSE,
         KernelError::JoinFailure(_) => JOIN_FAILURE,
+        KernelError::Utf8Error(_) => UTF8,
+        KernelError::ParseIntError(_) => PARSE_INT,
+        KernelError::InvalidColumnMappingMode(_) => INVALID_COLUMN_MAPPING_MODE,
         KernelError::InvalidTableLocation(_) => INVALID_TABLE_LOCATION,
+        KernelError::InvalidDecimal(_) => INVALID_DECIMAL,
+        KernelError::InvalidInterval(_) => INVALID_INTERVAL,
+        KernelError::InvalidGeoParams(_) => INVALID_GEO_PARAMS,
         KernelError::InvalidStructData(_) => INVALID_STRUCT_DATA,
         KernelError::InternalError(_) => INTERNAL,
         KernelError::InvalidExpressionEvaluation(_) => INVALID_EXPRESSION,
         KernelError::InvalidLogPath(_) => INVALID_LOG_PATH,
+        KernelError::InvalidLogSegment(_) => INVALID_LOG_SEGMENT,
+        KernelError::SnapshotHint(_) => INVALID_SNAPSHOT_HINT,
         KernelError::FileAlreadyExists(_) => FILE_ALREADY_EXISTS,
+        KernelError::TableAlreadyExistsAtPath(_) => TABLE_ALREADY_EXISTS_AT_PATH,
         KernelError::Unsupported(_) => UNSUPPORTED,
+        KernelError::ChecksumWriteUnsupported(_) => UNKNOWN,
+        KernelError::ParseIntervalError(_) => PARSE_INTERVAL,
+        KernelError::ChangeDataFeedUnsupported(_) => CHANGE_DATA_FEED_UNSUPPORTED,
+        KernelError::RowTrackingChangeFeedUnsupported(_) => ROW_TRACKING_CHANGE_FEED_UNSUPPORTED,
+        KernelError::ChangeDataFeedIncompatibleSchema(_, _) => CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA,
         KernelError::InvalidCheckpoint(_) => INVALID_CHECKPOINT,
         KernelError::Schema(_) => SCHEMA,
+        KernelError::StatsValidation(_) => UNKNOWN,
+        KernelError::LogHistory(_) => LOG_HISTORY,
+        KernelError::PlanResultTypeMismatch { .. } => UNKNOWN,
         KernelError::Cancelled => CANCELLED,
-        KernelError::InvalidLogSegment(_) => INVALID_LOG_SEGMENT,
-        KernelError::EmptyLog => EMPTY_LOG,
         KernelError::Backtraced { source, .. } => kernel_error_code(source),
         _ => UNKNOWN,
     }
@@ -113,6 +159,7 @@ pub fn kernel_code_name(code: i32) -> &'static str {
         PARQUET => "Parquet",
         OBJECT_STORE => "ObjectStore",
         OBJECT_STORE_PATH => "ObjectStorePath",
+        REQWEST => "Reqwest",
         FILE_NOT_FOUND => "FileNotFound",
         MISSING_COLUMN => "MissingColumn",
         UNEXPECTED_COLUMN_TYPE => "UnexpectedColumnType",
@@ -127,18 +174,37 @@ pub fn kernel_code_name(code: i32) -> &'static str {
         MISSING_METADATA_AND_PROTOCOL => "MissingMetadataAndProtocol",
         PARSE => "Parse",
         JOIN_FAILURE => "JoinFailure",
+        UTF8 => "Utf8",
+        PARSE_INT => "ParseInt",
+        INVALID_COLUMN_MAPPING_MODE => "InvalidColumnMappingMode",
         INVALID_TABLE_LOCATION => "InvalidTableLocation",
+        INVALID_DECIMAL => "InvalidDecimal",
         INVALID_STRUCT_DATA => "InvalidStructData",
         INTERNAL => "Internal",
         INVALID_EXPRESSION => "InvalidExpression",
         INVALID_LOG_PATH => "InvalidLogPath",
         FILE_ALREADY_EXISTS => "FileAlreadyExists",
         UNSUPPORTED => "Unsupported",
+        PARSE_INTERVAL => "ParseInterval",
+        CHANGE_DATA_FEED_UNSUPPORTED => "ChangeDataFeedUnsupported",
+        CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA => "ChangeDataFeedIncompatibleSchema",
         INVALID_CHECKPOINT => "InvalidCheckpoint",
+        CHECKPOINT_WRITE => "CheckpointWrite",
         SCHEMA => "Schema",
+        LOG_HISTORY => "LogHistory",
+        ROW_TRACKING_CHANGE_FEED_UNSUPPORTED => "RowTrackingChangeFeedUnsupported",
         CANCELLED => "Cancelled",
+        INVALID_TRANSACTION_STATE => "InvalidTransactionState",
         INVALID_LOG_SEGMENT => "InvalidLogSegment",
+        UNPUBLISHED_VERSION => "UnpublishedVersion",
         EMPTY_LOG => "EmptyLog",
+        INVALID_SNAPSHOT_HINT => "InvalidSnapshotHint",
+        START_VERSION_NOT_FOUND => "StartVersionNotFound",
+        INVALID_GEO_PARAMS => "InvalidGeoParams",
+        MAX_CATALOG_VERSION => "MaxCatalogVersion",
+        TABLE_ALREADY_EXISTS_AT_PATH => "TableAlreadyExistsAtPath",
+        COMMIT_RANGE => "CommitRange",
+        INVALID_INTERVAL => "InvalidInterval",
         _ => "Unknown",
     }
 }
@@ -343,8 +409,7 @@ pub fn classify_kernel_error(
                 Code::Cancelled,
                 format!("all client streams closed during the job: {e}"),
             ),
-        }
-        .with_kernel_error(root);
+        };
     }
     if let Some(op_err) = op_failure {
         return ServerError::new(
@@ -426,5 +491,422 @@ mod tests {
         assert!(e.message.contains("(ObjectStore error)"), "{}", e.message);
         assert!(!e.message.contains("code 8"), "{}", e.message);
         assert_eq!(kernel_code_name(8), "ObjectStore");
+    }
+
+    #[test]
+    fn synthetic_cancel_errors_do_not_attach_kernel_error() {
+        for reason in [
+            CancelReason::Deadline,
+            CancelReason::Saturated,
+            CancelReason::StreamsGone,
+        ] {
+            let e = classify_kernel_error(&KernelError::Cancelled, Some(reason), None);
+            assert_eq!(e.kernel_error, None, "{reason:?}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn kernel_error_code_matches_ffi_discriminants_for_current_variants() {
+        use delta_kernel::expressions::Scalar;
+        use delta_kernel::history_manager::error::LogHistoryError;
+        use delta_kernel::object_store;
+        use delta_kernel::schema::DataType;
+        use delta_kernel::snapshot::SnapshotHintError;
+        use delta_kernel::table_properties::ParseIntervalError;
+
+        fn scalar_conversion_error() -> KernelError {
+            bool::try_from(Scalar::Integer(7)).expect_err("expected scalar conversion error")
+        }
+
+        fn malformed_json_error() -> serde_json::Error {
+            serde_json::from_str::<serde_json::Value>("{").expect_err("expected json error")
+        }
+
+        fn object_store_error() -> object_store::Error {
+            object_store::Error::Generic {
+                store: "test",
+                source: std::io::Error::other("boom").into(),
+            }
+        }
+
+        fn object_store_not_found() -> object_store::Error {
+            object_store::Error::NotFound {
+                path: "missing".to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "boom").into(),
+            }
+        }
+
+        fn object_store_path_error() -> object_store::path::Error {
+            object_store::path::Path::parse("//").expect_err("expected object-store path error")
+        }
+
+        fn reqwest_error() -> reqwest::Error {
+            reqwest::Client::new()
+                .get("not a url")
+                .build()
+                .expect_err("expected reqwest error")
+        }
+
+        fn invalid_url_error() -> url::ParseError {
+            url::Url::parse("not a url").expect_err("expected url parse error")
+        }
+
+        fn utf8_error() -> std::str::Utf8Error {
+            let bytes = vec![0xff];
+            std::str::from_utf8(&bytes).expect_err("expected utf8 error")
+        }
+
+        fn parse_int_error() -> std::num::ParseIntError {
+            "x".parse::<i64>().expect_err("expected parse-int error")
+        }
+
+        fn log_history_error() -> Box<LogHistoryError> {
+            Box::new(LogHistoryError::Internal {
+                context: "test",
+                source: None,
+            })
+        }
+
+        let cases: &[(&str, KernelError, i32)] = &[
+            (
+                "Arrow",
+                delta_kernel::arrow::error::ArrowError::ComputeError("boom".into()).into(),
+                codes::ARROW,
+            ),
+            (
+                "CheckpointWrite",
+                KernelError::CheckpointWrite("boom".into()),
+                codes::CHECKPOINT_WRITE,
+            ),
+            (
+                "EngineDataType",
+                KernelError::EngineDataType("boom".into()),
+                codes::ENGINE_DATA_TYPE,
+            ),
+            ("Extract", KernelError::Extract("u8", "i32"), codes::EXTRACT),
+            (
+                "ScalarConversion",
+                scalar_conversion_error(),
+                codes::UNKNOWN,
+            ),
+            (
+                "Generic",
+                KernelError::Generic("boom".into()),
+                codes::GENERIC,
+            ),
+            (
+                "GenericError",
+                KernelError::GenericError {
+                    source: std::io::Error::other("boom").into(),
+                },
+                codes::GENERIC,
+            ),
+            (
+                "CommitRange",
+                KernelError::CommitRange("boom".into()),
+                codes::COMMIT_RANGE,
+            ),
+            (
+                "MaxCatalogVersion",
+                KernelError::MaxCatalogVersion("boom".into()),
+                codes::MAX_CATALOG_VERSION,
+            ),
+            (
+                "LogTailVersionsNotContiguous",
+                KernelError::LogTailVersionsNotContiguous {
+                    first_version: 1,
+                    second_version: 3,
+                },
+                codes::INVALID_LOG_SEGMENT,
+            ),
+            (
+                "IOError",
+                KernelError::IOError(std::io::Error::other("boom")),
+                codes::IO,
+            ),
+            (
+                "Parquet",
+                delta_kernel::parquet::errors::ParquetError::General("boom".into()).into(),
+                codes::PARQUET,
+            ),
+            (
+                "ObjectStore",
+                KernelError::ObjectStore(object_store_error()),
+                codes::OBJECT_STORE,
+            ),
+            (
+                "ObjectStoreNotFound",
+                KernelError::ObjectStore(object_store_not_found()),
+                codes::FILE_NOT_FOUND,
+            ),
+            (
+                "ObjectStorePath",
+                KernelError::ObjectStorePath(object_store_path_error()),
+                codes::OBJECT_STORE_PATH,
+            ),
+            (
+                "Reqwest",
+                KernelError::Reqwest(reqwest_error()),
+                codes::REQWEST,
+            ),
+            (
+                "FileNotFound",
+                KernelError::FileNotFound("missing".into()),
+                codes::FILE_NOT_FOUND,
+            ),
+            (
+                "MissingColumn",
+                KernelError::MissingColumn("col".into()),
+                codes::MISSING_COLUMN,
+            ),
+            (
+                "InvalidPartitionValues",
+                KernelError::InvalidPartitionValues("boom".into()),
+                codes::UNKNOWN,
+            ),
+            (
+                "UnexpectedColumnType",
+                KernelError::UnexpectedColumnType("col".into()),
+                codes::UNEXPECTED_COLUMN_TYPE,
+            ),
+            (
+                "MissingData",
+                KernelError::MissingData("col".into()),
+                codes::MISSING_DATA,
+            ),
+            ("EmptyLog", KernelError::EmptyLog, codes::EMPTY_LOG),
+            (
+                "MissingVersion",
+                KernelError::MissingVersion(7),
+                codes::MISSING_VERSION,
+            ),
+            (
+                "StartVersionNotFound",
+                KernelError::StartVersionNotFound {
+                    requested: 1,
+                    earliest: 3,
+                },
+                codes::START_VERSION_NOT_FOUND,
+            ),
+            (
+                "UnpublishedVersion",
+                KernelError::UnpublishedVersion(7),
+                codes::UNPUBLISHED_VERSION,
+            ),
+            (
+                "DeletionVector",
+                KernelError::DeletionVector("boom".into()),
+                codes::DELETION_VECTOR,
+            ),
+            (
+                "InvalidSelectionVector",
+                KernelError::InvalidSelectionVector("boom".into()),
+                codes::UNKNOWN,
+            ),
+            (
+                "InvalidUrl",
+                KernelError::InvalidUrl(invalid_url_error()),
+                codes::INVALID_URL,
+            ),
+            (
+                "MalformedJson",
+                KernelError::MalformedJson(malformed_json_error()),
+                codes::MALFORMED_JSON,
+            ),
+            (
+                "MissingMetadata",
+                KernelError::MissingMetadata,
+                codes::MISSING_METADATA,
+            ),
+            (
+                "MissingProtocol",
+                KernelError::MissingProtocol,
+                codes::MISSING_PROTOCOL,
+            ),
+            (
+                "InvalidProtocol",
+                KernelError::InvalidProtocol("boom".into()),
+                codes::INVALID_PROTOCOL,
+            ),
+            (
+                "MissingMetadataAndProtocol",
+                KernelError::MissingMetadataAndProtocol,
+                codes::MISSING_METADATA_AND_PROTOCOL,
+            ),
+            (
+                "ParseError",
+                KernelError::ParseError("boom".into(), DataType::STRING),
+                codes::PARSE,
+            ),
+            (
+                "JoinFailure",
+                KernelError::JoinFailure("boom".into()),
+                codes::JOIN_FAILURE,
+            ),
+            (
+                "Utf8Error",
+                KernelError::Utf8Error(utf8_error()),
+                codes::UTF8,
+            ),
+            (
+                "ParseIntError",
+                KernelError::ParseIntError(parse_int_error()),
+                codes::PARSE_INT,
+            ),
+            (
+                "InvalidColumnMappingMode",
+                KernelError::InvalidColumnMappingMode("boom".into()),
+                codes::INVALID_COLUMN_MAPPING_MODE,
+            ),
+            (
+                "InvalidTableLocation",
+                KernelError::InvalidTableLocation("boom".into()),
+                codes::INVALID_TABLE_LOCATION,
+            ),
+            (
+                "InvalidDecimal",
+                KernelError::InvalidDecimal("boom".into()),
+                codes::INVALID_DECIMAL,
+            ),
+            (
+                "InvalidInterval",
+                KernelError::InvalidInterval("boom".into()),
+                codes::INVALID_INTERVAL,
+            ),
+            (
+                "InvalidGeoParams",
+                KernelError::InvalidGeoParams("boom".into()),
+                codes::INVALID_GEO_PARAMS,
+            ),
+            (
+                "InvalidStructData",
+                KernelError::InvalidStructData("boom".into()),
+                codes::INVALID_STRUCT_DATA,
+            ),
+            (
+                "InternalError",
+                KernelError::InternalError("boom".into()),
+                codes::INTERNAL,
+            ),
+            (
+                "Backtraced",
+                KernelError::internal_error("boom"),
+                codes::INTERNAL,
+            ),
+            (
+                "InvalidExpressionEvaluation",
+                KernelError::InvalidExpressionEvaluation("boom".into()),
+                codes::INVALID_EXPRESSION,
+            ),
+            (
+                "InvalidLogPath",
+                KernelError::InvalidLogPath("boom".into()),
+                codes::INVALID_LOG_PATH,
+            ),
+            (
+                "InvalidLogSegment",
+                KernelError::InvalidLogSegment("boom".into()),
+                codes::INVALID_LOG_SEGMENT,
+            ),
+            (
+                "SnapshotHint",
+                SnapshotHintError::Connector {
+                    message: "boom".into(),
+                    source: None,
+                }
+                .into(),
+                codes::INVALID_SNAPSHOT_HINT,
+            ),
+            (
+                "FileAlreadyExists",
+                KernelError::FileAlreadyExists("boom".into()),
+                codes::FILE_ALREADY_EXISTS,
+            ),
+            (
+                "TableAlreadyExistsAtPath",
+                KernelError::TableAlreadyExistsAtPath("boom".into()),
+                codes::TABLE_ALREADY_EXISTS_AT_PATH,
+            ),
+            (
+                "Unsupported",
+                KernelError::Unsupported("boom".into()),
+                codes::UNSUPPORTED,
+            ),
+            (
+                "ChecksumWriteUnsupported",
+                KernelError::ChecksumWriteUnsupported("boom".into()),
+                codes::UNKNOWN,
+            ),
+            (
+                "ParseIntervalError",
+                KernelError::ParseIntervalError(ParseIntervalError::NotAnInterval("boom".into())),
+                codes::PARSE_INTERVAL,
+            ),
+            (
+                "ChangeDataFeedUnsupported",
+                KernelError::ChangeDataFeedUnsupported(7),
+                codes::CHANGE_DATA_FEED_UNSUPPORTED,
+            ),
+            (
+                "RowTrackingChangeFeedUnsupported",
+                KernelError::RowTrackingChangeFeedUnsupported(7),
+                codes::ROW_TRACKING_CHANGE_FEED_UNSUPPORTED,
+            ),
+            (
+                "ChangeDataFeedIncompatibleSchema",
+                KernelError::ChangeDataFeedIncompatibleSchema("expected".into(), "actual".into()),
+                codes::CHANGE_DATA_FEED_INCOMPATIBLE_SCHEMA,
+            ),
+            (
+                "InvalidCheckpoint",
+                KernelError::InvalidCheckpoint("boom".into()),
+                codes::INVALID_CHECKPOINT,
+            ),
+            ("Schema", KernelError::Schema("boom".into()), codes::SCHEMA),
+            (
+                "StatsValidation",
+                KernelError::StatsValidation("boom".into()),
+                codes::UNKNOWN,
+            ),
+            (
+                "LogHistory",
+                KernelError::LogHistory(log_history_error()),
+                codes::LOG_HISTORY,
+            ),
+            (
+                "PlanResultTypeMismatch",
+                KernelError::PlanResultTypeMismatch {
+                    expected: "Unit",
+                    actual: "Data",
+                },
+                codes::UNKNOWN,
+            ),
+            ("Cancelled", KernelError::Cancelled, codes::CANCELLED),
+        ];
+
+        assert_eq!(cases.len(), current_kernel_error_variant_count());
+        for (name, error, expected) in cases {
+            assert_eq!(kernel_error_code(error), *expected, "{name}: {error}");
+        }
+    }
+
+    fn current_kernel_error_variant_count() -> usize {
+        const SOURCE: &str = include_str!("../../kernel/src/error.rs");
+        let enum_body = SOURCE
+            .split_once("pub enum KernelError {")
+            .expect("KernelError enum")
+            .1
+            .split_once("\n}")
+            .expect("KernelError enum end")
+            .0;
+        enum_body
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                let first = line.split([' ', '(', '{']).next()?;
+                (line.starts_with(first) && first.chars().next().is_some_and(char::is_uppercase))
+                    .then_some(())
+            })
+            .count()
     }
 }

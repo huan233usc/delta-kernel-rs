@@ -287,10 +287,7 @@ async fn unsupported_protocol_error_carries_kernel_error() {
     let err = run(&mut c, request(&fx, 0, vec![]), Behavior::default())
         .await
         .err();
-    assert!(
-        err.code == Code::Unsupported as i32 || err.code == Code::ProtocolUnsupported as i32,
-        "{err:?}"
-    );
+    assert_eq!(err.code, Code::Unsupported as i32, "{err:?}");
     let kernel_error = err.kernel_error.as_ref().expect("kernel error");
     assert_eq!(kernel_error.code, codes::UNSUPPORTED, "{err:?}");
     assert_eq!(kernel_error.message, err.message, "{err:?}");
@@ -574,7 +571,8 @@ async fn resolve_time_travel_matches_in_process_kernel() {
                         if e.message.contains("after the latest available version") {
                             assert_no_kernel_error(&e);
                         } else {
-                            assert!(e.kernel_error.is_some(), "{ctx}: {e:?}");
+                            let kernel_error = e.kernel_error.as_ref().expect("kernel error");
+                            assert_eq!(kernel_error.code, codes::LOG_HISTORY, "{ctx}: {e:?}");
                         }
                     }
                     (exp, got) => panic!("{ctx}: in-process {exp:?}, server {got:?}"),
@@ -669,7 +667,8 @@ async fn resolve_time_travel_after_log_cleanup() {
                 (Ok((v, _)), Ok(r)) => assert_eq!(r.version, v),
                 (Err(()), Err(Ended::Error(e))) => {
                     assert_eq!(e.code, Code::Unsupported as i32);
-                    assert!(e.kernel_error.is_some(), "{e:?}");
+                    let kernel_error = e.kernel_error.as_ref().expect("kernel error");
+                    assert_eq!(kernel_error.code, codes::LOG_HISTORY, "{e:?}");
                 }
                 (e, g) => panic!("t={t} rec={recreatable} earliest={earliest}: {e:?} vs {g:?}"),
             }
@@ -769,7 +768,8 @@ async fn get_snapshot_catalog_managed_without_catalog_latest() {
             err.message.starts_with("CATALOG_STATE_REQUIRED: "),
             "{err:?}"
         );
-        assert!(err.kernel_error.is_some(), "{err:?}");
+        let kernel_error = err.kernel_error.as_ref().expect("kernel error");
+        assert_eq!(kernel_error.code, codes::MAX_CATALOG_VERSION, "{err:?}");
         assert!(!err.retryable);
     }
 }

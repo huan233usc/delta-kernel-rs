@@ -293,7 +293,7 @@ sha256(canonical location).
 | `snap:{table_key}:{seg_id}` | hash | `info` (SnapshotInfo), `seg` (LogSegmentInfo), `hint`, `version`, `built_at`, `confirmed_at`, `table_id` (v12: the request table id of the build; `--l2-preload` rebuilds the L1 key from it) | `--l2-ttl-secs` |
 | `ver:{table_key}` | zset | member `seg_id`, score `version`; without an expected segment the entry with the greatest `confirmed_at` wins (v8 rule) | same |
 | `latest:{table_key}` (path-based) / `latest:{table_key}:{tail_id}` (`catalog_latest`, `tail_id` = hex digest of the canonical tail) | hash | `seg_id`, `version`, `confirmed_at_ms`, `tail_id`. Monotonic per key (compare-and-set script): replaced only by a higher version, or the same version and tail with a later confirmation | 2 × staleness, ≥ 60 s |
-| `plan:{seg_id}:{spec_hash}` | string | zstd(plan bytes) \| `EMPTY` \| `UNSUPPORTED:<reason>` | `--l2-ttl-secs` |
+| `plan:{seg_id}:{spec_hash}` | string | zstd(plan bytes) \| `EMPTY` \| `UNSUPPORTED_PROTO:<Error proto>`; legacy `UNSUPPORTED:<reason>` is read-only | `--l2-ttl-secs` |
 | `lock:{table_key}:{target}` | string | `{instance_id}:{job}`; target `v{version}` \| `latest` \| `c{mcv}:{tail digest}`; released only by its owner | `--l2-build-deadline-ms` |
 | `authz:{sha256(token)}:{table_key}` | string | authorized-until (ms) | until − now |
 
@@ -350,7 +350,7 @@ SF1 / HiFi sizes are not measured here: they need the P1-b client runs.
 | `snap/<table_key>/<seg_id>.bin` | `snap:…` | envelope with the Redis hash fields + `expires_at` |
 | `ver/<table_key>.json` | `ver:…` | sealed JSON; body `members`: `seg_id` → `{version, confirmed_at_ms}` |
 | `latest/<table_key>.json`, `latest/<table_key>__<tail_id>.json` | `latest:…` | sealed JSON; body `seg_id`, `version`, `confirmed_at_ms`, `tail_id` |
-| `plan/<seg_id>/<spec_hash>.bin` | `plan:…` | envelope with `value` = zstd(plan) \| `EMPTY` \| `UNSUPPORTED:<reason>` |
+| `plan/<seg_id>/<spec_hash>.bin` | `plan:…` | envelope with `value` = zstd(plan) \| `EMPTY` \| `UNSUPPORTED_PROTO:<Error proto>`; legacy `UNSUPPORTED:<reason>` is read-only |
 
 - A `.bin` envelope is `DKSL2\x01`, a kind byte, length-prefixed fields and a SHA-256 trailer.
 - A sealed JSON entry is `{"body": {...}, "sha256": ...}`.
