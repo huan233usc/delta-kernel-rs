@@ -161,10 +161,13 @@ pub fn catalog_state_required(e: &delta_kernel::Error) -> Option<ServerError> {
     };
     match root_kernel_error(k) {
         KernelError::MaxCatalogVersion(m) if m.contains(CATALOG_STATE_REQUIRED_KERNEL_TEXT) => {
-            Some(ServerError::new(
-                proto::error::Code::Unsupported,
-                format!("{CATALOG_STATE_REQUIRED_PREFIX}{e}"),
-            ))
+            Some(
+                ServerError::new(
+                    proto::error::Code::Unsupported,
+                    format!("{CATALOG_STATE_REQUIRED_PREFIX}{e}"),
+                )
+                .with_kernel_error(k),
+            )
         }
         _ => None,
     }
@@ -233,6 +236,7 @@ pub struct ServerError {
     pub code: proto::error::Code,
     pub message: String,
     pub retryable: bool,
+    pub kernel_error: Option<proto::KernelError>,
 }
 
 impl ServerError {
@@ -247,6 +251,7 @@ impl ServerError {
             code,
             message: message.into(),
             retryable,
+            kernel_error: None,
         }
     }
 
@@ -254,11 +259,17 @@ impl ServerError {
         Self::new(proto::error::Code::Internal, message)
     }
 
+    pub fn with_kernel_error(mut self, e: &KernelError) -> Self {
+        self.kernel_error = Some(to_wire_kernel_error(root_kernel_error(e)));
+        self
+    }
+
     pub fn to_proto(&self) -> proto::Error {
         proto::Error {
             code: self.code as i32,
             message: self.message.clone(),
             retryable: self.retryable,
+            kernel_error: self.kernel_error.clone(),
         }
     }
 }
@@ -290,12 +301,19 @@ pub fn classify_build_error(
     match e {
         delta_kernel::Error::Kernel(k) => classify_kernel_error(k, cancel, op_failure),
         delta_kernel::Error::Delta(d) if cancel.is_none() && op_failure.is_none() => {
-            let code = if d.name().contains("PATH_DOES_NOT_EXIST") {
+            let is_missing_path = d.name().contains("PATH_DOES_NOT_EXIST");
+            let code = if is_missing_path {
                 proto::error::Code::TableNotFound
             } else {
                 proto::error::Code::Internal
             };
-            ServerError::new(code, format!("{}: {d}", d.name()))
+            let err = ServerError::new(code, format!("{}: {d}", d.name()));
+            if is_missing_path {
+                let message = err.message.clone();
+                err.with_kernel_error(&KernelError::FileNotFound(message))
+            } else {
+                err
+            }
         }
         other => {
             classify_kernel_error(&KernelError::generic(other.to_string()), cancel, op_failure)
@@ -325,7 +343,8 @@ pub fn classify_kernel_error(
                 Code::Cancelled,
                 format!("all client streams closed during the job: {e}"),
             ),
-        };
+        }
+        .with_kernel_error(root);
     }
     if let Some(op_err) = op_failure {
         return ServerError::new(
@@ -335,20 +354,23 @@ pub fn classify_kernel_error(
                 kernel_code_name(op_err.code),
                 op_err.message
             ),
-        );
+        )
+        .with_kernel_error(root);
     }
     match root {
-        KernelError::Unsupported(_) => ServerError::new(Code::Unsupported, e.to_string()),
+        KernelError::Unsupported(_) => {
+            ServerError::new(Code::Unsupported, e.to_string()).with_kernel_error(root)
+        }
         KernelError::InvalidProtocol(_) => {
-            ServerError::new(Code::ProtocolUnsupported, e.to_string())
+            ServerError::new(Code::ProtocolUnsupported, e.to_string()).with_kernel_error(root)
         }
         KernelError::FileNotFound(_)
         | KernelError::EmptyLog
         | KernelError::MissingVersion(_)
         | KernelError::InvalidTableLocation(_) => {
-            ServerError::new(Code::TableNotFound, e.to_string())
+            ServerError::new(Code::TableNotFound, e.to_string()).with_kernel_error(root)
         }
-        _ => ServerError::internal(e.to_string()),
+        _ => ServerError::internal(e.to_string()).with_kernel_error(root),
     }
 }
 

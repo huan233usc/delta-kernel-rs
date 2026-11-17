@@ -18,7 +18,7 @@
 //! | `snap:{table_key}:{seg_id}` | hash | `info`, `seg`, `hint`, `version`, `built_at`, `confirmed_at`, `table_id` | `ttl` (6h) |
 //! | `ver:{table_key}` | zset | member `seg_id`, score `version` | `ttl` |
 //! | `latest:{table_key}` (path-based) / `latest:{table_key}:{tail_id}` (`catalog_latest`) | hash | `seg_id`, `version`, `confirmed_at_ms`, `tail_id`; monotonic ([`latest_replaces`]) | 2 × staleness, ≥ 60s |
-//! | `plan:{seg_id}:{spec_hash}` | string | zstd(plan bytes) \| `EMPTY` \| `UNSUPPORTED:<reason>` | `ttl` |
+//! | `plan:{seg_id}:{spec_hash}` | string | zstd(plan bytes) \| `EMPTY` \| encoded unsupported | `ttl` |
 //! | `lock:{table_key}:{target}` | string (`SET NX PX`) | `{replica}:{job}` | build deadline |
 //! | `authz:{sha256(token)}:{table_key}` | string | authorized-until (ms) | until − now |
 //!
@@ -174,6 +174,9 @@ pub type L2 = dyn SnapshotStore<Payload = Vec<u8>>;
 
 // ---------- plan value encoding (shared by both L2 backends) ----------
 
+const UNSUPPORTED_PREFIX: &[u8] = b"UNSUPPORTED:";
+const UNSUPPORTED_PROTO_PREFIX: &[u8] = b"UNSUPPORTED_PROTO:";
+
 /// L2 string value of a plan result, or `None` if it is too large.
 pub fn encode_plan(plan: &proto::ScanPlanResult) -> StoreResult<Result<Vec<u8>, usize>> {
     Ok(match &plan.result {
@@ -187,7 +190,9 @@ pub fn encode_plan(plan: &proto::ScanPlanResult) -> StoreResult<Result<Vec<u8>, 
         }
         Some(scan_plan_result::Result::Empty(_)) => Ok(b"EMPTY".to_vec()),
         Some(scan_plan_result::Result::Unsupported(e)) => {
-            Ok(format!("UNSUPPORTED:{}", e.message).into_bytes())
+            let mut out = UNSUPPORTED_PROTO_PREFIX.to_vec();
+            e.encode(&mut out).map_err(|e| e.to_string())?;
+            Ok(out)
         }
         None => return Err("plan result without a value".into()),
     })
@@ -196,11 +201,17 @@ pub fn encode_plan(plan: &proto::ScanPlanResult) -> StoreResult<Result<Vec<u8>, 
 pub fn decode_plan(v: &[u8]) -> StoreResult<proto::ScanPlanResult> {
     let result = if v == b"EMPTY" {
         scan_plan_result::Result::Empty(proto::StaticallyEmpty {})
-    } else if let Some(reason) = v.strip_prefix(b"UNSUPPORTED:") {
+    } else if let Some(bytes) = v.strip_prefix(UNSUPPORTED_PROTO_PREFIX) {
+        scan_plan_result::Result::Unsupported(
+            proto::Error::decode(bytes)
+                .map_err(|e| format!("invalid encoded unsupported plan error: {e}"))?,
+        )
+    } else if let Some(reason) = v.strip_prefix(UNSUPPORTED_PREFIX) {
         scan_plan_result::Result::Unsupported(proto::Error {
             code: proto::error::Code::Unsupported as i32,
             message: String::from_utf8_lossy(reason).into_owned(),
             retryable: false,
+            kernel_error: None,
         })
     } else {
         scan_plan_result::Result::Plan(zstd::decode_all(v).map_err(|e| e.to_string())?)
@@ -797,6 +808,10 @@ mod tests {
                     code: proto::error::Code::Unsupported as i32,
                     message: "TIMESTAMP partition with a timezone".into(),
                     retryable: false,
+                    kernel_error: Some(proto::KernelError {
+                        code: 35,
+                        message: "TIMESTAMP partition with a timezone".into(),
+                    }),
                 })),
                 cache_hit: false,
             },

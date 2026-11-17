@@ -106,6 +106,7 @@ pub fn history_error(e: &KernelError) -> Option<ServerError> {
             proto::error::Code::Unsupported,
             format!("{LOG_HISTORY_PREFIX}{e}"),
         )
+        .with_kernel_error(e)
     })
 }
 

@@ -884,6 +884,7 @@ async fn binary_runs_without_system_ca_certificates() {
         .arg(&endpoint)
         .env("SSL_CERT_FILE", &empty_file)
         .env("SSL_CERT_DIR", &empty_dir)
+        .env("RUST_LOG", "info")
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();

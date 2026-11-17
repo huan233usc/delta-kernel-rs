@@ -18,7 +18,7 @@ use delta_kernel::scan::{PartitionValuesOptions, StatsOptions};
 use delta_kernel::{IoOperation, KernelResult, Operation, PlanExecutor, Snapshot, SnapshotRef};
 use delta_kernel_server::cache::{CacheConfig, Core, IoMode, KERNEL_FEATURES, KERNEL_REV};
 use delta_kernel_server::decode::{decode_operation, decode_plan};
-use delta_kernel_server::errors::{codes, to_wire_kernel_error};
+use delta_kernel_server::errors::{codes, root_kernel_error, to_wire_kernel_error};
 use delta_kernel_server::normalize::normalize_plan_bytes;
 use delta_kernel_server::proto::delta_kernel_service_client::DeltaKernelServiceClient;
 use delta_kernel_server::proto::{
@@ -221,6 +221,42 @@ pub fn fixture_at(name: &str, table_dir: &str) -> Fixture {
         root,
         url,
         table_id: format!("tbl-{}", name.replace('/', "-")),
+    }
+}
+
+pub fn missing_table_fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("missing_table");
+    let url = Url::from_directory_path(&root).unwrap();
+    Fixture {
+        _dir: dir,
+        root,
+        url,
+        table_id: "missing-table".into(),
+    }
+}
+
+pub fn table_with_protocol(protocol: &str) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("protocol_table");
+    let log = root.join("_delta_log");
+    std::fs::create_dir_all(&log).unwrap();
+    let schema = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}"#;
+    let commit = format!(
+        "{{\"commitInfo\":{{\"timestamp\":1700000000000,\"operation\":\"CREATE TABLE\"}}}}\n\
+         {protocol}\n\
+         {{\"metaData\":{{\"id\":\"protocol-table\",\"format\":{{\"provider\":\"parquet\",\
+         \"options\":{{}}}},\"schemaString\":\"{schema}\",\"partitionColumns\":[],\
+         \"configuration\":{{}},\"createdTime\":1700000000000}}}}\n"
+    );
+    std::fs::write(log.join(format!("{:020}.json", 0)), commit).unwrap();
+    let root = root.canonicalize().unwrap();
+    let url = Url::from_directory_path(&root).unwrap();
+    Fixture {
+        _dir: dir,
+        root,
+        url,
+        table_id: "protocol-table".into(),
     }
 }
 
@@ -1039,6 +1075,15 @@ pub fn local_snapshot(fx: &Fixture, version: Option<i64>) -> SnapshotRef {
 
 pub fn latest_version(fx: &Fixture) -> i64 {
     local_snapshot(fx, None).version() as i64
+}
+
+pub fn assert_kernel_error(err: &proto::Error, expected: &delta_kernel::KernelError) {
+    let expected = to_wire_kernel_error(root_kernel_error(expected));
+    assert_eq!(err.kernel_error.as_ref(), Some(&expected), "{err:?}");
+}
+
+pub fn assert_no_kernel_error(err: &proto::Error) {
+    assert!(err.kernel_error.is_none(), "{err:?}");
 }
 
 fn kernel_options(spec: &proto::ScanPlanSpec) -> (StatsOptions, PartitionValuesOptions) {

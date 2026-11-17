@@ -6,7 +6,7 @@ use delta_kernel::scan::{PartitionValuesOptions, StatsOptions};
 use delta_kernel::{Engine, KernelError, SnapshotRef};
 use prost::Message as _;
 
-use crate::errors::root_kernel_error;
+use crate::errors::{root_kernel_error, to_wire_kernel_error};
 use crate::proto::{self, scan_plan_result, stats_options};
 
 /// Canonical cache key of a spec. The message has no map fields, so prost's encoding is stable.
@@ -63,19 +63,20 @@ pub fn generate_plan(
     spec: &proto::ScanPlanSpec,
     engine: &dyn Engine,
 ) -> PlanOutcome {
-    let unsupported = |message: String| {
+    let unsupported = |message: String, kernel_error: Option<proto::KernelError>| {
         PlanOutcome::Result(proto::ScanPlanResult {
             result: Some(scan_plan_result::Result::Unsupported(proto::Error {
                 code: proto::error::Code::Unsupported as i32,
                 message,
                 retryable: false,
+                kernel_error,
             })),
             cache_hit: false,
         })
     };
     let (stats, partition) = match scan_options(spec) {
         Ok(opts) => opts,
-        Err(message) => return unsupported(message),
+        Err(message) => return unsupported(message, None),
     };
     let result = snapshot
         .clone()
@@ -95,9 +96,10 @@ pub fn generate_plan(
             result: Some(scan_plan_result::Result::Empty(proto::StaticallyEmpty {})),
             cache_hit: false,
         }),
-        Err(e) if matches!(root_kernel_error(&e), KernelError::Unsupported(_)) => {
-            unsupported(e.to_string())
-        }
+        Err(e) if matches!(root_kernel_error(&e), KernelError::Unsupported(_)) => unsupported(
+            e.to_string(),
+            Some(to_wire_kernel_error(root_kernel_error(&e))),
+        ),
         Err(e) => PlanOutcome::Failed(e),
     }
 }

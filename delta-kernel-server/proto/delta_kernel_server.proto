@@ -241,6 +241,7 @@ message Error {
               PERMISSION_DENIED = 8; UNAVAILABLE = 9;
               STALE_REF = 10; }       // v10: SnapshotRef no longer resolves to its log segment
   Code code = 1; string message = 2; bool retryable = 3;
+  KernelError kernel_error = 4;        // set when the error came from a kernel call
 }
 
 // ---------- test hooks ----------

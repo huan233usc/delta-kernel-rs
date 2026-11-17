@@ -666,7 +666,8 @@ fn server_command(instance_id: &str, l2_dir: &Path, extra: &[&str]) -> Command {
     cmd.args(["--enable-test-hooks", "--instance-id", instance_id])
         .arg("--l2-dir")
         .arg(l2_dir)
-        .args(extra);
+        .args(extra)
+        .env("RUST_LOG", "info");
     cmd
 }
 

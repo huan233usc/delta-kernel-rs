@@ -13,6 +13,7 @@ use delta_kernel::history_manager::{
     HistoryCommitType, first_version_after, get_earliest_commit, latest_version_as_of,
 };
 use delta_kernel_server::cache::{CacheConfig, KERNEL_REV};
+use delta_kernel_server::errors::codes;
 use delta_kernel_server::file_store::FileStore;
 use delta_kernel_server::info::segment_id;
 use delta_kernel_server::proto::error::Code;
@@ -259,6 +260,65 @@ async fn scan_plan_stale_ref() {
         &with_plans(&fresh, vec![p.plan.unwrap()]),
         &[spec_json()],
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_table_error_carries_kernel_error() {
+    let fx = missing_table_fixture();
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let err = run(&mut c, request(&fx, 0, vec![]), Behavior::default())
+        .await
+        .err();
+    assert_eq!(err.code, Code::TableNotFound as i32, "{err:?}");
+    assert_kernel_error(
+        &err,
+        &delta_kernel::KernelError::FileNotFound(err.message.clone()),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsupported_protocol_error_carries_kernel_error() {
+    let fx = table_with_protocol(
+        r#"{"protocol":{"minReaderVersion":4,"minWriterVersion":7,"writerFeatures":[]}}"#,
+    );
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let err = run(&mut c, request(&fx, 0, vec![]), Behavior::default())
+        .await
+        .err();
+    assert!(
+        err.code == Code::Unsupported as i32 || err.code == Code::ProtocolUnsupported as i32,
+        "{err:?}"
+    );
+    let kernel_error = err.kernel_error.as_ref().expect("kernel error");
+    assert_eq!(kernel_error.code, codes::UNSUPPORTED, "{err:?}");
+    assert_eq!(kernel_error.message, err.message, "{err:?}");
+    assert!(
+        kernel_error
+            .message
+            .contains("Unsupported minimum reader version 4"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_kernel_error_leaves_kernel_error_unset() {
+    let server = TestServer::start().await;
+    let mut c = server.client().await;
+    let req = proto::GetSnapshotRequest {
+        table: None,
+        at: Some(proto::VersionSpec {
+            spec: Some(proto::version_spec::Spec::Version(0)),
+        }),
+        prefetch_plans: vec![],
+        client: Some(client_info()),
+        expected_log_segment: None,
+        auth: None,
+    };
+    let err = run(&mut c, req, Behavior::default()).await.err();
+    assert_eq!(err.code, Code::Internal as i32, "{err:?}");
+    assert_no_kernel_error(&err);
 }
 
 /// A staged-tail ref is rebuilt from its own staged deltas and never cached; the plan equals the
@@ -511,6 +571,11 @@ async fn resolve_time_travel_matches_in_process_kernel() {
                     (Err(()), Err(Ended::Error(e))) => {
                         assert_eq!(e.code, Code::Unsupported as i32, "{ctx}: {e:?}");
                         assert!(e.message.starts_with("LOG_HISTORY: "), "{ctx}: {e:?}");
+                        if e.message.contains("after the latest available version") {
+                            assert_no_kernel_error(&e);
+                        } else {
+                            assert!(e.kernel_error.is_some(), "{ctx}: {e:?}");
+                        }
                     }
                     (exp, got) => panic!("{ctx}: in-process {exp:?}, server {got:?}"),
                 }
@@ -602,7 +667,10 @@ async fn resolve_time_travel_after_log_cleanup() {
             .await;
             match (expected, got.result) {
                 (Ok((v, _)), Ok(r)) => assert_eq!(r.version, v),
-                (Err(()), Err(Ended::Error(e))) => assert_eq!(e.code, Code::Unsupported as i32),
+                (Err(()), Err(Ended::Error(e))) => {
+                    assert_eq!(e.code, Code::Unsupported as i32);
+                    assert!(e.kernel_error.is_some(), "{e:?}");
+                }
                 (e, g) => panic!("t={t} rec={recreatable} earliest={earliest}: {e:?} vs {g:?}"),
             }
         }
@@ -701,6 +769,7 @@ async fn get_snapshot_catalog_managed_without_catalog_latest() {
             err.message.starts_with("CATALOG_STATE_REQUIRED: "),
             "{err:?}"
         );
+        assert!(err.kernel_error.is_some(), "{err:?}");
         assert!(!err.retryable);
     }
 }

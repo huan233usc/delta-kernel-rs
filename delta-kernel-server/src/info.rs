@@ -14,7 +14,7 @@ use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::{Engine, KernelError, KernelResult, Snapshot};
 use sha2::Digest as _;
 
-use crate::errors::root_kernel_error;
+use crate::errors::{root_kernel_error, to_wire_kernel_error};
 use crate::proto;
 
 pub fn compute_snapshot_info(
@@ -37,6 +37,7 @@ pub fn compute_snapshot_info(
                 code: proto::error::Code::Internal as i32,
                 message: e.to_string(),
                 retryable: false,
+                kernel_error: Some(to_wire_kernel_error(root_kernel_error(&e))),
             }),
         ),
     };

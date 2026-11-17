@@ -675,6 +675,12 @@ async fn op_error_is_op_failed() {
         "{}",
         err.message
     );
+    let kernel_error = err.kernel_error.as_ref().expect("kernel error");
+    assert!(
+        err.message
+            .ends_with(&format!("kernel error: {}", kernel_error.message)),
+        "{err:?}"
+    );
     // Nothing poisoned: a healthy client builds fine afterwards.
     let (resp, _) = run(
         &mut c,
