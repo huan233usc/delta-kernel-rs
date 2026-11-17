@@ -578,6 +578,16 @@ async fn unreachable_local_io_is_unavailable() {
         err.message
     );
     assert!(!err.message.contains("(code "), "{}", err.message);
+    let kernel_error = err
+        .kernel_error
+        .as_ref()
+        .expect("local_unavailable must preserve the real kernel failure");
+    assert_ne!(
+        kernel_error.code,
+        delta_kernel_server::errors::codes::UNKNOWN,
+        "{kernel_error:?}"
+    );
+    assert!(!kernel_error.message.is_empty(), "{kernel_error:?}");
     assert!(server.core.cached_instances_per_table().is_empty());
     let (ok, _) = run(
         &mut c,
